@@ -33,7 +33,7 @@ dev = [
     "fakeredis[lua]==2.40.0",
     # Test-only: the simulator's reference for V3 signatures and AccessToken JWTs.
     "plivo==4.63.0",
-    "pytest==8.4.2",
+    "pytest==9.2.0",
     "pytest-xdist==3.8.0",
     # Pinned exactly: ruff's formatting shifts between releases.
     "ruff==0.16.3",
