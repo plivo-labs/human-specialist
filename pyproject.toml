@@ -1,0 +1,147 @@
+[project]
+name = "human-specialist"
+version = "0.1.0"
+description = "Voice contact center engine on Plivo."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.13"
+dependencies = [
+    "alembic==1.19.2",
+    "cryptography==50.0.2",
+    "fastapi==0.136.1",
+    "httpx==0.28.1",
+    "prometheus-client==0.26.0",
+    "psycopg2-binary==2.9.13",
+    "pydantic==2.13.4",
+    "python-multipart==0.0.32",
+    "redis==8.1.0",
+    "SQLAlchemy==1.4.54",
+    "starlette==1.10.0",
+    "uvicorn==0.54.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hs"]
+
+[dependency-groups]
+dev = [
+    "fakeredis[lua]==2.40.0",
+    # Test-only: the simulator's reference for V3 signatures and AccessToken JWTs.
+    "plivo==4.63.0",
+    "pytest==8.4.2",
+    "pytest-xdist==3.8.0",
+    # Pinned exactly: ruff's formatting shifts between releases.
+    "ruff==0.16.3",
+]
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+tag_format = "v$version"
+version_scheme = "semver2"
+version_provider = "uv"
+major_version_zero = true
+update_changelog_on_bump = true
+annotated_tag = true
+version_files = [
+    "docker/compose.yaml:ghcr.io/plivo-labs/human-specialist:",
+    "src/hs/app.py:^    version=",
+    "tests/contract/openapi.json:^    \"version\": ",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+xfail_strict = true
+# A warning raised from hs/ is an error, and so is any use of pydantic's v1 API.
+filterwarnings = ['error:::hs\.', "error::pydantic.warnings.PydanticDeprecatedSince20"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+src = ["src", "."]
+# extend-exclude keeps ruff's defaults (.git, .venv, build, dist, ...). Markdown is prose, not source.
+extend-exclude = ["*.md"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+skip-magic-trailing-comma = true
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RET", "PIE", "T10", "T20", "FIX", "ERA", "C4", "RUF", "S", "C90"]
+ignore = [
+    "E501",    # the formatter owns line length; long literals stay
+    "RUF012",  # pydantic and SQLAlchemy class attributes are not shared mutable state
+    "S311",    # random is used for jitter and ids that are not secrets
+]
+
+[tool.ruff.lint.isort]
+split-on-trailing-comma = false
+
+[tool.ruff.lint.mccabe]
+max-complexity = 12
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = [
+    "fastapi.Depends", "fastapi.Security", "fastapi.Query", "fastapi.Path", "fastapi.Header",
+    "fastapi.Body", "fastapi.Form", "fastapi.File", "fastapi.Cookie",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S108", "S603", "S607"]
+"alembic/**" = ["ERA001"]
+
+# Existing lint debt. Only ever delete lines here.
+"src/hs/conversations/child_update.py" = ["C901", "SIM102"]
+"src/hs/conversations/management.py" = ["B007", "C901", "E402", "SIM211"]
+"src/hs/conversations/models.py" = ["B904", "B905", "C901", "S110", "SIM102", "SIM105", "UP042"]
+"src/hs/conversations/search.py" = ["C901", "S105"]
+"src/hs/conversations/store.py" = ["C417", "C901", "E712", "RET503"]
+"src/hs/conversations/transfer.py" = ["C901", "SIM102"]
+"src/hs/infra/constants.py" = ["E402"]
+"src/hs/infra/counters.py" = ["E402", "UP042"]
+"src/hs/infra/helpers.py" = ["S110"]
+"src/hs/infra/log.py" = ["PIE810"]
+"src/hs/infra/models.py" = ["UP042"]
+"src/hs/infra/redis.py" = ["S105", "S110"]
+"src/hs/intake/enqueue.py" = ["B904"]
+"src/hs/plivo/numbers.py" = ["B904"]
+"src/hs/routing/account_read.py" = ["B905", "S608"]
+"src/hs/routing/get_agents.py" = ["C901", "UP031"]
+"src/hs/routing/sticky.py" = ["C901", "UP031"]
+"src/hs/voice/agent_leg.py" = ["C901"]
+"src/hs/voice/call_legs.py" = ["C901"]
+"src/hs/voice/call_models.py" = ["UP042"]
+"src/hs/voice/callbacks.py" = ["B905", "C901"]
+"src/hs/voice/controls.py" = ["C901"]
+"src/hs/voice/dispatch.py" = ["C901"]
+"src/hs/voice/hangup.py" = ["B023", "C901", "RET503"]
+"src/hs/voice/transcripts.py" = ["C901", "E402"]
+"src/hs/voice/transfer.py" = ["C901", "RET503", "SIM102"]
+"tests/acceptance/conftest.py" = ["F403", "F405"]
+"tests/harness/__init__.py" = ["S608"]
+"tests/harness/sim.py" = ["RET503", "S314", "S324"]
+"tests/unit/conftest.py" = ["S110", "SIM105"]
+"tests/unit/conversations/test_models_conversation.py" = ["E402", "RUF005", "RUF015", "UP045"]
+"tests/unit/conversations/test_orphan_parent_janitor.py" = ["B905"]
+"tests/unit/conversations/test_child_update.py" = ["B017"]
+"tests/unit/conversations/test_status_machinery.py" = ["B905"]
+"tests/unit/conversations/test_timer_receivers.py" = ["B905"]
+"tests/unit/conversations/test_parent_ingress_and_chunk_cache.py" = ["B017", "B905"]
+"tests/unit/intake/test_enqueue.py" = ["ERA001"]
+"tests/unit/routing/test_sticky.py" = ["RUF002", "RUF003"]
+"tests/unit/routing/test_sticky_cache.py" = ["ERA001", "RUF002"]
+"tests/unit/routing/test_active_queue_crud.py" = ["ERA001"]
+"tests/unit/voice/test_monitor_leave_active_flag.py" = ["B905"]
+"tests/unit/voice/test_voice_callbacks.py" = ["B008", "B905"]
+"tests/unit/voice/test_agent_leg.py" = ["RUF003"]
+"tests/unit/voice/test_hangup.py" = ["B008"]
+"tests/unit/voice/test_participant_add_remove.py" = ["RUF059", "S107"]
+"tests/unit/voice/test_voice_persistence.py" = ["B008"]
+"tests/unit/voice/test_transfer_hardening.py" = ["B008"]

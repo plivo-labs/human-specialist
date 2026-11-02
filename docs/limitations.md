@@ -1,0 +1,25 @@
+# What it does not do
+
+- Emergency calling (911/E911). Plivo does not offer it, so a softphone on this stack cannot be your only line.
+- Answering-machine detection. An outbound call connects the agent to whatever answers, a person or a voicemail.
+- Per-tenant spend, concurrency or call-rate caps. Plivo limits apply to the whole Plivo account.
+- Rate limiting of the API. Put a rate limiter at your ingress.
+- Keeping a call alive through a browser refresh.
+- Offering a waiting caller again, within five minutes, to an agent who already missed, declined or could not be reached on that call. Once every agent the queue can offer has been tried, the caller waits.
+- Fitting a queue's wait to its offers. `wait_timeout_sec` defaults to 20 seconds and an offer rings for `ring_timeout_sec`, 30 seconds by default, so with both defaults the first offer is cut off and no retry runs. Set the wait above `ring_timeout_sec` × (1 + `retries`).
+- Taking the caller off hold after a transfer that ends without a hand-over. The caller stays held until the agent resumes them, including after a warm transfer to a busy number that emits no `call.transferred`. [Call control errors](api.md#call-control-errors) lists the cases.
+- Moving an outbound call to a queue or to voicemail. The transfer answers 409 `transfer_failed`; transfer the lead to an agent, a team or a number instead.
+- Ending a transfer that is cancelled after its target's ring timeout. The cancel answers 204 but hangs up nobody, so a target who answered stays on the call until they hang up. A number target can be removed with `DELETE /calls/{id}/participants/{number}`, the number without its `+`.
+- Stopping a ringing transfer when the agent hangs up an outbound call. The target can keep ringing until its ring timeout. Cancel the transfer before the agent hangs up.
+- Running one transfer at a time after a lost callback or a restart. A transfer left in progress gives way to a new request after the ring timeout, but not while an added participant is on the call. Two requests that find it at the same moment can both dial.
+- Pausing or resuming a recording after someone left the call. HS includes participants who already left, and stops at the first participant that refuses. After a supervisor or a transfer target leaves, the request can answer 409 `recording_control_failed` with some tracks changed and others not.
+- Waiting more than about 155 seconds for a transcript. If Plivo has not published a track's transcript that long after its transcription callback, HS stops asking. The recording's transcript then reads `complete: false` without that track's text, and `transcript.ready` is never sent.
+- Telling who ended every answered call. When Plivo reports the end of the call's room before the exit of the party who hung up, `call.ended` reads `ended_by: "system"` though the caller or the agent ended the call.
+- Telling a caller who left from a missed offer in one narrow window. If an agent's ring fails after the caller pressed a key to leave the queue or the queue's wait ran out, but before HS has recorded that exit, the offer reads `offer.missed` instead of `offer.withdrawn` with reason `caller_left`. That miss adds no strike toward the agent's Break.
+- Rejoining as a supervisor right after leaving. A supervisor who joins a call again before HS has processed their previous leave can be removed as if a second supervisor were already on the call. Wait for `supervisor.left` before joining again.
+- Per-tenant data purge. You can delete a recording; events expire after `EVENT_RETENTION_DAYS`.
+- Transcription in languages other than English.
+- Deleting call detail records, which Plivo keeps.
+- SMS, WhatsApp, chat, email, a UI or a dialer. It is voice only; the UI, dialer and CRM sync are yours to build.
+- Telling every Redis outage from a missing record. Call controls check, but elsewhere a read Redis drops can answer like a miss (for example a 404) instead of a 503. When such a read, or the write that schedules a job, fails partway through a Plivo callback, Plivo's retry can leave that callback's work undone. For example, a caller who hung up while queued can get no `call.ended`, and a caller the queue refused can stay in its `waiting` count.
+- Closing calls whose end HS missed. If HS is down longer than Plivo retries its callbacks, a call that ended in that window is not closed automatically.
