@@ -75,7 +75,7 @@ def test_a_public_base_url_that_is_not_an_absolute_http_url_is_refused(monkeypat
         "http://10.0.0.5:8080/hs",
         "https://[::1]:8443",
         "https://bücher.example/hs",
-        "https://humancontactcenterproduction.example.com",
+        "https://hs.example.com",
     ],
 )
 def test_a_public_base_url_a_self_hoster_uses_loads(monkeypatch, url):

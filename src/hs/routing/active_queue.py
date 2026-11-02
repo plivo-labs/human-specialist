@@ -51,8 +51,8 @@ def _run_rows(db, contact_uuid: str, qnr_run_uuid: str):
 def update_queue_status(db, contact_uuid: str, qnr_run_uuid: str, status: str, *, strict: bool = False) -> str | None:
     """Update every matching queue row with one atomic SQL UPDATE.
 
-    Duplicate rows are possible until the active-queue uniqueness migration is deployed, so one or more
-    affected live rows is a successful durable acknowledgement. In strict mode, zero affected rows and a
+    The table does not enforce one row per contact run, so one or more affected live rows is a successful
+    durable acknowledgement. In strict mode, zero affected rows and a
     database failure are deliberately different results so callback callers do not retry a queue entry that
     was already soft-deleted by hangup.
     """

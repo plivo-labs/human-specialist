@@ -51,7 +51,7 @@ def test_dead_connection_at_commit_no_longer_poisons_the_thread_slot(real_scoped
     engine, scoped = real_scoped
     _kill_commits(monkeypatch, engine)
 
-    # --- control: the SQLAlchemy state the prod worker thread was left in ---
+    # --- control: the SQLAlchemy state the worker thread was left in ---
     poisoned = scoped()
     assert poisoned.execute(text("select 1")).scalar() == 1  # request did SQL: txn + connection live
     with pytest.raises(OperationalError):

@@ -232,11 +232,6 @@ def test_chunk_res_timestamp_redeclared_once_in_place():
 
 
 # ======================================================================================
-# the agent's aggregated chunk = ConversationChunkRes + hide_conversation at tail
-# ======================================================================================
-
-
-# ======================================================================================
 # ConversationRes — reversed-MRO PARENT-first full order (POST /child/active)
 # ======================================================================================
 def _build_conversation_res(**overrides) -> ConversationRes:
@@ -337,16 +332,6 @@ def test_agent_details_res_single_agent_name():
 
 
 # ======================================================================================
-# the chunk list and chunk view: payload key order
-# ======================================================================================
-
-
-# ======================================================================================
-# the closed-conversation search model: required fields + default sort_field
-# ======================================================================================
-
-
-# ======================================================================================
 # enums / constants
 # ======================================================================================
 def test_open_statuses():
@@ -417,9 +402,7 @@ def test_aom_occupied_state_field_order_if_available():
     ]
 
 
-# ── caller-supplied paging caps (closed/open conversation search) ────────────────
-# page_size flows straight into .offset()/.limit() + per-row to_record() materialization,
-# so these pins keep a huge page_size a 422, not an unbounded query.
+# ── contact-identifier formatting ────────────────
 
 
 @pytest.mark.parametrize(
@@ -430,14 +413,14 @@ def test_aom_occupied_state_field_order_if_available():
         ("Bob@Example.com", "Bob@Example.com"),
     ],
 )
-def test_parent_insert_phone_or_email_keeps_prod_format(raw, stored):
+def test_parent_insert_phone_or_email_keeps_format(raw, stored):
     from hs.conversations.models import ConvParentInsertModel
 
     insert = ConvParentInsertModel(parent_channel="call", phone_or_email=raw, parent_contact_uuid="c1", org_auth_id="A")
     assert insert.phone_or_email == stored
 
 
-def test_child_insert_customer_contact_and_sender_id_keep_prod_format(monkeypatch):
+def test_child_insert_customer_contact_and_sender_id_keep_format(monkeypatch):
     import hs.setup.number as number
     from hs.conversations.models import ConvInsertModel
 

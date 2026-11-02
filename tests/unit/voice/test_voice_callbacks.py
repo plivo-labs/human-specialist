@@ -345,7 +345,7 @@ def test_initialised_callback_prompt_cache_failure_still_routes(init_wiring, mon
 
 def test_initialised_callback_route_failure_runs_the_assignment_failed_chain(init_wiring, monkeypatch):
     """RouteAndAddToMPC err → AQE delete(FAILED) + unanswered(assignment failed) + the aleg
-    hand-back with flow_action=<route result> + the assignment_failed CH event → ('', err)."""
+    hand-back with flow_action=<route result> + the assignment_failed conversation event → ('', err)."""
     deleted, unanswered, transfers = [], [], []
     monkeypatch.setattr(vcb.aq, "delete_active_queue_entry", lambda db, c, q, s: deleted.append((c, q, s)) or 7)
     monkeypatch.setattr(vcb, "_update_unanswered", lambda c, reason, aqid: unanswered.append((c, reason, aqid)))

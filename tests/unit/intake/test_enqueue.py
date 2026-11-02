@@ -302,7 +302,7 @@ def test_incoming_contact_params_coerces_nulls_to_defaults():
 
 
 def _fake_instance(cls):
-    return type("CH", (), {"insert_conversation_event": lambda self, *a, **k: False})()
+    return type("_FakeEvents", (), {"insert_conversation_event": lambda self, *a, **k: False})()
 
 
 # ======================================================================================

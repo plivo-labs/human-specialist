@@ -39,7 +39,7 @@ _HANDLED = "successfully handled hangup"
 _PHONE_MEMBER = re.compile(r"\+?\d+")
 _EXTERNAL_TRANSFERS = (rc.TRANSFER_TYPE_EXTERNAL, rc.TRANSFER_TYPE_WARM_EXTERNAL)
 _AGENT_TRANSFERS = (rc.TRANSFER_TYPE_AGENT, rc.TRANSFER_TYPE_TEAM, *_EXTERNAL_TRANSFERS)
-# Plivo cause code -> what became of an offer whose agent leg ended unanswered, by production's labels: 3020 Rejected,
+# Plivo cause code -> what became of an offer whose agent leg ended unanswered: 3020 Rejected,
 # 9000 Lost Race, 6010 Invite Timeout (a RONA strike). Any other is a drop-off: caller_left once the caller is out
 # of the room, else a miss without a strike.
 _OFFER_OUTCOME = {

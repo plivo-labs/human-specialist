@@ -89,7 +89,7 @@ def test_blocked_sink_does_not_block_producers_and_preserves_order(fresh_logger)
 
 
 def test_event_loop_keeps_running_while_sink_is_frozen_but_not_with_sync_handler(fresh_logger):
-    """The prod mechanism, end to end: an asyncio loop that logs while the sink is frozen.
+    """The logging mechanism, end to end: an asyncio loop that logs while the sink is frozen.
 
     Non-blocking sink: a watchdog-style ping (call_soon_threadsafe -> Event) is serviced
     promptly. Control: with the synchronous handler restored, the loop's first log call

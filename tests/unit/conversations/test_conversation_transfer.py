@@ -828,9 +828,6 @@ def test_signal_chunk_adapter_never_raises(monkeypatch):
     assert (sm, ident, itype) == ("Cara accepted", str(AOM_UUID), "agent")
 
 
-# ============================================================================ the HTTP route
-
-
 # ============================================================================ secondary signal chunks
 def _signal_recorders(monkeypatch):
     import hs.conversations.management as cm

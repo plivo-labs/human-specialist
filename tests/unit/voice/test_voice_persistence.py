@@ -23,7 +23,7 @@ import tests.conftest  # noqa: F401
 from hs.infra.models import UseCaseResponse
 from hs.voice.call_models import CallLegInsertModel, CallRecordingRequestModel
 
-CT = "11111111-2222-3333-4444-555555555555"  # a uuid ct (no '+' prepend in SMWR)
+CT = "11111111-2222-3333-4444-555555555555"
 
 
 class Row:
@@ -637,16 +637,6 @@ class FakeCache:
 
     def get_instance(self):
         return self
-
-
-def _stream_env(monkeypatch, contact=None, store=None):
-    import json as _json
-
-    redis = FakeRedis(store)
-    if contact is not None:
-        redis.store[f"SMWR::{CT}"] = _json.dumps(contact)
-    seams = []
-    return redis, seams
 
 
 def _tm_env(monkeypatch, org=Row(auth_id="A", uuid="t-1"), recording=None, leg=None, fetch=None):

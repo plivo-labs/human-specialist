@@ -198,6 +198,3 @@ def test_transfer_qnr_no_parent_no_child_400(monkeypatch):
         resp.status_code,
         resp.error,
     ) == (400, "Parent conversation not found")
-
-
-# ============================================================================ channel_switch

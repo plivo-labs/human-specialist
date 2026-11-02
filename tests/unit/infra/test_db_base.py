@@ -31,7 +31,7 @@ def test_offline_import_has_no_network():
 
 
 def test_routing_session_get_bind_always_core_engine():
-    """RoutingSession.get_bind ALWAYS returns core_engine (crm db deprecated)."""
+    """RoutingSession.get_bind ALWAYS returns core_engine, the only engine bound."""
     rs = RoutingSession.__new__(RoutingSession)  # no connection opened
     assert rs.get_bind() is core_engine
     assert rs.get_bind(mapper=object(), clause=object()) is core_engine

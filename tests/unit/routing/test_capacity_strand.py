@@ -147,9 +147,6 @@ class _FakeDB:
         pass
 
 
-# ------------------------------------- drain releases the reservation (fix 1, the regression)
-
-
 # --------------------------- drain fallback when account lookup dies after CIA delete (fix 4)
 
 

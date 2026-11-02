@@ -782,7 +782,7 @@ def test_a_transfer_nobody_takes_leaves_the_caller_held_until_the_agent_resumes(
 
 
 def resumed_by_the_agent(world, live):
-    """Production keeps the caller on hold after a transfer that ends without a hand-over; the agent resumes."""
+    """HS keeps the caller on hold after a transfer that ends without a hand-over; the agent resumes."""
     world.wait(world.plivo.idle, what="the transfer's end handled")
     assert live.caller.held and live.leg.state == "in_progress"
     ok(act(live.agent.api(), live.id, "hold", {"on": False}))

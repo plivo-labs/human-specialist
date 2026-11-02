@@ -32,15 +32,3 @@ def test_lst_just_before_40s_boundary_is_fresh():
 
 def test_recent_lst_is_fresh():
     assert _is_ping_stale(str(int(time.time()))) is False
-
-
-# --- offline-check routing ----------------------------------------------------------------------
-
-
-# --- self-healing, marker-deduped arming --------------------------------------------------------
-
-
-# --- the timer payload --------------------------------------------------------------------------
-
-
-# --- the callback endpoint ----------------------------------------------------------------------

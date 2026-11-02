@@ -145,7 +145,7 @@ class _FakePipe:
 def _cache_with_fake(monkeypatch):
     from hs.infra.redis import Cache
 
-    c = Cache()  # fresh instance (production uses the get_instance singleton)
+    c = Cache()  # fresh instance (the service uses the get_instance singleton)
     fake = _FakeRedis()
     monkeypatch.setattr(Cache, "client", property(lambda self: fake))
     return c, fake

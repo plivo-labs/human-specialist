@@ -19,7 +19,7 @@ human-specialist is that engine as one service you run, with an API you build on
 - **Routing is configuration.** Queues, business hours, holidays, menus, overflow and voicemail are resources, not a drawn call flow.
 - **Agents in a browser or on a SIP phone.** Agents take calls with the Plivo Browser SDK or any SIP softphone. Hold, transfer, conference, recording and supervisor listen, whisper and barge are API calls.
 - **Every change is an event.** State changes go out on a server-sent-events stream and to signed webhooks, with replay.
-- **Your data stays yours.** It runs on your servers with your Plivo account, and calls, recordings and reports stay in your database.
+- **Your data stays yours.** It runs on your servers with your Plivo account, and calls and reports stay in your database. HS stores recording metadata and serves a signed `audio_url`. The audio itself stays with Plivo.
 
 ## How it works
 

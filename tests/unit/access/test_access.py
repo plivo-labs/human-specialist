@@ -375,7 +375,7 @@ def test_a_plivo_refusal_that_names_the_app_or_a_url_is_relayed(monkeypatch):
 
     body = {
         "app_name": ["hs-3f2a9c1e-7b4d-4e8a-9c0f-1a2b3c4d5e6f already exists"],
-        "answer_url": "https://humancontactcenterproduction.example.com/plivo/3f2a9c1e-7b4d-4e8a-9c0f-1a2b3c4d5e6f/answer is down",
+        "answer_url": "https://hs.example.com/plivo/3f2a9c1e-7b4d-4e8a-9c0f-1a2b3c4d5e6f/answer is down",
     }
     monkeypatch.setattr(httpx, "request", lambda *a, **k: httpx.Response(400, json=body))
     with pytest.raises(ApiError) as e:

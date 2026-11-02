@@ -72,9 +72,6 @@ def fake_cache(monkeypatch):
     return fc
 
 
-# ============================================================== async conversation routing model
-
-
 # ============================================================== unique retry
 class _FakeNested:
     def __enter__(self):

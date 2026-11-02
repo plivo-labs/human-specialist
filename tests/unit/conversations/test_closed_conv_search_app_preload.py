@@ -23,7 +23,7 @@ import os
 import subprocess
 import sys
 
-_PROD_ORDER_REPRO = """
+_ORDER_REPRO = """
 import sys
 import hs.app  # uvicorn entrypoint: must preload every DB-mapped adapter
 assert "hs.conversations.search_store" in sys.modules, (
@@ -44,7 +44,7 @@ print("PRELOAD_OK")
 def test_app_startup_preloads_closed_conv_search_model():
     # The test env from tests/conftest.py; create_engine is lazy, so the import does not connect.
     proc = subprocess.run(
-        [sys.executable, "-c", _PROD_ORDER_REPRO], capture_output=True, text=True, env=os.environ, timeout=120
+        [sys.executable, "-c", _ORDER_REPRO], capture_output=True, text=True, env=os.environ, timeout=120
     )
     # Surface ANY startup failure (ImportError, circular import, mapper error, a real
     # missing-preload regression, ...) as a test FAILURE — never skip, or a genuine
