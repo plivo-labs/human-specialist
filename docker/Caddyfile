@@ -1,0 +1,21 @@
+{
+	log {
+		format filter {
+			request>uri query {
+				replace access_token REDACTED
+			}
+			wrap json
+		}
+	}
+}
+
+:6005 {
+	@hs path /api/* /plivo/* /status /openapi.json
+	handle @hs {
+		reverse_proxy {$HS_UPSTREAM}
+	}
+	handle {
+		root * /srv
+		file_server
+	}
+}

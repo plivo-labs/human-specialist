@@ -26,7 +26,4 @@ def test_openapi_matches_the_snapshot(app):
 if __name__ == "__main__":
     import tests.conftest  # noqa: F401  # the test env hs reads at import
 
-    app = routes.import_app()
-    if app is None:
-        raise SystemExit("hs.app not built yet")
-    SNAPSHOT.write_text(render(app))
+    SNAPSHOT.write_text(render(routes.import_app()))

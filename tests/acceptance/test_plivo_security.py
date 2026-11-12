@@ -1,5 +1,4 @@
-"""Plivo-facing routes: V3 signature against the tenant's own token over PUBLIC_BASE_URL; refused dial-outs; a
-callback any tenant can sign acts only on that tenant's own calls."""
+"""Plivo-facing routes: V3 signature against the tenant's own token over PUBLIC_BASE_URL; refused dial-outs."""
 
 import json
 import time
@@ -112,6 +111,15 @@ def signed_by(other, path: str, params: dict):
     return plivo_post(other.world, other.id, path, params, other.auth_token)
 
 
+def hs_query(world, path: str, cid: str) -> str:
+    """The query of the `path` callback URL HS gave Plivo for conversation `cid`, as a forger who saw it would send."""
+    return next(
+        c.url.partition("?")[2].partition("#")[0]
+        for c in world.plivo.callbacks
+        if f"/{path}?" in c.url and f"c={cid}" in c.url
+    )
+
+
 def naming(tenant, cid: str) -> list[str]:
     """The types of the tenant's events about this conversation, once all committed ones are visible."""
     tenant.world.wait(tenant.world.plivo.idle, what="the Plivo simulator to go idle")
@@ -162,6 +170,24 @@ def test_another_tenants_callback_naming_a_call_in_a_menu_changes_nothing(world,
     assert closed["data"]["result"] == "abandoned"
 
 
+@pytest.mark.parametrize("path", ["answer", "actions/menu", "enqueue"])
+def test_a_signed_answer_naming_another_tenants_call_is_answered_as_an_unknown_call(world, tenant, path):
+    caller, cid, _ = in_menu(tenant)
+    other = world.new_tenant("Other")
+    number, m = menu_line(other, {"1": hangup_action()})
+    unknown = signed_by(other, "answer", answer_params(other.number()))
+    params = {**answer_params(number), "CallUUID": caller.call_uuid}
+    if path == "enqueue":
+        url = other.queue()["enqueue_url"]
+        foreign = world.anon().post(url, data=params, headers=world.plivo.sign(url, params, other.auth_token))
+    else:
+        foreign = signed_by(other, path + (f"?menu_id={m['id']}" if path == "actions/menu" else ""), params)
+    assert (foreign.status_code, foreign.text) == (unknown.status_code, unknown.text)
+    assert caller.state == "in_progress" and "conversation.closed" not in naming(tenant, cid)
+    fence(other)
+    assert not other.events(type="conversation.started")
+
+
 @pytest.mark.parametrize("path", ["mpc-status", "call-status", "recording"])
 def test_another_tenants_engine_callback_naming_an_answered_call_changes_nothing(world, tenant, path):
     live, other = connect(tenant), world.new_tenant("Other")
@@ -180,47 +206,40 @@ def test_another_tenants_engine_callback_naming_an_answered_call_changes_nothing
     }[path]
     params |= {"HangupTime": now, "PlivoHangupCauseCode": "4000", "PlivoHangupSource": "Callee"}
     before = naming(tenant, live.id)
-    run = live.caller.mpc.removeprefix("mpc_")
-    signed_by(other, f"{path}?call_uuid={live.caller.call_uuid}&qnr_run_uuid={run}", params)
+    signed_by(
+        other, f"{path}?{hs_query(world, 'call-status' if path == 'call-status' else 'mpc-status', live.id)}", params
+    )
+    world.run_jobs()
     assert naming(tenant, live.id) == before and live.caller.state == live.leg.state == "in_progress"
     assert ok(tenant.api.get("/api/v1/recordings", params={"conversation_id": live.id}))["data"] == []
 
 
-def leg_ends(world, leg_uuid: str) -> list:
-    with world._db.cursor() as cur:
-        cur.execute("SELECT end_time FROM call_leg WHERE call_uuid = %s", (leg_uuid,))
-        return [row[0] for row in cur.fetchall()]
+def leg_ends(tenant, cid: str, leg_uuid: str) -> list:
+    """When each of the conversation's legs on `leg_uuid` ended, as the conversation read shows it."""
+    legs = ok(tenant.api.get(f"/api/v1/conversations/{cid}"))["legs"]
+    return [leg["ended_at"] for leg in legs if leg["call_uuid"] == leg_uuid]
 
 
 def test_a_participant_exit_for_a_tenants_own_call_cannot_end_another_tenants_leg(world, tenant):
     live, other = connect(tenant), world.new_tenant("Other")
     own, leg, forged = connect(other), live.leg.call_uuid, "2000-01-01 00:00:00"
-    world.wait(lambda: leg_ends(world, leg) == [None], what="the agent's leg row")
+    world.wait(lambda: leg_ends(tenant, live.id, leg) == [None], what="the agent's leg")
     params = {"EventName": "ParticipantExit", "MPCName": own.caller.mpc, "SequenceNumber": "99"}
     params |= {"ParticipantCallUUID": leg, "ParticipantRole": "agent", "MemberAddress": "sip:forged@phone.plivo.com"}
     params |= {"ParticipantJoinTime": forged, "ParticipantExitTime": forged, "ParticipantExitCause": "Forged"}
-    run = own.caller.mpc.removeprefix("mpc_")
-    signed_by(other, f"mpc-status?call_uuid={own.caller.call_uuid}&qnr_run_uuid={run}", params)
-    assert live.caller.state == live.leg.state == "in_progress" and leg_ends(world, leg) == [None]
+    signed_by(other, f"mpc-status?{hs_query(world, 'mpc-status', own.id)}", params)
+    world.run_jobs()
+    assert live.caller.state == live.leg.state == "in_progress" and leg_ends(tenant, live.id, leg) == [None]
     live.caller.hangup()
     live.stream.wait_for("call.ended", conversation_id=live.id)
-    world.wait(lambda: leg_ends(world, leg) != [None], what="the agent's leg end")
-    assert leg_ends(world, leg) != [forged]
-
-
-def leg_recordings(world, leg_uuid: str) -> int:
-    with world._db.cursor() as cur:
-        cur.execute(
-            "SELECT count(*) FROM recording r JOIN call_leg l ON l.id = r.call_leg_id WHERE l.call_uuid = %s",
-            (leg_uuid,),
-        )
-        return cur.fetchone()[0]
+    world.wait(lambda: leg_ends(tenant, live.id, leg) != [None], what="the agent's leg end")
+    assert not leg_ends(tenant, live.id, leg)[0].startswith("2000-01-01")
 
 
 def test_a_participant_recording_for_a_tenants_own_call_cannot_attach_to_another_tenants_leg(world, tenant):
     live, other = connect(tenant), world.new_tenant("Other")
     own, leg, now = connect(other), live.leg.call_uuid, time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
-    world.wait(lambda: leg_ends(world, leg) == [None], what="the agent's leg row")
+    world.wait(lambda: leg_ends(tenant, live.id, leg) == [None], what="the agent's leg")
     params = {
         "EventName": "ParticipantRecordingCompleted",
         "ParticipantCallUUID": leg,
@@ -228,9 +247,10 @@ def test_a_participant_recording_for_a_tenants_own_call_cannot_attach_to_another
     }
     params |= {"RecordingUUID": str(uuid.uuid4()), "RecordingURL": "https://example.test/Recording/forged.mp3"}
     params |= {"RecordingDuration": "5", "RecordingStartTime": now, "RecordingEndTime": now}
-    run = own.caller.mpc.removeprefix("mpc_")
-    signed_by(other, f"recording?call_uuid={own.caller.call_uuid}&qnr_run_uuid={run}", params)
-    assert leg_recordings(world, leg) == 0
+    signed_by(other, f"recording?{hs_query(world, 'mpc-status', own.id)}", params)
+    world.run_jobs()
+    assert ok(tenant.api.get("/api/v1/recordings", params={"conversation_id": live.id}))["data"] == []
+    assert ok(tenant.api.get(f"/api/v1/conversations/{live.id}"))["recording_ids"] == []
 
 
 def test_another_tenants_transcription_naming_a_recording_leaves_its_transcript_alone(world, tenant):
@@ -244,7 +264,7 @@ def test_another_tenants_transcription_naming_a_recording_leaves_its_transcript_
     )
     forged = json.dumps([{"start": 0.0, "end": 1.0, "text": "Forged words"}])
     params = {"recording_id": track.id, "call_uuid": track.call_uuid, "transcription": forged}
-    signed_by(other, f"transcription?call_uuid={live.caller.call_uuid}", params)
+    signed_by(other, f"transcription?c={live.id}", params)
     world.run_jobs()
     assert "Forged words" not in json.dumps(ok(tenant.api.get(f"/api/v1/recordings/{rid}/transcript")))
 
@@ -257,5 +277,5 @@ def test_another_tenants_dial_callback_naming_a_ringing_click_to_call_changes_no
     leg = agent.phone.wait_ring()
     other, before = world.new_tenant("Other"), naming(tenant, cid)
     params = {**answer_params("+14155550123"), "Direction": "outbound", "HangupCauseCode": "3010"}
-    signed_by(other, f"{path}?dial={cid}", params)
+    signed_by(other, f"{path}?c={cid}", params)
     assert naming(tenant, cid) == before and leg.state == "ringing"

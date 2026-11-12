@@ -1,42 +1,24 @@
-"""Webhook subscriptions and their delivery job: signed, never redirected, sent only to a checked public address."""
+"""The webhook delivery job: signed, never redirected, sent only to a checked public address."""
 
 import asyncio
 import hashlib
 import hmac
 import ipaddress
 import json
+import logging
 import socket
 import time
 from datetime import UTC, datetime
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
-from sqlalchemy import Boolean, Column, Index, Table, Text, func, select, true, update
-from sqlalchemy.dialects.postgresql import ARRAY, TIMESTAMP, UUID
+from sqlalchemy import select, update
+from sqlalchemy.engine import Row
 
-from hs import events
-from hs.access import decrypt
-from hs.infra.db import DBBase, core_engine
-from hs.infra.settings import settings
-from hs.jobs import handler
+from hs import core, events, hot, jobs, plivo
 
-webhooks = Table(
-    "webhooks",
-    DBBase.metadata,
-    Column("id", UUID(as_uuid=False), primary_key=True, server_default=func.gen_random_uuid()),
-    Column("tenant_id", Text, nullable=False),
-    Column("url", Text, nullable=False),
-    Column("secret", Text, nullable=False),  # sealed with hs.access.encrypt, as is previous_secret
-    Column("previous_secret", Text),
-    Column("previous_secret_expires_at", TIMESTAMP(timezone=True)),
-    Column("event_types", ARRAY(Text), nullable=False, server_default="{}"),
-    Column("enabled", Boolean, nullable=False, server_default=true()),
-    Column("created_at", TIMESTAMP(timezone=True), nullable=False, server_default=func.now()),
-    Index("ix_webhooks_tenant", "tenant_id"),
-)
-
-RETRIES = (10, 60, 300, 1800, 7200, 21600, 43200)
-DEADLINE = settings.webhook_deadline  # seconds for the whole delivery: connect, send, and the answer's status line
+log = logging.getLogger(__name__)
+DEADLINE = 10.0  # seconds for the whole delivery: connect, send, and the answer's status line
 NAT64 = ipaddress.ip_network("64:ff9b::/96")
 
 
@@ -46,7 +28,7 @@ def destination(url: str) -> str | None:
     host, port = parts.hostname, parts.port
     if not host or parts.username is not None:
         raise ValueError("a webhook URL needs a host and no credentials")
-    if host in {h.lower() for h in settings.webhook_private_hosts} and parts.scheme in ("http", "https"):
+    if host in {h.lower() for h in core.settings.webhook_private_hosts} and parts.scheme in ("http", "https"):
         return None
     if parts.scheme != "https":
         raise ValueError("webhook URLs must use https")
@@ -93,17 +75,20 @@ async def post(url: str, body: bytes, headers: dict[str, str]) -> int:
             return answer.status_code
 
 
-@handler("webhook", backoff=RETRIES)
-def deliver(payload: dict) -> None:
-    """Payload {webhook_id, event_id} for an outbox event, or {webhook_id, body} for a test event."""
-    with core_engine.connect() as conn:
-        hook = conn.execute(select(webhooks).where(webhooks.c.id == payload["webhook_id"])).first()
-        body = payload.get("body") or events.one(conn, payload["event_id"])
-    if hook is None or not hook.enabled or body is None:
-        return
-    keys = [decrypt(hook.secret)]
+@jobs.handler("webhook", backoff=events.RETRIES, lane="webhook")
+def deliver(job: Row) -> core.ApiError | None:
+    """Payload {webhook_id, body}: the envelope rides on the job, so a parked delivery outlives its event. Only a 5xx
+    or a failed exchange is retried; any other answer but a 2xx or a 410 is a refusal another try would get again."""
+    W, body = core.T.webhooks, job.payload["body"]
+    with core.read() as db:
+        hook = db.execute(select(W).where(W.c.id == job.payload["webhook_id"])).first()
+    if hook is None or not hook.enabled:
+        return None
+    if hot.tripped(hook.tenant_id, hook.id):
+        raise jobs.NotYet(f"webhook {hook.id} rests after a failed exchange")
+    keys = [plivo.decrypt(hook.secret)]
     if hook.previous_secret and hook.previous_secret_expires_at > datetime.now(UTC):
-        keys.append(decrypt(hook.previous_secret))
+        keys.append(plivo.decrypt(hook.previous_secret))
     raw, now = json.dumps(body, separators=(",", ":")).encode(), int(time.time())
     headers = {
         "Content-Type": "application/json",
@@ -111,9 +96,17 @@ def deliver(payload: dict) -> None:
         "X-HS-Timestamp": str(now),
         "X-HS-Signature": signature(now, raw, *keys),
     }
-    status = asyncio.run(post(hook.url, raw, headers))
+    try:
+        status = asyncio.run(post(hook.url, raw, headers))
+    except Exception:
+        hot.trip(hook.tenant_id, hook.id)
+        raise
     if status == 410:
-        with core_engine.begin() as conn:
-            conn.execute(update(webhooks).where(webhooks.c.id == hook.id).values(enabled=False))
-    elif not 200 <= status < 300:
+        with core.tx() as db:
+            db.execute(update(W).where(W.c.id == hook.id).values(enabled=False))
+    elif 500 <= status <= 599:
         raise RuntimeError(f"webhook answered {status}")
+    elif not 200 <= status < 300:
+        log.warning("webhook %s answered %s: parked, not retried", hook.id, status)
+        return core.ApiError(502, "webhook_refused", f"the webhook answered {status}")
+    return None

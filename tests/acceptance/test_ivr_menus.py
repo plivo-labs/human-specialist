@@ -2,11 +2,11 @@
 
 import json
 import threading
-import time
 import uuid
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from urllib.parse import urlsplit
-
-from psycopg2 import sql
 
 from tests.acceptance.conftest import (
     answer_params,
@@ -29,6 +29,8 @@ from tests.acceptance.conftest import (
     voicemail_action,
     with_query,
 )
+
+RACES = 5
 
 
 def test_each_of_three_options_runs_its_action(world, tenant):
@@ -70,6 +72,23 @@ def test_an_invalid_digit_reprompts_then_routes_the_next_one(world, tenant):
         lambda: len(seen(stream, "conversation.menu_input")) == 2 and seen(stream, "conversation.menu_input")
     )
     assert [(e["data"]["input"], e["data"]["attempt"]) for e in inputs] == [("invalid", 1), ("1", 2)]
+
+
+def test_a_replayed_answer_and_menu_digit_get_the_same_xml_and_one_event_each(world, tenant):
+    number, _ = menu_line(tenant, {"1": hangup_action("One")})
+    call = answer_params(number)
+
+    def twice(url: str, params: dict) -> str:
+        signed = world.plivo.sign(url, params, tenant.auth_token)
+        first, again = [world.anon().post(url, data=params, headers=signed) for _ in range(2)]
+        assert first.status_code == again.status_code == 200 and first.text == again.text
+        return first.text
+
+    answered = twice(f"{world.base_url}/plivo/{tenant.id}/answer", call)
+    action = ET.fromstring(answered).find("GetDigits").get("action").partition("#")[0]  # noqa: S314 (HS's own reply)
+    assert "One" in twice(action, {**call, "Digits": "1"})
+    fence(tenant)
+    assert len(tenant.events(type="conversation.started")) == len(tenant.events(type="conversation.menu_input")) == 1
 
 
 def test_a_menu_option_can_open_a_nested_menu(world, tenant):
@@ -161,7 +180,7 @@ def test_a_calls_key_enqueues_a_live_call_by_json_into_the_queues_room(world, te
     body = {"call_uuid": caller.call_uuid, "from": "+14155550111", "to": number}
     r = tenant.key_with("calls").post(q["enqueue_url"], json=body)
     assert r.is_success and r.headers["content-type"].startswith("application/json")
-    assert ok(r)["active_queue_entry_id"]
+    assert list(ok(r)) == ["conversation_id"]
     leg = agent.phone.wait_ring()
     stream.wait_for("offer.accepted", conversation_id=ok(r)["conversation_id"])
     world.wait(lambda: caller.mpc and caller.mpc == leg.mpc, what="the caller in the queue's room with the agent")
@@ -204,6 +223,15 @@ def test_a_hangup_posted_to_an_enqueue_url_does_not_enqueue_again(world, tenant)
     world.wait(world.plivo.idle)
     fence(tenant)
     assert len([e for e in tenant.events(type="conversation.queued") if e["conversation_id"] == cid]) == 1
+
+
+def test_a_menu_change_applies_to_the_next_call(world, tenant):
+    number, m = menu_line(tenant, {"1": hangup_action("Old option")}, greeting="Old greeting")
+    change = {"greeting": {"text": "New greeting"}, "options": {"1": hangup_action("New option")}}
+    ok(tenant.api.patch(f"/api/v1/menus/{m['id']}", json=change))
+    caller = world.plivo.call(number, digits="1")
+    caller.wait_state("completed")
+    assert in_order(caller.said, "New greeting", "New option") and "Old greeting" not in caller.said
 
 
 def test_a_late_exit_from_the_queue_a_caller_left_for_a_menu_keeps_the_conversation(world, tenant):
@@ -255,7 +283,8 @@ def test_a_menu_or_queue_a_number_routes_to_cannot_be_deleted(tenant):
     for kind, target, action in (("queues", q, queue_action(q)), ("menus", m, {"type": "menu", "menu_id": m["id"]})):
         number = tenant.number()
         tenant.route_number(number, action)
-        error(tenant.api.delete(f"/api/v1/{kind}/{target['id']}"), 409, f"{kind[:-1]}_in_use")
+        refused = error(tenant.api.delete(f"/api/v1/{kind}/{target['id']}"), 409, f"{kind[:-1]}_in_use")
+        assert refused["message"] == "a number, queue or menu names this"
         tenant.route_number(number, hangup_action())
         assert tenant.api.delete(f"/api/v1/{kind}/{target['id']}").status_code == 204
 
@@ -272,30 +301,6 @@ def test_a_queue_or_menu_another_row_names_cannot_be_deleted(tenant):
     assert tenant.api.delete(f"/api/v1/queues/{fallback['id']}").status_code == 204
 
 
-def test_a_menu_saved_with_a_hash_option_still_reads_and_patches(world, tenant):
-    m = menu(tenant, {"1": hangup_action()})
-    with world._db.cursor() as cur:
-        cur.execute(
-            "UPDATE menus SET body = jsonb_set(body, '{options,#}', %s::jsonb) WHERE id = %s",
-            (json.dumps(hangup_action()), m["id"]),
-        )
-    assert "#" in ok(tenant.api.get(f"/api/v1/menus/{m['id']}"))["options"]
-    assert any(row["id"] == m["id"] for row in ok(tenant.api.get("/api/v1/menus"))["data"])
-    renamed = ok(tenant.api.patch(f"/api/v1/menus/{m['id']}", json={"name": "Renamed"}))
-    assert renamed["name"] == "Renamed" and set(renamed["options"]) == {"1", "#"}
-
-
-def test_a_menu_that_replaces_options_drops_the_hash_option(world, tenant):
-    m = menu(tenant, {"1": hangup_action()})
-    with world._db.cursor() as cur:
-        cur.execute(
-            "UPDATE menus SET body = jsonb_set(body, '{options,#}', %s::jsonb) WHERE id = %s",
-            (json.dumps(hangup_action()), m["id"]),
-        )
-    ok(tenant.api.patch(f"/api/v1/menus/{m['id']}", json={"options": {"2": hangup_action()}}))
-    assert set(ok(tenant.api.get(f"/api/v1/menus/{m['id']}"))["options"]) == {"2"}
-
-
 def test_free_text_naming_a_queue_does_not_block_its_delete(tenant):
     q = tenant.queue(name="Mentioned")
     menu(tenant, {"1": hangup_action()}, greeting=f"queue {q['id']}")
@@ -310,51 +315,83 @@ def test_a_voicemail_mailbox_queue_blocks_its_delete(tenant):
     error(tenant.api.delete(f"/api/v1/queues/{q['id']}"), 409, "queue_in_use")
 
 
-def written_while_deleted(world, table: str, row_id: str, send, *args, **kwargs) -> int:
-    """The status of a write sent while a delete holds the row's lock, as the API's delete does, then commits."""
-    db = world._db
-    db.autocommit = False
-    cur = db.cursor()
-    cur.execute(sql.SQL("SELECT id FROM {} WHERE id = %s FOR UPDATE").format(sql.Identifier(table)), (row_id,))
-    done = {}
-    t = threading.Thread(target=lambda: done.update(r=send(*args, **kwargs)))
-    t.start()
-    for _ in range(100):
-        with db.cursor() as c:
-            c.execute(
-                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'"
-            )
-            if c.fetchone()[0]:
-                break
-        time.sleep(0.05)
-    cur.execute(sql.SQL("DELETE FROM {} WHERE id = %s").format(sql.Identifier(table)), (row_id,))
-    db.commit()
-    db.autocommit = True
-    t.join(10)
-    return done["r"].status_code
+def test_a_menu_or_queue_only_its_own_action_names_can_be_deleted(tenant):
+    m, q = menu(tenant, {"1": hangup_action()}), tenant.queue(name="Loop")
+    ok(tenant.api.patch(f"/api/v1/menus/{m['id']}", json={"options": {"1": {"type": "menu", "menu_id": m["id"]}}}))
+    ok(tenant.api.patch(f"/api/v1/queues/{q['id']}", json={"overflow_action": queue_action(q)}))
+    assert tenant.api.delete(f"/api/v1/menus/{m['id']}").status_code == 204
+    assert tenant.api.delete(f"/api/v1/queues/{q['id']}").status_code == 204
+
+
+def raced(write, delete, landed: int, in_use: str):
+    """A write and the delete of a document it names, sent through the API at the same moment. One lands and the
+    other is refused: the write's response when it landed with `landed` and the delete got 409 `in_use`, else None
+    when the delete landed and the write got 422 foreign_id."""
+    start = threading.Barrier(2)
+
+    def send(call):
+        start.wait(5)
+        return call()
+
+    with ThreadPoolExecutor(2) as pool:
+        wrote, deleted = pool.map(send, (write, delete))
+    if deleted.status_code == 204:
+        error(wrote, 422, "foreign_id")
+        return None
+    assert wrote.status_code == landed, f"{wrote.status_code} {wrote.text}"
+    error(deleted, 409, in_use)
+    return wrote
 
 
 def test_a_route_cannot_name_a_voicemail_queue_deleted_meanwhile(world, tenant):
-    q, number = tenant.queue(name="Box"), tenant.number()
-    route = {"open_action": hangup_action(), "closed_action": voicemail_action(q)}
-    assert (
-        written_while_deleted(world, "queues", q["id"], tenant.api.put, f"/api/v1/numbers/{number}", json=route) == 422
-    )
+    number = tenant.number()
+    url = f"/api/v1/numbers/{number}"
+
+    def route(q):
+        return {"open_action": hangup_action(), "closed_action": voicemail_action(q)}
+
+    gone = tenant.queue(name="Box")
+    pointing = f"/Number/{number.removeprefix('+')}/"
+    held = world.plivo.fault("stall", lambda r: r.method == "POST" and pointing in r.path, account=tenant.auth_id)
+    with ThreadPoolExecutor(1) as pool:
+        put = pool.submit(tenant.api.put, url, json=route(gone))
+        world.wait(lambda: held.hits, what="the route to reach Plivo")
+        assert tenant.api.delete(f"/api/v1/queues/{gone['id']}").status_code == 204
+        held.release()
+        error(put.result(), 422, "foreign_id")
+    error(tenant.api.get(url), 404, "number_not_found")
+    box = tenant.queue(name="Box")
+    ok(tenant.api.put(url, json=route(box)))
+    error(tenant.api.delete(f"/api/v1/queues/{box['id']}"), 409, "queue_in_use")
+    assert ok(tenant.api.get(url))["closed_action"]["mailbox"]["queue_id"] == box["id"]
+    assert ok(tenant.api.get(f"/api/v1/queues/{box['id']}"))["id"] == box["id"]
 
 
-def test_a_queue_cannot_overflow_to_a_queue_deleted_meanwhile(world, tenant):
-    fallback = tenant.queue(name="Fallback")
-    busy = {"name": "Busy", "overflow_action": queue_action(fallback)}
-    assert written_while_deleted(world, "queues", fallback["id"], tenant.api.post, "/api/v1/queues", json=busy) == 422
+def test_a_queue_cannot_overflow_to_a_queue_deleted_meanwhile(tenant):
+    for i in range(RACES):
+        fallback = tenant.queue(name=f"Fallback {i}")
+        post = partial(
+            tenant.api.post, "/api/v1/queues", json={"name": f"Busy {i}", "overflow_action": queue_action(fallback)}
+        )
+        wrote = raced(post, partial(tenant.api.delete, f"/api/v1/queues/{fallback['id']}"), 201, "queue_in_use")
+        assert tenant.api.get(f"/api/v1/queues/{fallback['id']}").status_code == (200 if wrote else 404)
+        queues = ok(tenant.api.get("/api/v1/queues", params={"limit": 100}))["data"]
+        named = [q["id"] for q in queues if (q["overflow_action"] or {}).get("queue_id") == fallback["id"]]
+        assert named == ([wrote.json()["id"]] if wrote else [])
 
 
-def test_a_menu_option_cannot_name_a_menu_deleted_meanwhile_and_may_name_its_own_menu(world, tenant):
-    inner, outer = menu(tenant, {"1": hangup_action()}), menu(tenant, {"1": hangup_action()})
-    options = {"1": {"type": "menu", "menu_id": inner["id"]}, "2": {"type": "menu", "menu_id": outer["id"]}}
-    url = f"/api/v1/menus/{outer['id']}"
-    assert written_while_deleted(world, "menus", inner["id"], tenant.api.patch, url, json={"options": options}) == 422
-    del options["1"]
-    assert ok(tenant.api.patch(url, json={"options": options}))["options"] == options
+def test_a_menu_option_cannot_name_a_menu_deleted_meanwhile_and_may_name_its_own_menu(tenant):
+    outer = menu(tenant, {"1": hangup_action()})
+    url, own = f"/api/v1/menus/{outer['id']}", {"2": {"type": "menu", "menu_id": outer["id"]}}
+    for _ in range(RACES):
+        inner = menu(tenant, {"1": hangup_action()})
+        before = ok(tenant.api.get(url))["options"]
+        options = {"1": {"type": "menu", "menu_id": inner["id"]}} | own
+        patch = partial(tenant.api.patch, url, json={"options": options})
+        wrote = raced(patch, partial(tenant.api.delete, f"/api/v1/menus/{inner['id']}"), 200, "menu_in_use")
+        assert ok(tenant.api.get(url))["options"] == (options if wrote else before)
+        assert tenant.api.get(f"/api/v1/menus/{inner['id']}").status_code == (200 if wrote else 404)
+        assert ok(tenant.api.patch(url, json={"options": own}))["options"] == own
 
 
 def test_a_menu_option_that_names_its_own_menu_is_accepted_and_reads_back(world, tenant):

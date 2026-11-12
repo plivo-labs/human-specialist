@@ -4,6 +4,8 @@ import json
 import logging
 import time
 
+import pytest
+
 from tests.acceptance.conftest import (
     connect,
     data_frames,
@@ -88,6 +90,23 @@ def test_the_stream_sends_auth_expired_then_closes(tenant):
     stream.wait_closed()
 
 
+def test_a_revoked_keys_stream_gets_auth_expired_and_closes(world, tenant):
+    minted = ok(world.operator.post(f"/api/v1/tenants/{tenant.id}/api-keys", json={"scopes": ["events"]}))
+    stream = tenant.stream(token=minted["api_key"])
+    ok(world.operator.delete(f"/api/v1/tenants/{tenant.id}/api-keys/{minted['id']}"))
+    stream.wait_for("auth.expired")
+    stream.wait_closed()
+
+
+def test_a_stream_never_carries_another_tenants_events(world, tenant):
+    other = world.new_tenant("Other")
+    theirs = other.stream(after=0)
+    bump(tenant, "Away")
+    [last] = bump(other, "Away")
+    theirs.wait_for("agent.status_changed", id=last["id"])
+    assert {e["tenant_id"] for e in theirs.events} == {other.id}
+
+
 def test_replay_returns_events_after_the_cursor_in_order_and_pages(tenant):
     events = bump(tenant, "Away", "Available", "Busy")
     page = ok(tenant.api.get("/api/v1/events", params={"after": events[0]["id"]}))
@@ -117,9 +136,10 @@ def test_webhook_deliveries_are_signed_over_timestamp_and_body(world, tenant):
     assert signed_with(sink.wait_for("webhook.test"), hook["secret"])
 
 
-def test_a_failed_delivery_is_retried_and_signed_again(world, tenant):
+@pytest.mark.parametrize("status", [500, 599])
+def test_a_failed_delivery_is_retried_and_signed_again(world, tenant, status):
     sink = world.webhook_sink()
-    sink.respond_with(500)
+    sink.respond_with(status)
     hook = webhook(tenant, sink.url)
     [event] = bump(tenant, "Away")
     first = sink.wait_for("agent.status_changed")
@@ -139,6 +159,19 @@ def test_a_410_disables_the_subscription(world, tenant):
     [later] = bump(tenant, "Busy")
     world.run_jobs()
     assert not delivered(sink, later["id"])
+
+
+@pytest.mark.parametrize("status", [400, 600])
+def test_a_delivery_answered_with_a_4xx_or_past_599_is_not_retried(world, tenant, status):
+    sink = world.webhook_sink()
+    sink.respond_with(status)
+    hook = webhook(tenant, sink.url)
+    [event] = bump(tenant, "Away")
+    sink.wait_for("agent.status_changed")
+    sink.respond_with(200)
+    world.run_jobs()
+    assert len(delivered(sink, event["id"])) == 1
+    assert ok(tenant.api.get(f"/api/v1/webhooks/{hook['id']}"))["enabled"] is True
 
 
 def test_rotating_the_secret_signs_with_both_secrets(world, tenant):
@@ -161,14 +194,14 @@ def test_a_subscription_gets_only_its_event_types(world, tenant):
     assert other.deliveries == []
 
 
-def test_webhooks_do_not_follow_redirects(world, tenant):
+def test_webhooks_neither_follow_nor_retry_redirects(world, tenant):
     target, sink = world.webhook_sink(), world.webhook_sink()
     sink.redirect_to(target.url)
     webhook(tenant, sink.url)
     [event] = bump(tenant, "Away")
     sink.wait_for("agent.status_changed")
-    run_jobs_until(world, lambda: len(delivered(sink, event["id"])) >= 2, "a retry, since a redirect is no success")
-    assert target.deliveries == []
+    world.run_jobs()
+    assert len(delivered(sink, event["id"])) == 1 and target.deliveries == []
 
 
 def test_the_stream_token_never_reaches_the_logs(world, tenant, caplog):
@@ -179,9 +212,13 @@ def test_the_stream_token_never_reaches_the_logs(world, tenant, caplog):
         return any(line.startswith(":") for line in ls)
 
     read_stream(world.anon(), until_ping, params={"access_token": agent.stream_token})
-    hs_lines = [r.getMessage() for r in caplog.records if not r.name.startswith(("httpx", "httpcore"))]
-    assert any("/events/stream" in line for line in hs_lines)
-    assert not [line for line in hs_lines if agent.stream_token in line]
+
+    def hs_lines() -> list[str]:
+        return [r.getMessage() for r in caplog.records if not r.name.startswith(("httpx", "httpcore"))]
+
+    # The access line of a streamed response is written once the response has ended, after the client let go.
+    world.wait(lambda: any("/events/stream" in line for line in hs_lines()), what="the stream's access line")
+    assert not [line for line in hs_lines() if agent.stream_token in line]
 
 
 def test_private_and_plain_http_webhook_urls_are_refused(world, tenant):
@@ -231,6 +268,24 @@ def test_a_supervisor_stream_gets_its_team_queue_events(world, tenant):
     assert not [e for e in watch.events if e.get("conversation_id") == elsewhere]
 
 
+def test_a_silent_listen_reaches_its_supervisor_and_never_the_agent_it_listens_to(tenant):
+    t = team(tenant, "Floor")
+    lead, sup = (tenant.agent(name, role="supervisor", teams=[t]).login() for name in ("Lead", "Sup"))
+    desk, watch = tenant.stream(token=lead.stream_token, after=0), tenant.stream(token=sup.stream_token, after=0)
+    live = connect(tenant, lead)
+    ok(sup.api().post(f"/api/v1/calls/{live.id}/monitor", json={"mode": "listen"}))
+    sup.phone.wait_ring().wait_state("in_progress")
+    assert watch.wait_for("supervisor.joined", conversation_id=live.id)["data"]["visible"] is False
+    ok(sup.api().delete(f"/api/v1/calls/{live.id}/monitor"))
+    watch.wait_for("supervisor.left", conversation_id=live.id)
+    finish(live)
+    [last] = status_changes(tenant, lead, "Busy")
+    replay = tenant.stream(token=lead.stream_token, after=0)
+    for stream in (desk, replay):
+        stream.wait_for("agent.status_changed", id=last["id"])
+        assert not [e["type"] for e in stream.events if e["type"].startswith("supervisor.")]
+
+
 def test_conversation_events_carry_the_envelope(tenant):
     live = connect(tenant)
     e = live.stream.wait_for("offer.accepted", conversation_id=live.id)
@@ -247,6 +302,18 @@ def test_conversation_events_carry_the_envelope(tenant):
     } <= e.keys()
     assert (e["tenant_id"], e["agent_id"], e["direction"]) == (tenant.id, live.agent.id, "inbound")
     assert e["created_at"].endswith(("Z", "+00:00"))
+
+
+def test_the_agent_who_answers_an_inbound_call_tells_call_answered_once_with_its_leg(tenant):
+    live = connect(tenant)
+    answered = live.stream.wait_for("call.answered", conversation_id=live.id)
+    assert (answered["agent_id"], answered["data"]["call_uuid"]) == (live.agent.id, live.leg.call_uuid)
+    target = tenant.agent("Target").login()
+    cold = {"mode": "cold", "target": {"type": "agent", "agent_id": target.id}}
+    ok(tenant.api.post(f"/api/v1/calls/{live.id}/transfers", json=cold))
+    target.phone.wait_ring().wait_state("in_progress")
+    live.stream.wait_for("call.transferred", conversation_id=live.id, status="completed")
+    assert len(seen(live.stream, "call.answered", conversation_id=live.id)) == 1, "a call is answered once"
 
 
 def test_the_context_of_a_dial_rides_on_every_event_of_the_call(tenant):
@@ -272,3 +339,24 @@ def test_every_event_of_a_call_reaches_both_sse_and_webhooks_in_id_order(world, 
     assert {"offer.created", "offer.accepted", "call.ended", "conversation.closed"} <= {e["type"] for e in mine}
     ids = [int(e["id"]) for e in live.stream.events]
     assert ids == sorted(ids) and len(set(ids)) == len(ids)
+
+
+def test_a_webhook_can_be_paused_repointed_and_deleted(world, tenant):
+    first, second = world.webhook_sink(), world.webhook_sink()
+    hook = webhook(tenant, first.url)
+    url = f"/api/v1/webhooks/{hook['id']}"
+    assert [h["id"] for h in ok(tenant.api.get("/api/v1/webhooks"))["data"]] == [hook["id"]]
+    assert ok(tenant.api.patch(url, json={"enabled": False}))["enabled"] is False
+    [paused] = bump(tenant, "Away")
+    world.run_jobs()
+    assert not delivered(first, paused["id"])
+    moved = ok(tenant.api.patch(url, json={"enabled": True, "url": second.url}))
+    assert (moved["enabled"], moved["url"]) == (True, second.url)
+    [later] = bump(tenant, "Busy")
+    world.wait(lambda: delivered(second, later["id"]), what="delivery to the new url")
+    ok(tenant.api.delete(url))
+    [gone] = bump(tenant, "Away")
+    world.run_jobs()
+    assert not delivered(second, gone["id"]) and first.deliveries == []
+    error(tenant.api.get(url), 404, "webhook_not_found")
+    assert ok(tenant.api.get("/api/v1/webhooks"))["data"] == []

@@ -1,0 +1,14 @@
+# The default rules, minus the placeholder credentials the tests and CI use.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "placeholder credentials in tests and CI"
+regexTarget = "line"
+regexes = [
+  '''(test|ci)-operator-key-of-at-least-32-bytes''',
+  '''hs_at_c2VjcmV0-_x''',
+  '''pw-0123456789''',
+  '''other-secret-0123456789''',
+  '''X-Plivo-Signature-Ma-V2''',
+]

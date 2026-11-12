@@ -1,24 +1,25 @@
-"""A fake Plivo: the REST API HS calls, and a call engine that runs HS's XML and sends V3-signed callbacks.
+"""A fake Plivo: the REST API HS calls, a call engine that runs HS's XML and sends V3-signed callbacks, and
+messaging (SMS, MMS, WhatsApp) with V2-signed webhooks.
 
 One engine thread applies every call and MPC change, in order, and fetches XML (answer, action, redirect,
-transfer and exit-action URLs) inline. Status callbacks (MPC, call-status, hangup, recording,
-transcription) go out through a separate delivery thread, so, as with Plivo, they can reach HS while it is
-still inside another request. REST handlers only read state and queue work, so HS can call the API from
-inside a callback without deadlocking anything. Real time passes only for a phone's `after`, an MPC
-member's `waitTime`, a GetDigits waiting for input, and ring timeouts and retry delays scaled by
-`time_factor`.
+transfer and exit-action URLs) inline. Status callbacks (MPC, call-status, hangup, recording, transcription,
+message) go out through a separate delivery thread, so, as with Plivo, they can reach HS while it is still
+inside another request. REST handlers only read state and queue work, so HS can call the API from inside a
+callback without deadlocking anything. Real time passes only for a phone's `after`, an MPC member's
+`waitTime`, a GetDigits waiting for input, and ring timeouts and retry delays scaled by `time_factor`.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
+import hmac
 import itertools
 import json
 import logging
 import os
 import queue
-import random
 import re
 import secrets
 import socket
@@ -29,12 +30,12 @@ import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from urllib.parse import parse_qsl
 
 import httpx
 import uvicorn
-from plivo.utils.signature_v3 import construct_post_url, get_signature_v3
+from plivo.utils.signature_v3 import construct_get_url, construct_post_url, get_signature_v3
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -43,6 +44,9 @@ from starlette.routing import Route
 log = logging.getLogger(__name__)
 
 SIP_DOMAIN = "phone.plivo.com"
+# A Call's hangup tells StartTime, AnswerTime and EndTime in the account's zone, with no offset; every other time is UTC.
+ACCOUNT_ZONE = timezone(timedelta(hours=5, minutes=30))
+INBOUND_MEDIA_TYPE = "image/jpeg"
 # Plivo hangup cause code -> (HangupCauseName, switch-style hangup_cause, call_status of a never-answered leg)
 CAUSES = {
     1000: ("Canceled", "ORIGINATOR_CANCEL", "cancel"),
@@ -68,6 +72,14 @@ CAUSES = {
 }
 # Stretches every wait deadline (not simulated time) on a loaded machine: HS_TEST_SLOW=3.
 SLOW = float(os.environ.get("HS_TEST_SLOW", "1"))
+
+
+def slow() -> float:
+    """How far a wait's deadline stretches now: SLOW, or the machine's load per CPU when that is more, since a run
+    that starts calm can turn busy. Load stretches it at most 6 times, so a hung HS still fails."""
+    return max(SLOW, min(6.0, os.getloadavg()[0] / (os.cpu_count() or 1)))
+
+
 PHONE_BEHAVIOURS = ("answer", "decline", "timeout", "ignore")
 LEAD_BEHAVIOURS = ("answer", "busy", "no_answer", "reject", "fail")
 FAILURES = {
@@ -108,6 +120,10 @@ MEMBER_TOGGLES = (
     ("coach_mode", "ParticipantCoachModeStart", "ParticipantCoachModeStop"),
 )
 SUSPEND = object()  # an element parked the call (MPC, Dial, a waiting GetDigits); the engine resumes it later
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+REST_FAULTS = ("reject", "lose", "timeout", "stall", "refuse", "slow")
+CALLBACK_FAULTS = ("drop", "duplicate", "race", "delay")
+MEETS = {"sent": CALLBACK_FAULTS, "released": (), "flushed": ("drop", "duplicate", "race")}
 
 
 def free_socket() -> socket.socket:
@@ -135,8 +151,8 @@ def serve(app, sock: socket.socket | None = None) -> tuple[str, Callable[[], Non
     return f"http://127.0.0.1:{sock.getsockname()[1]}", stop
 
 
-def _fmt(t: float) -> str:
-    return datetime.fromtimestamp(t, UTC).strftime("%Y-%m-%d %H:%M:%S") if t else ""
+def _fmt(t: float, zone=UTC) -> str:
+    return datetime.fromtimestamp(t, zone).strftime("%Y-%m-%d %H:%M:%S") if t else ""
 
 
 def _rand(chars: str, n: int) -> str:
@@ -195,33 +211,69 @@ class SimRequest:
     params: dict  # parsed JSON or form body / query
 
 
-@dataclass(eq=False)
-class Fault:
-    """One rule from PlivoSim.fault(); `hits` are the REST requests or callbacks it applied to."""
-
-    sim: PlivoSim
-    action: str
-    account: str
-    match: Callable[[SimRequest], bool]
-    times: float
-    hits: list[SimRequest] = field(default_factory=list)
-    delayed: list = field(default_factory=list)
-    released: bool = False
-
-    def release(self) -> None:
-        """Send the callbacks it delays, behind what was sent meanwhile; from then on it holds nothing."""
-        with self.sim._changed:
-            self.released, delayed, self.delayed = True, self.delayed, []
-        for job in delayed:
-            self.sim._out.put(job)
-
-
 @dataclass
 class SimCallback:
     url: str
     params: dict
     status: int  # HS's response status
     body: str  # HS's response body (XML for answer/action URLs)
+
+
+@dataclass(eq=False)
+class Fault:
+    """One rule from PlivoSim.fault(); `hits` are the REST requests or callbacks it applied to."""
+
+    sim: PlivoSim
+    action: str
+    account: str | None
+    match: Callable[[SimRequest], bool]
+    times: float
+    status: int
+    after: Callable[[SimRequest], bool] | None
+    hits: list[SimRequest] = field(default_factory=list)
+    delayed: list = field(default_factory=list)
+    released: threading.Event = field(default_factory=threading.Event)
+    waiters: list = field(default_factory=list)
+    error: str = "rejected by the test"  # a reject's body: {"error": error}
+    after_sec: float = 0
+
+    def release(self, send: bool = True) -> None:
+        """Answer the replies it stalls and send the callbacks it delays (`send` False: drop them); from then
+        on it holds nothing."""
+        with self.sim._changed:
+            self.released.set()
+            delayed, self.delayed = self.delayed, []
+            waiters, self.waiters = self.waiters, []
+        for wake in waiters:
+            wake()
+        for job in delayed if send else ():
+            self.sim._out.put((job, "released"))
+
+    def flush(self) -> None:
+        """Send the callbacks it holds now, newest first, each on its own thread and through the other callback
+        faults, so they race each other and what the calls send meanwhile; keep holding the ones that come later."""
+        with self.sim._changed:
+            delayed, self.delayed = self.delayed, []
+        for job in reversed(delayed):
+            self.sim._out.put((job, "flushed"))
+
+
+@dataclass(eq=False)
+class SimMessage:
+    direction: str  # inbound | outbound
+    type: str  # sms | mms | whatsapp
+    from_: str
+    to: str
+    text: str
+    media: list[str]
+    auth_id: str
+    template: dict | None = None
+    interactive: dict | None = None  # WhatsApp buttons or a list, as Plivo takes them
+    location: dict | None = None
+    state: str = "queued"  # queued | sent | delivered | undelivered | failed | received (inbound)
+    error_code: str = "000"
+    created: float = field(default_factory=time.time)
+    message_uuid: str = field(default_factory=lambda: str(uuid.uuid4()))
 
 
 @dataclass
@@ -238,6 +290,7 @@ class SimCall:
 
     # Engine state, set by PlivoSim._new_call.
     _sim = _account = _ring = _member = _resume = _dialing = _dial_a = _bridge = _playing = _status = _menu = None
+    _wait = None
     _digits, _request_uuid, _source, _dialled = "", "", "", ""
     _started = _answered = _ended = 0.0
 
@@ -250,6 +303,10 @@ class SimCall:
         """Keypad presses: DTMF into the MPC when the leg is in one, else input for the waiting GetDigits."""
         self._sim._queue(self._sim._press, self, digits)
 
+    def answer(self) -> None:
+        """The person at this leg answers it now, while it rings (a leg Plivo dialled, whatever its phone's on_ring)."""
+        self._sim._queue(self._sim._ring_outcome, self, "answer")
+
     def hangup(self) -> None:
         """The person on this leg hangs up (declines it while it rings)."""
         self._sim._queue(self._sim._hangup_by_party, self)
@@ -258,10 +315,14 @@ class SimCall:
         """The member Speak/Play the MPC API started on this leg finished playing."""
         self._sim._queue(self._sim._media_done, self)
 
+    def wait_out(self) -> None:
+        """The waitTime of this leg's MPC member runs out now, however much of it was left."""
+        self._sim._queue(lambda: self._sim._wait_timeout(self._member))
+
     def wait_state(self, state: str, timeout: float = 5.0) -> SimCall:
         """Wait until the leg has been in `state` (a call that already ended still counts as answered)."""
         with self._sim._changed:
-            if not self._sim._changed.wait_for(lambda: state in self._history, timeout * SLOW):
+            if not self._sim._changed.wait_for(lambda: state in self._history, timeout * slow()):
                 raise AssertionError(f"call to {self.to} never reached {state}; it is {self.state}")
         return self
 
@@ -299,7 +360,7 @@ class SimPhone:
     def wait_ring(self, timeout: float = 5.0) -> SimCall:
         """The next leg that rang this phone (each leg is returned once, in ring order)."""
         with self._sim._changed:
-            if not self._sim._changed.wait_for(lambda: len(self.legs) > self._taken, timeout * SLOW):
+            if not self._sim._changed.wait_for(lambda: len(self.legs) > self._taken, timeout * slow()):
                 raise AssertionError(f"{self.endpoint_username} did not ring")
         self._taken += 1
         return self.legs[self._taken - 1]
@@ -325,10 +386,11 @@ class _Recording:
     kind: str  # call | mpc | participant
     call_uuid: str
     callback: tuple  # (recording callback URL, method, transcription URL)
-    track: str = "participant"  # a participant recording's record_track_type: participant or all
     start: float = field(default_factory=time.time)
     end: float = 0.0
     deleted: bool = False
+    track: str = "participant"  # a participant recording's record_track_type: participant or all
+    speech_offset: float = 0.0
 
 
 @dataclass(eq=False)
@@ -376,40 +438,42 @@ class _Ring:
 
 
 class PlivoSim:
-    """Fake Plivo: REST API (calls, MPC, endpoints, applications, numbers, recordings, account) and a
-    call engine that executes HS's XML and sends signed (V3) callbacks like Plivo does.
+    """Fake Plivo: REST API (calls, MPC, endpoints, applications, numbers, recordings, messages, WhatsApp templates,
+    account)
+    and a call engine that executes HS's XML and sends signed (V3) callbacks like Plivo does.
 
-    Knobs: `shuffle_seed` reorders and delays status callbacks (seeded); `deliver_twice` sends each one
-    twice; `time_factor` scales ring timeouts, retry delays and recording durations; `short_takes` makes
-    every recording 0 s long; `member_address` is "dialled" (as HS dialled it), "plus" or "bare" (no sip:);
-    `exit_after_events` delivers a room's ParticipantExit and MPCEnd before the leaving members' exit actions
-    are fetched, an order Plivo's concurrent sends allow; `transcribe_first` delivers a <Record> transcription before the element's action URL is fetched.
+    Knobs: `time_factor` scales ring timeouts, retry delays and recording durations, but a factor over 1 never
+    delays a voice callback's retry past Plivo's own; `short_takes` makes every recording 0 s long; `member_address`
+    is "dialled" (as HS dialled it), "plus" or "bare" (no sip:); `exit_after_events` delivers a room's
+    ParticipantExit and MPCEnd before the leaving members' exit actions are fetched, an order Plivo's concurrent
+    sends allow; `transcribe_first` delivers a <Record> transcription before the element's action URL is fetched;
+    `fault()` injects provider faults.
     """
 
-    def __init__(self, shuffle_seed: int | None = None, deliver_twice: bool = False, time_factor: float = 0.1):
+    def __init__(self, time_factor: float = 0.1):
         self.requests: list[SimRequest] = []
         self.callbacks: list[SimCallback] = []
         self.calls: list[SimCall] = []  # every leg, in creation order
+        self.messages: list[SimMessage] = []  # every message, both directions, in creation order
+        self.templates: set[tuple[str, str]] = set()  # approved WhatsApp templates: (name, language)
+        self.wabas: dict[tuple[str, str], list[dict]] = {}  # (auth_id, WABA id) -> its templates, as Plivo shows them
         self.errors: list[BaseException] = []  # engine failures; a healthy run has none
+        self.faults: list[Fault] = []  # checked in order; the first that matches applies
         self.transcript = "Hi, please call me back about my order."
-        self.shuffle_seed, self.deliver_twice, self.time_factor = shuffle_seed, deliver_twice, time_factor
-        self.short_takes, self.member_address, self.exit_after_events, self.transcribe_first = (
-            False,
-            "dialled",
-            False,
-            False,
-        )
+        self.time_factor, self.short_takes, self.member_address = time_factor, False, "dialled"
+        self.exit_after_events, self.transcribe_first = False, False
+        self.tokens: dict[str, dict] = {}  # every Browser SDK access token POST JWT/Token minted, with its claims
+        self.feedback: list[dict] = []  # every call quality feedback POSTed, with its call_uuid
         self.main = _new_account("MA", "Main")
         self.accounts = {self.main.auth_id: self.main}
         self.resources: dict[tuple[str, str], tuple[_Account, dict]] = {}  # (Application|Endpoint|Number, id)
         self.phones: dict[str, SimPhone] = {}
-        self.tokens: dict[str, dict] = {}  # every Browser SDK access token POST JWT/Token minted, with its claims
         self.recordings: dict[str, _Recording] = {}
+        self._inbound_media: dict[str, bytes] = {}  # served path -> bytes of an inbound message's media
         self._mpcs: list[_Mpc] = []
         self._leads: dict[str, SimPhone] = {}
         self._apps: dict[str, str] = {}
-        self._rejects: list[tuple[str, int, str]] = []
-        self.faults: list[Fault] = []  # checked in order; the first that matches applies
+        self._outcomes: dict[str, tuple[str, str]] = {}
         self._ids, self._numbers = itertools.count(10001), itertools.count(1000)
         self._changed = threading.Condition()
         self._work: queue.Queue = queue.Queue()
@@ -426,12 +490,14 @@ class PlivoSim:
             ("POST", r"Application/(?P<rid>\d+)", self._app_update),
             ("POST", r"Endpoint", self._endpoint_create),
             ("POST", r"Endpoint/(?P<rid>\d+)", self._endpoint_update),
+            ("GET", r"(?P<kind>Application|Endpoint)", self._resource_list),
             ("GET", r"(?P<kind>Application|Endpoint)/(?P<rid>\d+)", self._resource_get),
             ("DELETE", r"(?P<kind>Application|Endpoint)/(?P<rid>\d+)", self._resource_delete),
             ("GET", r"Number/(?P<rid>\d+)", self._number_get),
             ("POST", r"Number/(?P<rid>\d+)", self._number_update),
             ("POST", r"Call", self._call_create),
             ("POST", r"Call/(?P<uid>[^/]+)", self._call_transfer),
+            ("POST", r"Call/(?P<uid>[^/]+)/Feedback", self._call_feedback),
             ("DELETE", r"Call/(?P<uid>[^/]+)", self._call_hangup),
             ("DELETE", r"Call/(?P<uid>[^/]+)/Record", self._call_record_stop),
             ("DELETE", r"Request/(?P<uid>[^/]+)", self._request_cancel),
@@ -452,12 +518,17 @@ class PlivoSim:
             ("DELETE", r"Recording/(?P<rid>[\w-]+)", self._recording_delete),
             ("GET", r"Transcription/(?P<rid>[\w-]+)", self._transcription_get),
             ("POST", r"JWT/Token", self._jwt_token),
+            ("POST", r"Message", self._message_create),
+            ("GET", r"Message/(?P<uid>[\w-]+)", self._message_get),
+            ("GET", r"WhatsApp/Template/(?P<waba>\d+)", self._template_list),
+            ("GET", r"WhatsApp/Template/(?P<waba>\d+)/(?P<tid>\d+)", self._template_get),
         ]
         api = Route("/v1/Account/{auth_id}/{rest:path}", self._rest, methods=["GET", "POST", "DELETE"])
         apps = Route("/apps/{app_id}", self._customer_app, methods=["GET", "POST"])
         media = Route("/v1/Account/{auth_id}/Recording/{name}", self._media_file, methods=["GET"])
+        inbound = Route("/v1/Account/{auth_id}/Message/{uid}/Media/{n}", self._message_media, methods=["GET"])
         self.url, stop_api = serve(Starlette(routes=[api, apps]))
-        self.media_url, stop_media = serve(Starlette(routes=[media]))  # recording files, on their own origin
+        self.media_url, stop_media = serve(Starlette(routes=[media, inbound]))  # recording files, on their own origin
         self._stops = (stop_api, stop_media)
 
     def close(self) -> None:
@@ -476,8 +547,8 @@ class PlivoSim:
         self.accounts[acc.auth_id] = acc
         return acc
 
-    def buy_number(self, auth_id: str) -> str:
-        number = f"1415{next(self._numbers):07d}"
+    def buy_number(self, auth_id: str, prefix: str = "1415") -> str:
+        number = f"{prefix}{next(self._numbers):07d}"
         obj = {"number": number, "alias": None, "application": None, "voice_enabled": True}
         self.resources[("Number", number)] = (self.accounts[auth_id], obj)
         return f"+{number}"
@@ -496,16 +567,22 @@ class PlivoSim:
         return hashlib.sha256(recording_id.encode()).digest() * 512
 
     def idle(self) -> bool:
-        """No engine work queued or running, and no status callback queued or in flight."""
+        """No engine work queued or running, and no status callback queued or in flight (a delayed one is
+        neither)."""
         return self._work.unfinished_tasks == 0 and self._out.unfinished_tasks == 0
 
     @staticmethod
-    def sign(url: str, params: dict, auth_token: str, nonce: str = "") -> dict[str, str]:
-        """The signature headers Plivo sends with a form POST of `params` to `url` (the SDK's V3 algorithm)."""
+    def sign(url: str, params: dict, auth_token: str, nonce="", version="V3", method="POST") -> dict[str, str]:
+        """The signature headers Plivo sends with `params` to `url` (a form POST, or a GET's query): V3 (the SDK's
+        algorithm) for voice, V2 for messaging, which signs only the URL without its query, plus the nonce."""
         nonce = nonce or _rand(string.digits, 20)
-        base = construct_post_url(url, dict(params)).decode()
-        signature = get_signature_v3(auth_token.encode(), base, nonce.encode()).decode()
-        return {"X-Plivo-Signature-V3": signature, "X-Plivo-Signature-V3-Nonce": nonce}
+        if version == "V2":
+            digest = hmac.new(auth_token.encode(), (url.partition("?")[0] + nonce).encode(), hashlib.sha256)
+            signature = base64.b64encode(digest.digest()).decode()
+        else:
+            base = (construct_get_url if method == "GET" else construct_post_url)(url, dict(params)).decode()
+            signature = get_signature_v3(auth_token.encode(), base, nonce.encode()).decode()
+        return {f"X-Plivo-Signature-{version}": signature, f"X-Plivo-Signature-{version}-Nonce": nonce}
 
     def call(self, to: str, from_: str = "+14155550111", *, digits: str = "") -> SimCall:
         """A PSTN caller dials `to`: the simulator fetches the number's application answer URL and runs
@@ -521,6 +598,54 @@ class PlivoSim:
         self._queue(self._inbound, call, app)
         return call
 
+    def text(
+        self, to: str, from_: str = "+14155550111", text: str = "", *, type_: str = "sms", media: tuple = ()
+    ) -> SimMessage:
+        """A customer messages `to` (sms | mms | whatsapp): the simulator posts it, V2-signed, to the message URL
+        of the number's application. An inbound WhatsApp opens the 24-hour window for free-text replies; move its
+        `.created` back to close the window."""
+        if ("Number", _plivo(to)) not in self.resources:
+            raise AssertionError(f"{to} is not a simulator number")
+        acc, number = self.resources[("Number", _plivo(to))]
+        msg = SimMessage("inbound", type_, _e164(_plivo(from_)), _e164(_plivo(to)), text, [], acc.auth_id)
+        msg.state = "received"
+        for n, item in enumerate(media):
+            if isinstance(item, bytes):
+                path = f"/v1/Account/{acc.auth_id}/Message/{msg.message_uuid}/Media/{n}"
+                self._inbound_media[path] = item
+                item = self.media_url + path
+            msg.media.append(item)
+        self.messages.append(msg)
+        p = {"From": _plivo(msg.from_), "To": _plivo(to), "Type": type_, "MessageUUID": msg.message_uuid}
+        p["Text" if type_ == "sms" else "Body"] = text
+        if media:
+            p.update(MediaCount=str(len(media)), **{f"Media{i}": url for i, url in enumerate(msg.media)})
+        if type_ == "whatsapp":
+            p["ContentType"] = "media" if media else "text"
+            if media:
+                p["MimeType"] = INBOUND_MEDIA_TYPE
+        if app := self._app_of(number["application"]):
+            self._post(acc, app["message_url"], p, app["message_method"], "V2")
+        return msg
+
+    def message_outcome(self, number: str, status: str, error_code: str = "000") -> None:
+        """How outbound messages to `number` end: delivered | undelivered | failed, with Plivo's error code."""
+        assert status in ("delivered", "undelivered", "failed"), status
+        self._outcomes[_e164(_plivo(number))] = (status, error_code)
+
+    def template(
+        self, auth_id: str, waba: str, name: str, language: str = "en_US", *, status="APPROVED", components=None
+    ) -> dict:
+        """A WhatsApp template of the account's WABA `waba`, as Plivo's Template API shows it. An approved one is also
+        one a template message may name."""
+        body = [{"type": "BODY", "text": f"{name} for you"}]
+        found = {"template_id": str(next(self._ids)), "name": name, "language": language, "category": "UTILITY"}
+        found |= {"status": status, "components": body if components is None else components}
+        self.wabas.setdefault((auth_id, waba), []).append(found)
+        if status == "APPROVED":
+            self.templates.add((name, language))
+        return found
+
     def lead(self, number: str, behaviour: str = "answer") -> SimPhone:
         """How an outbound PSTN number behaves: answer | busy | no_answer | reject | fail. Returns the
         number as a phone, to see the legs that rang it."""
@@ -535,36 +660,67 @@ class PlivoSim:
         self._apps[app_id] = xml
         return f"{self.url}/apps/{app_id}"
 
-    def reject_next(self, fragment: str, status: int, error: str = "rejected by the test") -> None:
+    def reject_next(
+        self,
+        fragment: str,
+        status: int,
+        error: str = "rejected by the test",
+        *,
+        account: str | None = None,
+        after_sec: float = 0,
+    ) -> None:
         """The next REST request whose path contains `fragment` gets `status` (e.g. 429 on Make Call), with
-        `{"error": error}` as its body."""
-        self._rejects.append((fragment, status, error))
+        `{"error": error}` as its body. Without `account` the fragment must name one call or member by uuid, or
+        other tests' traffic could match."""
+        if account is None and not _UUID.search(fragment):
+            raise ValueError("reject_next without an account needs a uuid in the fragment")
+        self._add("reject", account, lambda r: fragment in r.path, 1, status, None, error).after_sec = after_sec
 
-    def fault(self, action: str, match: Callable[[SimRequest], bool], *, account: str, times: float = 1) -> Fault:
-        """Fault the next `times` REST requests or status callbacks of the account `account` that `match` accepts.
-        REST: lose applies the request and answers 500. Status callbacks (not XML fetches): delay holds it until
-        release, then queues it behind what was sent meanwhile."""
-        assert action in ("lose", "delay"), action
-        fault = Fault(self, action, account, match, times)
+    def fault(
+        self,
+        action: str,
+        match: Callable[[SimRequest], bool],
+        *,
+        account: str,
+        times: float = 1,
+        status: int = 500,
+        after: Callable[[SimRequest], bool] | None = None,
+        after_sec: float = 0,
+    ) -> Fault:
+        """Fault the next `times` (math.inf: every) REST requests or status callbacks that `match` accepts.
+
+        `account` is the auth_id the rule is scoped to: it sees only REST requests made under that account and
+        callbacks for its calls, members and messages.
+
+        REST: reject answers `status` and applies nothing; lose applies the request and answers `status`;
+        timeout applies it and never answers, so the client times out; stall applies it and answers on release;
+        refuse applies nothing and answers `status` on release; slow answers as Plivo would. Each waits `after_sec`
+        before it answers.
+        Status callbacks (not XML fetches): drop never sends it; duplicate sends it twice; race sends two copies at
+        once, as a retry that reaches HS while it still handles the first; delay holds it until release, then
+        queues it behind what was sent meanwhile, or until flush (Fault.flush).
+        `after` releases the fault once a callback it accepts has been delivered and answered."""
+        if account is None:
+            raise ValueError("a fault is scoped to one account")
+        fault = self._add(action, account, match, times, status, after)
+        fault.after_sec = after_sec
+        return fault
+
+    def _add(self, action, account, match, times, status, after, error="rejected by the test") -> Fault:
+        assert action in REST_FAULTS + CALLBACK_FAULTS, action
+        fault = Fault(self, action, account, match, times, status, after, error=error)
         with self._changed:
             self.faults.append(fault)
         return fault
 
-    def _take(self, seen: SimRequest, auth_id: str, action: str) -> Fault | None:
-        """The first unspent, unreleased `action` fault for `auth_id` that matches `seen`; it spends one of its times."""
+    def reset_faults(self) -> None:
+        """The end of a test: wake the stalled replies, drop the delayed callbacks, clear the rules and the message
+        outcomes."""
         with self._changed:
-            fault = next(
-                (
-                    f
-                    for f in self.faults
-                    if (f.action, f.account) == (action, auth_id) and f.times > 0 and not f.released and f.match(seen)
-                ),
-                None,
-            )
-            if fault:
-                fault.times -= 1
-                fault.hits.append(seen)
-        return fault
+            faults, self.faults[:] = list(self.faults), []
+            self._outcomes.clear()
+        for fault in faults:
+            fault.release(send=False)
 
     def rotate_token(self, auth_id: str) -> str:
         """A new auth token for the account; the old one stops working."""
@@ -576,34 +732,67 @@ class PlivoSim:
 
     # ---- REST --------------------------------------------------------------------------------------
 
-    def _logged(self, request: Request, params: dict) -> Response | None:
-        """Log the request; the reply a pending reject_next() asks for, if any."""
-        self.requests.append(SimRequest(request.method, request.url.path, params))
-        rule = next((r for r in self._rejects if r[0] in request.url.path), None)
-        if rule is None:
-            return None
-        self._rejects.remove(rule)
-        return self._reply(rule[1], {"error": rule[2]})
+    def _take(self, seen: SimRequest, auth_id: str, actions: tuple[str, ...]) -> Fault | None:
+        """The first unspent fault among `actions` for `auth_id` that matches `seen`, which spends one of its times on it."""
+        with self._changed:
+            fault = next(
+                (
+                    f
+                    for f in self.faults
+                    if f.action in actions and f.account in (None, auth_id) and f.times > 0 and f.match(seen)
+                ),
+                None,
+            )
+            if fault:
+                fault.times -= 1
+                fault.hits.append(seen)
+        return fault
+
+    async def _answer(self, request: Request, params: dict, handle: Callable[[], Response]) -> Response:
+        """Log the request and answer it with `handle()`, through the first REST fault that matches it."""
+        seen = SimRequest(request.method, request.url.path, params)
+        self.requests.append(seen)
+        fault = self._take(seen, request.path_params.get("auth_id", ""), REST_FAULTS)
+        action = fault.action if fault else ""
+        if fault:
+            await asyncio.sleep(fault.after_sec)
+        if action == "reject":
+            return self._reply(fault.status, {"error": fault.error})
+        response = self._reply(fault.status, {"error": fault.error}) if action == "refuse" else handle()
+        if action == "lose":
+            return self._reply(fault.status, {"error": "internal server error"})
+        if action == "timeout":
+            while (await request.receive())["type"] != "http.disconnect":
+                pass
+        if action in ("stall", "refuse"):
+            loop, woken = asyncio.get_running_loop(), asyncio.Event()
+            with self._changed:
+                if fault.released.is_set():
+                    woken.set()
+                else:
+                    fault.waiters.append(lambda: loop.call_soon_threadsafe(woken.set))
+            await woken.wait()
+        return response
 
     async def _rest(self, request: Request) -> Response:
-        auth_id, rest = request.path_params["auth_id"], request.path_params["rest"].strip("/")
         raw, ctype = await request.body(), request.headers.get("content-type", "")
+        if request.method == "POST" and "MultiPartyCall/" in request.path_params["rest"] and "json" not in ctype:
+            return self._reply(400, {"error": "use 'application/json' Content-Type and raw POST with json data"})
         try:
             body = json.loads(raw) if raw and "json" in ctype else dict(parse_qsl(raw.decode(), keep_blank_values=True))
         except ValueError:
             return self._reply(400, {"error": "invalid request body"})
         params = {**request.query_params, **(body if isinstance(body, dict) else {})}
-        if rejected := self._logged(request, params):
-            return rejected
+        return await self._answer(request, params, lambda: self._route(request, params))
+
+    def _route(self, request: Request, params: dict) -> Response:
+        auth_id, rest = request.path_params["auth_id"], request.path_params["rest"].strip("/")
         acc = self._authorized(auth_id, request.headers.get("authorization"))
         if acc is None:
             return self._reply(401, {"error": "authentication failed"})
         for method, pattern, handler in self._routes:
             if method == request.method and (m := re.fullmatch(pattern, rest)):
-                reply = self._reply(*handler(acc, params, **m.groupdict()))
-                if self._take(SimRequest(request.method, request.url.path, params), auth_id, "lose"):
-                    return self._reply(500, {"error": "internal server error"})
-                return reply
+                return self._reply(*handler(acc, params, **m.groupdict()))
         return self._reply(404, {"error": "not found"})
 
     async def _customer_app(self, request: Request) -> Response:
@@ -612,9 +801,21 @@ class PlivoSim:
         return Response(self._apps[request.path_params["app_id"]], media_type="application/xml")
 
     async def _media_file(self, request: Request) -> Response:
+        return await self._answer(request, dict(request.query_params), lambda: self._recording_file(request))
+
+    async def _message_media(self, request: Request) -> Response:
+        return await self._answer(request, {}, lambda: self._inbound_file(request))
+
+    def _inbound_file(self, request: Request) -> Response:
+        """Inbound message media: Plivo serves it only to the owning account's credentials."""
+        auth_id = request.path_params["auth_id"]
+        if self._authorized(auth_id, request.headers.get("authorization")) is None:
+            return Response(status_code=401)
+        data = self._inbound_media.get(request.url.path)
+        return Response(status_code=404) if data is None else Response(data, 200, media_type=INBOUND_MEDIA_TYPE)
+
+    def _recording_file(self, request: Request) -> Response:
         """Recording files: public as Plivo serves them by default, but checked when credentials are sent."""
-        if rejected := self._logged(request, dict(request.query_params)):
-            return rejected
         auth_id, rid = request.path_params["auth_id"], request.path_params["name"].rpartition(".")[0]
         rec = self.recordings.get(rid)
         if rec is None or rec.deleted or rec.account.auth_id != auth_id:
@@ -684,9 +885,11 @@ class PlivoSim:
             return 400, {"error": "app_name and answer_url are required"}
         rid = _rand(string.digits, 17)
         app = {"app_id": rid, "app_name": p["app_name"], "answer_url": p["answer_url"]}
-        app.update({k: p.get(k, "POST") for k in ("answer_method", "fallback_method")})
+        app.update({k: p.get(k, "POST") for k in ("answer_method", "fallback_method", "message_method")})
         app.update(
-            fallback_answer_url=p.get("fallback_answer_url", ""), hangup_url=p.get("hangup_url") or app["answer_url"]
+            fallback_answer_url=p.get("fallback_answer_url", ""),
+            hangup_url=p.get("hangup_url") or app["answer_url"],
+            message_url=p.get("message_url", ""),
         )
         app["hangup_method"] = p.get("hangup_method") or app["answer_method"]
         self.resources[("Application", rid)] = (acc, app)
@@ -724,6 +927,20 @@ class PlivoSim:
             ep["application"] = f"/v1/Account/{acc.auth_id}/Application/{p['app_id']}/"
         return 202, {"message": "changed"}
 
+    def _jwt_token(self, acc, p):
+        """A Browser SDK access token: iss the account, sub one of its endpoints, app (Plivo's SDK sends it only when
+        given) one of its applications, the voice permissions booleans, a validity of at most 24 hours."""
+        voice = (p.get("per") or {}).get("voice") or {}
+        valid = p.get("iss") == acc.auth_id and ("app" not in p or self._owned(acc, "Application", str(p["app"])))
+        valid = valid and any(o["username"] == p.get("sub") for a, o in self._all("Endpoint") if a is acc)
+        valid = valid and all(isinstance(voice.get(k), bool) for k in ("incoming_allow", "outgoing_allow"))
+        nbf, exp = p.get("nbf"), p.get("exp")
+        if not (valid and isinstance(nbf, int) and isinstance(exp, int) and 0 < exp - nbf <= 86400):
+            return 400, {"error": "invalid token request"}
+        token = f"sim.{secrets.token_urlsafe(24)}"
+        self.tokens[token] = dict(p)
+        return 200, {"token": token}
+
     def _resource_get(self, acc, p, kind, rid):
         obj = self._owned(acc, kind, rid)
         if obj is None:
@@ -733,19 +950,9 @@ class PlivoSim:
             return 200, {**obj, "sip_registered": str(bool(phone and phone.registered)).lower()}
         return 200, obj
 
-    def _jwt_token(self, acc, p):
-        """A Browser SDK access token: iss the account, sub one of its endpoints, app one of its applications, the
-        voice permissions booleans, a validity of at most 24 hours."""
-        voice = (p.get("per") or {}).get("voice") or {}
-        valid = p.get("iss") == acc.auth_id and self._owned(acc, "Application", str(p.get("app")))
-        valid = valid and any(o["username"] == p.get("sub") for a, o in self._all("Endpoint") if a is acc)
-        valid = valid and all(isinstance(voice.get(k), bool) for k in ("incoming_allow", "outgoing_allow"))
-        nbf, exp = p.get("nbf"), p.get("exp")
-        if not (valid and isinstance(nbf, int) and isinstance(exp, int) and 0 < exp - nbf <= 86400):
-            return 400, {"error": "invalid token request"}
-        token = f"sim.{secrets.token_urlsafe(24)}"
-        self.tokens[token] = dict(p)
-        return 200, {"token": token}
+    def _resource_list(self, acc, p, kind):
+        mine, offset = [o for a, o in self._all(kind) if a is acc], int(p.get("offset", 0))
+        return 200, {"objects": mine[offset : offset + int(p.get("limit", 20))]}
 
     def _resource_delete(self, acc, p, kind, rid):
         if self._owned(acc, kind, rid) is None:
@@ -790,6 +997,12 @@ class PlivoSim:
             return 400, {"error": "aleg_url is required"}
         self._queue(self._transfer, call, p["aleg_url"], p.get("aleg_method", "POST"))
         return 202, {"message": "call transferred"}
+
+    def _call_feedback(self, acc, p, uid):
+        """Call quality feedback, recorded as posted. Plivo's answers to an unknown call or a bad rating are unchecked,
+        so the simulator refuses neither."""
+        self.feedback.append({"call_uuid": uid, **p})
+        return 201, {"message": "Feedback has been posted", "status": "success"}
 
     def _call_hangup(self, acc, p, uid):
         call = self._live(acc, uid)
@@ -961,8 +1174,63 @@ class PlivoSim:
         if rec is None or not rec.end:
             return 404, {"error": "transcription not found"}
         seconds = self._seconds(rec)
-        found = {"cost": 0.005, "rate": 0.05, "status": "completed", "transcription": self._segments(seconds)}
+        found = {"cost": 0.005, "rate": 0.05, "status": "completed", "transcription": self._segments(rec, seconds)}
         return 200, {**found, "recording_duration_ms": seconds * 1000, "recording_start_ms": int(rec.start * 1000)}
+
+    def _message_create(self, acc, p):
+        kind, text, template = p.get("type") or "sms", p.get("text", ""), p.get("template")
+        interactive, location = p.get("interactive"), p.get("location")
+        media = p.get("media_urls") or []
+        if isinstance(media, str):
+            media = [u.strip() for u in media.split(",") if u.strip()]
+        dsts = [_e164(_plivo(d)) for d in str(p.get("dst", "")).split("<") if d]
+        if not p.get("src") or not dsts or kind not in ("sms", "mms", "whatsapp"):
+            return 400, {"error": "src, dst and a type of sms, mms or whatsapp are required"}
+        if template is not None and not (
+            kind == "whatsapp"
+            and isinstance(template, dict)
+            and all(isinstance(template.get(k), str) and template[k] for k in ("name", "language"))
+            and isinstance(template.get("components", []), list)
+        ):
+            return 400, {"error": "template is for whatsapp only and needs a name, a language and a list of components"}
+        content = {
+            "sms": text,
+            "mms": isinstance(media, list) and 0 < len(media) <= 10,
+            "whatsapp": text or media or template or interactive or location,
+        }
+        if not content[kind]:
+            return 400, {"error": "sms needs text, mms 1 to 10 media_urls, whatsapp some content"}
+        src = _e164(_plivo(p["src"]))
+        parts = (text, media, acc.auth_id, template, interactive, location)
+        msgs = [SimMessage("outbound", kind, src, dst, *parts) for dst in dsts]
+        self.messages += msgs
+        for msg in msgs:
+            self._queue(self._dispatch, acc, msg, p.get("url", ""), p.get("method", "POST"))
+        return 202, {"message": "message(s) queued", "message_uuid": [m.message_uuid for m in msgs]}
+
+    def _message_get(self, acc, p, uid):
+        msg = next((m for m in self.messages if m.message_uuid == uid and m.auth_id == acc.auth_id), None)
+        if msg is None:
+            return 404, {"error": "not found"}
+        found = {"message_uuid": uid, "message_direction": msg.direction, "message_type": msg.type}
+        state = {"message_state": msg.state, "error_code": msg.error_code, "message_time": _fmt(msg.created)}
+        return 200, {**found, **state, "from_number": _plivo(msg.from_), "to_number": _plivo(msg.to)}
+
+    def _template_list(self, acc, p, waba):
+        """A page of the WABA's templates, without their components; `meta.next` names the next page."""
+        if (found := self.wabas.get((acc.auth_id, waba))) is None:
+            return 404, {"error": "not found"}
+        limit, offset = int(p.get("limit", 20)), int(p.get("offset", 0))
+        if not 0 < limit <= 20:
+            return 400, {"error": "limit is 1 to 20"}
+        more = f"/v1/Account/{acc.auth_id}/WhatsApp/Template/{waba}/?limit={limit}&offset={offset + limit}"
+        meta = {"limit": limit, "offset": offset, "next": more if offset + limit < len(found) else None}
+        shown = [{k: v for k, v in t.items() if k != "components"} for t in found[offset : offset + limit]]
+        return 200, {"meta": meta, "objects": shown}
+
+    def _template_get(self, acc, p, waba, tid):
+        found = next((t for t in self.wabas.get((acc.auth_id, waba), []) if t["template_id"] == tid), None)
+        return (200, found) if found else (404, {"error": "not found"})
 
     # ---- engine ------------------------------------------------------------------------------------
 
@@ -978,47 +1246,60 @@ class PlivoSim:
                 self._work.task_done()
 
     def _deliver_loop(self) -> None:
-        """Send status callbacks in order, or (shuffle_seed) in a seeded shuffle of each burst, with small
-        random delays."""
-        rng = random.Random(self.shuffle_seed)
-        while True:
-            batch = [self._out.get()]
-            if self.shuffle_seed is not None:
-                time.sleep(0.01)
-                while not self._out.empty():
-                    batch.append(self._out.get())
-                rng.shuffle(batch)
-            for job in batch:
-                try:
-                    if job is None:
-                        return
-                    if self.shuffle_seed is not None:
-                        time.sleep(rng.uniform(0, 0.005))
-                    if self._delayed(job):
-                        continue
-                    for _ in range(2 if self.deliver_twice else 1):
-                        self._send(*job, http=self._http_out)
-                except Exception as exc:
-                    log.exception("plivo sim: callback delivery failed")
-                    self.errors.append(exc)
-                finally:
-                    self._out.task_done()
+        while (item := self._out.get()) is not None:
+            if item[1] == "flushed":
+                threading.Thread(target=self._delivered, args=item, daemon=True).start()
+            else:
+                self._delivered(*item)
 
-    def _delayed(self, job: tuple) -> bool:
-        """Whether a delay fault holds this callback until its release."""
-        acc, url, params, method = job
-        with self._changed:
-            if fault := self._take(SimRequest(method, url.partition("#")[0], params), acc.auth_id, "delay"):
-                fault.delayed.append(job)
-            return fault is not None
+    def _delivered(self, job: tuple, how: str) -> None:
+        try:
+            self._deliver(job, how)
+        except Exception as exc:
+            log.exception("plivo sim: callback delivery failed")
+            self.errors.append(exc)
+        finally:
+            self._out.task_done()
+
+    def _deliver(self, job: tuple, how: str) -> None:
+        """Send one status callback through the first callback fault it meets (MEETS) that matches it."""
+        acc, url, params, method, version, tries = job
+        seen = SimRequest(method, url.partition("#")[0], params)
+        fault = self._take(seen, acc.auth_id, MEETS[how])
+        action = fault.action if fault else ""
+        if action == "delay":
+            with self._changed:
+                if not fault.released.is_set():
+                    fault.delayed.append(job)
+                    return
+        if action == "drop":
+            return
+        twin = threading.Thread(target=self._send, args=(acc, url, params, method, version, self._http_out))
+        if action == "race":
+            twin.start()
+        for _ in range(2 if action == "duplicate" else 1):
+            cb = self._send(acc, url, params, method, version, http=self._http_out)
+        if action == "race":
+            twin.join()
+        for waiting in list(self.faults):
+            if (
+                waiting.after
+                and waiting.account in (None, acc.auth_id)
+                and not waiting.released.is_set()
+                and waiting.after(seen)
+            ):
+                waiting.release()
+        if version == "V2" and cb.status != 200 and tries < 3:
+            # Plivo retries a messaging callback that got no 200 three times, 60, 120 and 240 s apart
+            self._later(60 * 2**tries * self.time_factor, self._post, acc, url, params, method, version, tries + 1)
 
     def _queue(self, fn: Callable, *args) -> None:
         self._work.put((fn, args))
 
-    def _post(self, acc: _Account, url: str, params: dict, method: str = "POST") -> None:
+    def _post(self, acc: _Account, url: str, params: dict, method="POST", version="V3", tries=0) -> None:
         """A status callback, sent by the delivery thread."""
         if url:
-            self._out.put((acc, url, params, method or "POST"))
+            self._out.put(((acc, url, params, method or "POST", version, tries), "sent"))
 
     def _later(self, delay: float, fn: Callable, *args) -> threading.Timer:
         timer = threading.Timer(delay, self._queue, (fn, *args))
@@ -1042,20 +1323,22 @@ class PlivoSim:
         self.calls.append(call)
         return call
 
-    def _send(self, acc: _Account, url: str, params: dict, method: str = "POST", http=None) -> SimCallback:
-        """Deliver one signed request, retrying as the URL's #rc/#rp/#rd fragment asks (Plivo's default: once,
-        on a connection failure only)."""
+    def _send(self, acc: _Account, url: str, params: dict, method="POST", version="V3", http=None) -> SimCallback:
+        """Deliver one signed request, a GET's parameters in its query, retrying as the URL's #rc/#rp/#rd fragment
+        asks (voice's default: once, on a connection failure only; `_deliver_loop` retries messaging)."""
         url, _, fragment = url.partition("#")
         opts = dict(parse_qsl(fragment))
-        policy, delay = opts.get("rp", "ct,rt").split(","), int(opts.get("rd", 0)) / 1000 * self.time_factor
-        for attempt in range(1 + int(opts.get("rc", 1))):
+        policy, delay = opts.get("rp", "ct,rt").split(","), int(opts.get("rd", 0)) / 1000 * min(self.time_factor, 1)
+        for attempt in range(1 + int(opts.get("rc", 1 if version == "V3" else 0))):
             if attempt:
                 time.sleep(delay)
-            headers = self.sign(url, params, acc.auth_token)
-            main = self.sign(url, params, (acc.parent or acc).auth_token, headers["X-Plivo-Signature-V3-Nonce"])
-            headers["X-Plivo-Signature-Ma-V3"] = main["X-Plivo-Signature-V3"]
+            headers = self.sign(url, params, acc.auth_token, version=version, method=method)
+            nonce = headers[f"X-Plivo-Signature-{version}-Nonce"]
+            main = self.sign(url, params, (acc.parent or acc).auth_token, nonce, version, method)
+            headers[f"X-Plivo-Signature-Ma-{version}"] = main[f"X-Plivo-Signature-{version}"]
+            target, form = (httpx.URL(url).copy_merge_params(params), None) if method == "GET" else (url, params)
             try:
-                r = (http or self._http).request(method, url, data=params, headers=headers)
+                r = (http or self._http).request(method, target, data=form, headers=headers)
                 status, body = r.status_code, r.text
             except httpx.TransportError as exc:
                 status, body = 0, str(exc)
@@ -1176,13 +1459,13 @@ class PlivoSim:
         start, ms = int(rec.start * 1000), seconds * 1000
         result = {"RecordUrl": rec.url, "RecordingID": rec.id, "RecordingDuration": str(seconds)}
         result.update(RecordingDurationMs=str(ms), RecordingStartMs=str(start), RecordingEndMs=str(start + ms))
+        acc, std = call._account, self._std(call)
         text = {"transcription": self.transcript, "transcription_charge": "0.00500", "transcription_rate": "0.05000"}
         text.update(duration=str(seconds), call_uuid=call.call_uuid, recording_id=rec.id, error="")
-        transcribed = (call._account, el.get("transcriptionUrl", ""), text, el.get("transcriptionMethod", "POST"))
+        transcribed = (acc, el.get("transcriptionUrl", ""), text, el.get("transcriptionMethod", "POST"))
         if self.transcribe_first and transcribed[1]:
             self._send(*transcribed)
         doc = self._action(call, el, {**result, "Digits": ""})
-        acc, std = call._account, self._std(call)
         self._post(acc, el.get("callbackUrl", ""), {**std, **result}, el.get("callbackMethod", "POST"))
         if not self.transcribe_first:
             self._post(*transcribed)
@@ -1190,6 +1473,18 @@ class PlivoSim:
 
     def _x_Redirect(self, call, el):
         return self._fetch(call, (el.text or "").strip(), el.get("method", "POST"), code=7014)
+
+    def _x_Wait(self, call, el):
+        """Silence for `length` seconds (scaled), then the rest of the document, unless something else took the
+        call meanwhile."""
+        wait = call._wait = object()
+        call._timers.append(self._later(float(el.get("length", 1)) * self.time_factor, self._waited, call, wait))
+        return SUSPEND
+
+    def _waited(self, call: SimCall, wait: object) -> None:
+        if call._wait is wait and call.state != "completed":
+            resume, call._resume, call._wait = call._resume, None, None
+            self._execute(call, resume or [])
 
     def _x_Hangup(self, call, el):
         self._end(call, {"rejected": 3020, "busy": 3010}.get(el.get("reason", ""), 4000), "Answer XML")
@@ -1231,9 +1526,31 @@ class PlivoSim:
 
     def _x_MultiPartyCall(self, call, el):
         opts = _snake(el.attrib)
-        mpc = self._mpc_for(call._account, (el.text or "").strip(), opts)
+        mpc = self._mpc_for(call._account, (el.text or "").strip(), opts, joining=True)
         self._join(self._member(mpc, call, opts, api=False))
         return SUSPEND
+
+    def _dispatch(self, acc: _Account, msg: SimMessage, url: str, method: str) -> None:
+        """Walk an outbound message through Plivo's states, posting each (V2-signed) to its status URL."""
+        template = msg.template and (msg.template.get("name"), msg.template.get("language"))
+        replied = any(
+            (m.direction, m.type, m.from_, m.to) == ("inbound", "whatsapp", msg.to, msg.from_)
+            and time.time() - m.created < 24 * 3600
+            for m in self.messages
+        )
+        if self._owned(acc, "Number", _plivo(msg.from_)) is None:
+            final = ("failed", "40")  # invalid source number
+        elif template and template not in self.templates:
+            final = ("failed", "340")  # template status error
+        elif msg.type == "whatsapp" and not template and not replied:
+            final = ("failed", "380")  # re-engagement: free text outside the 24-hour window
+        else:
+            final = self._outcomes.get(msg.to, ("delivered", "000"))
+        sent = [] if final[0] == "failed" else [("sent", "000")]
+        p = {"From": _plivo(msg.from_), "To": _plivo(msg.to), "MessageUUID": msg.message_uuid}
+        for state, code in [("queued", "000"), *sent, final]:
+            msg.state, msg.error_code = state, code
+            self._post(acc, url, {**p, "Status": state, "ErrorCode": code}, method, "V2")
 
     def _inbound(self, call: SimCall, app: dict | None) -> None:
         """Plivo asks the answer URL while the call still rings, and answers when the document runs."""
@@ -1290,14 +1607,15 @@ class PlivoSim:
         `<username>_<auth id>` rings its Browser SDK login."""
         user = leg.to.removeprefix("sip:").partition("@")[0]
         username = user.partition("_")[0]
-        phone = self.phones.get(username)
         if not leg.to.startswith("sip:"):
             phone = self._leads.get(_plivo(leg.to))
             if phone is None:
                 return "answer", 0.0
         elif not any(o["username"] == username for _, o in self._all("Endpoint")):
             return "fail", 0.0
-        elif not phone or not (phone.registered if user == username else phone.sdk == user):
+        elif (phone := self.phones.get(username)) is None or not (
+            phone.registered if user == username else phone.sdk == user
+        ):
             return "unregistered", 0.0
         phone.legs.append(leg)
         self._notify()
@@ -1340,8 +1658,12 @@ class PlivoSim:
             name, switch, unanswered = CAUSES[code]
             p = {**self._std(call), "CallStatus": "completed" if answered else unanswered, "Event": "Hangup"}
             p.update(HangupCause=switch, HangupCauseName=name, HangupCauseCode=str(code), HangupSource=source)
-            p.update(Duration=_duration(call), BillDuration=_duration(call), StartTime=_fmt(call._started))
-            p.update(AnswerTime=_fmt(call._answered), EndTime=_fmt(call._ended))
+            # Duration counts whole seconds from SessionStart, the form's one UTC time, not from the answer.
+            start = datetime.fromtimestamp(call._started, UTC)
+            seconds = str(int(call._ended - call._started)) if call._answered else "0"
+            p.update(Duration=seconds, BillDuration=_duration(call), SessionStart=f"{start:%Y-%m-%d %H:%M:%S.%f}")
+            times = {"StartTime": call._started, "AnswerTime": call._answered, "EndTime": call._ended}
+            p.update({k: _fmt(t, ACCOUNT_ZONE) for k, t in times.items()})
             self._post(call._account, call._hangup[0], p, call._hangup[1])
         if call._member and not call._member.exit_cause:
             self._exit(call._member, EXIT_HANGUP)
@@ -1375,7 +1697,7 @@ class PlivoSim:
         if call._member and not call._member.exit_cause:
             self._exit(call._member, EXIT_TRANSFERRED, follow=False)
         self._drop_dial(call)
-        call._resume = call._menu = None
+        call._resume = call._menu = call._wait = None
         doc = self._fetch(call, url, method, code=7013)
         if doc is not None:
             self._execute(call, doc)
@@ -1392,8 +1714,9 @@ class PlivoSim:
 
     # ---- multi-party calls ---------------------------------------------------------------------------
 
-    def _mpc_for(self, acc: _Account, name: str, opts: dict) -> _Mpc:
-        """The live MPC by this name, else a new one with this participant's MPC-level settings."""
+    def _mpc_for(self, acc: _Account, name: str, opts: dict, *, joining: bool = False) -> _Mpc:
+        """The live MPC by this name, else a new one with this participant's MPC-level settings. One a participant
+        joins at once says it is initialized with that member (`_join`), as Plivo's does."""
         live = (m for m in reversed(self._mpcs) if m.account is acc and m.name == name and m.status != "Ended")
         live = next(live, None)
         if live:
@@ -1401,7 +1724,8 @@ class PlivoSim:
         groups = (opts.get("status_callback_events") or "mpc-state-changes,participant-state-changes").split(",")
         mpc = _Mpc(acc, name, opts, frozenset(e for g in groups for e in EVENT_GROUPS.get(g.strip(), ())))
         self._mpcs.append(mpc)
-        self._event(mpc, "MPCInitialized")
+        if not joining:
+            self._event(mpc, "MPCInitialized")
         return mpc
 
     def _member(self, mpc: _Mpc, call: SimCall, opts: dict, api: bool) -> _Member:
@@ -1441,6 +1765,8 @@ class PlivoSim:
         self._notify()
         if m.flag("record_participant_track"):
             m.recording = self._new_recording(mpc.account, "participant", call.call_uuid, _recording_callback(m.opts))
+        if not mpc.seq:
+            self._event(mpc, "MPCInitialized", m)
         self._event(mpc, "ParticipantJoin", m)
         if mpc.status == "Initialized" and m.flag("start_mpc_on_enter", True):
             mpc.status, mpc.started = "Active", time.time()
@@ -1567,7 +1893,7 @@ class PlivoSim:
         if call._member and not call._member.exit_cause:
             self._exit(call._member, EXIT_TRANSFERRED, follow=False)
         self._drop_dial(call)
-        call._resume = call._menu = None
+        call._resume = call._menu = call._wait = None
         self._join(self._member(mpc, call, p, api=True))
         api["AddParticipantAPIRequestOutcome"] = "successful"
         self._event(mpc, "AddParticipantByAPIActionCompleted", call._member, **api)
@@ -1602,8 +1928,8 @@ class PlivoSim:
         """The recording's length in sim seconds: real time over `time_factor`, at least 1 (0 with short_takes)."""
         return 0 if self.short_takes else max(1, round((rec.end - rec.start) / self.time_factor))
 
-    def _segments(self, seconds: int) -> list[dict]:
-        return [{"start": 0.0, "end": float(seconds), "text": self.transcript}]
+    def _segments(self, rec: _Recording, seconds: int) -> list[dict]:
+        return [{"start": rec.speech_offset, "end": float(seconds), "text": self.transcript}]
 
     def _attach_recording(self, mpc: _Mpc, rec: _Recording) -> None:
         mpc.recording = rec
@@ -1631,9 +1957,10 @@ class PlivoSim:
         p.update(RecordingStartTime=_fmt(rec.start), RecordingEndTime=_fmt(rec.start + seconds))
         if member:
             p.update(MemberID=member.member_id, ParticipantCallUUID=member.call.call_uuid, RecordTrackType=rec.track)
+            rec.speech_offset = float(max(0, int(mpc.recording.start) - int(rec.start))) if mpc.recording else 0.0
         self._post(rec.account, url, p, method)
         text = {
-            "transcription": json.dumps(self._segments(seconds)),
+            "transcription": json.dumps(self._segments(rec, seconds)),
             "recording_id": rec.id,
             "call_uuid": rec.call_uuid,
         }

@@ -17,8 +17,8 @@ def test_a_plivo_403_is_a_refusal_with_its_reason_and_not_bad_credentials(world,
     caplog.set_level("WARNING", logger="human-specialist")
     for reason in (WHITELIST, VOICE_OFF):
         sub = world.plivo.subaccount("Acme")
-        world.plivo.reject_next("/v1/Account/", 403, reason)
-        err = error(register(world, sub), 502, "plivo_error")
+        world.plivo.reject_next("/v1/Account/", 403, reason, account=sub.auth_id)
+        err = error(register(world, sub), 422, "plivo_refused")
         assert err["details"] == {"status": 403, "errors": {"error": reason}}
         assert sub.auth_token not in str(err)
         world.wait(lambda reason=reason: reason in caplog.text, what="the refusal reason in the log")
@@ -27,8 +27,8 @@ def test_a_plivo_403_is_a_refusal_with_its_reason_and_not_bad_credentials(world,
 
 def test_a_refused_registration_leaves_nothing_and_another_subaccount_registers(world):
     first, second = world.plivo.subaccount("First"), world.plivo.subaccount("Second")
-    world.plivo.reject_next("/v1/Account/", 403, WHITELIST)
-    error(register(world, first), 502, "plivo_error")
+    world.plivo.reject_next("/v1/Account/", 403, WHITELIST, account=first.auth_id)
+    error(register(world, first), 422)
     ok(register(world, second))
     again = ok(register(world, first))
     assert again["tenant_id"] and again["api_key"]

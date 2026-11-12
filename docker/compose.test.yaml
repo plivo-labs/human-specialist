@@ -1,5 +1,6 @@
 # Test stack: `docker compose -f docker/compose.test.yaml up -d`. Host ports move with HS_TEST_PG_PORT and
-# HS_TEST_REDIS_PORT; point HS_TEST_DATABASE_URL and HS_TEST_REDIS_URL at the ones you pick.
+# HS_TEST_SEARCH_PORT; point HS_TEST_DATABASE_URL and HS_TEST_SEARCH_URL at the ones you pick. Without OpenSearch
+# the search tests skip only their OpenSearch variant.
 name: human-specialist-test
 services:
   postgres:
@@ -13,11 +14,15 @@ services:
       test: ["CMD", "pg_isready", "-U", "hs"]
       interval: 2s
       retries: 30
-  redis:
-    image: redis:7-alpine
-    command: ["redis-server", "--databases", "64"]
-    ports: ["127.0.0.1:${HS_TEST_REDIS_PORT:-57379}:6379"]
+  opensearch:
+    image: opensearchproject/opensearch:2.17.1
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      OPENSEARCH_JAVA_OPTS: -Xms256m -Xmx256m
+    ports: ["127.0.0.1:${HS_TEST_SEARCH_PORT:-59200}:9200"]
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "curl", "-fs", "http://localhost:9200/_cluster/health"]
       interval: 2s
-      retries: 30
+      retries: 60

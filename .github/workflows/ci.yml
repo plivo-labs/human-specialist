@@ -1,4 +1,5 @@
-# Mirrors `make check` against the same Postgres/Redis stack as local runs.
+# Mirrors `make check` against the same Postgres and OpenSearch stack as local runs. HS_REQUIRE_STACK turns
+# a skipped OpenSearch variant into a failure, so the search tests run on both backends here.
 name: CI
 
 on:
@@ -14,9 +15,10 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     env:
       HS_TEST_DATABASE_URL: postgresql://hs:hs@127.0.0.1:56432/hs
-      HS_TEST_REDIS_URL: redis://127.0.0.1:57379/0
+      HS_REQUIRE_STACK: "1"
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.2.0
@@ -25,7 +27,7 @@ jobs:
       # The whole tree, not only the changed files the pre-commit hook sees.
       - name: Secrets
         run: docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.30.1 dir /repo --redact
-      # Generic provenance markers only.
+      # Generic provenance markers only; the private word list runs locally.
       - name: Leak patterns
         run: |
           set +e
@@ -33,15 +35,78 @@ jobs:
           rc=$?
           set -e
           [ "$rc" -eq 1 ] || { echo "internal reference found or git failed (exit $rc)"; exit 1; }
-      # Compose rather than `services:`: Redis needs `--databases 64`, which services cannot pass.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends redis-server redis-tools
       - run: docker compose -f docker/compose.test.yaml up -d --wait
-      - run: make check SPEC_BASE=origin/${{ github.base_ref || 'main' }}
+      - run: make check
 
-  # A reusable workflow, so the image is pushed only after `check` passed on this commit.
+  # The recipe in docs/plugins.md, as printed: the image, a plugin image derived from it, and both answering.
+  plugin-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DATABASE_URL: postgresql://hs:hs@127.0.0.1:56432/hs
+      REDIS_URL: redis://127.0.0.1:6379/0
+      PUBLIC_BASE_URL: http://127.0.0.1:6004
+      HS_OPERATOR_KEY: ci-operator-key-of-at-least-32-bytes
+      HS_SECRET_KEY: ci-secret-key-ci-secret-key-ci-secret-key
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker build -f docker/Dockerfile -t hs-ci .
+      - run: docker build -f examples/plugin/Dockerfile --build-arg HS_IMAGE=hs-ci -t hs-ci-toy examples/plugin
+      - run: |
+          docker compose -f docker/compose.test.yaml up -d --wait postgres
+          docker run -d --network host redis:7-alpine redis-server --maxmemory-policy noeviction
+          docker run --rm --network host -e DATABASE_URL -e REDIS_URL -e PUBLIC_BASE_URL -e HS_OPERATOR_KEY -e HS_SECRET_KEY hs-ci-toy alembic upgrade head
+          docker run -d --name toy --network host -e DATABASE_URL -e REDIS_URL -e PUBLIC_BASE_URL -e HS_OPERATOR_KEY -e HS_SECRET_KEY hs-ci-toy
+          curl --retry 30 --retry-delay 1 --retry-connrefused -fsS http://127.0.0.1:6004/status
+          curl -fsS http://127.0.0.1:6004/toy/hello
+      - if: failure()
+        run: docker logs toy
+
+  ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version-file: ui/.nvmrc
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm test
+      - run: npm run build
+
+  # A reusable workflow, so the image is pushed only after `check` passed on this commit, and only for a release tag.
   image:
-    needs: check
-    if: github.event_name == 'push'
+    needs: [check, plugin-image, ui]
+    if: github.ref_type == 'tag'
     permissions:
       contents: read
       packages: write
     uses: ./.github/workflows/image.yml
+
+  release:
+    needs: [check, image]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: The tag is the version in pyproject.toml
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          test "$GITHUB_REF_NAME" = "v$version"
+      - name: Release notes from CHANGELOG.md
+        # The section under "## <tag> (date)", without its heading.
+        run: |
+          awk -v tag="$GITHUB_REF_NAME" '/^## / { if (found) exit; if ($2 == tag) { found = 1; next } } found' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          grep -q '[^[:space:]]' "$RUNNER_TEMP/notes.md" || { echo "CHANGELOG.md has no section for $GITHUB_REF_NAME" >&2; exit 1; }
+      - run: gh release create "$GITHUB_REF_NAME" --verify-tag --notes-file "$RUNNER_TEMP/notes.md" $([[ "$GITHUB_REF_NAME" == *-* ]] && echo --prerelease)
+        env:
+          GH_TOKEN: ${{ github.token }}

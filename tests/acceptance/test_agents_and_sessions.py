@@ -3,12 +3,15 @@
 import time
 from datetime import datetime
 
+import pytest
+
 from tests.acceptance.conftest import (
     connect,
     error,
     hs_header,
     ok,
     registered_number,
+    seen,
     set_status,
     settings,
     skill,
@@ -34,11 +37,6 @@ def test_creating_an_agent_creates_its_endpoint_and_starts_offline(world, tenant
     assert status_of(tenant, agent) == tenant.status_id("Offline")
 
 
-def test_an_agent_named_like_a_person_gets_its_endpoint(tenant):
-    agent = ok(tenant.api.post(A, json={"name": "Agent One", "role": "agent", "external_id": "u-1"}))
-    assert agent["name"] == "Agent One" and agent["endpoint_id"]
-
-
 def test_external_id_is_unique_per_tenant_and_filters_the_list(world, tenant):
     first = ok(tenant.api.post(A, json={"name": "A", "role": "agent", "external_id": "u-1"}))
     err = error(tenant.api.post(A, json={"name": "B", "role": "agent", "external_id": "u-1"}), 409, "agent_exists")
@@ -56,20 +54,6 @@ def test_a_session_returns_agent_stream_and_plivo_tokens(tenant):
     expires = datetime.fromisoformat(s["expires_at"]).timestamp()
     assert 0 < expires - time.time() <= 3600 + 60
     assert expires >= datetime.fromisoformat(s["plivo"]["expires_at"]).timestamp()
-
-
-def test_the_plivo_token_is_minted_by_plivo_for_the_endpoint_app_and_session(world, tenant):
-    agent = tenant.agent()
-    s = session(tenant, agent)
-    claims = world.plivo.tokens[s["plivo"]["access_token"]]
-    app = ok(world.operator.get(f"/api/v1/tenants/{tenant.id}"))["plivo_app_id"]
-    assert (claims["iss"], claims["sub"], claims["app"]) == (tenant.auth_id, agent.endpoint_username, app)
-    assert claims["per"]["voice"] == {"incoming_allow": True, "outgoing_allow": False}
-    assert claims["nbf"] <= time.time() < claims["exp"] == datetime.fromisoformat(s["plivo"]["expires_at"]).timestamp()
-    assert claims["exp"] <= datetime.fromisoformat(s["expires_at"]).timestamp()
-    settings(tenant, agent_direct_dial=True)
-    later = world.plivo.tokens[session(tenant, agent)["plivo"]["access_token"]]
-    assert later["per"]["voice"]["outgoing_allow"] is True
 
 
 def test_the_second_heartbeat_makes_the_agent_available(tenant):
@@ -102,20 +86,6 @@ def test_a_sip_device_agent_set_available_by_api_takes_calls(tenant):
     assert hs_header(agent.phone.wait_ring(), "HsKind") == "offer"
 
 
-def test_a_browser_agent_rings_at_its_sdk_login_and_a_sip_device_at_its_endpoint(tenant):
-    browser, desk = tenant.agent("Browser"), tenant.agent("Desk phone")
-    browser.phone.unregister()
-    browser.login()
-    ok(set_status(tenant, desk, "Available"))
-    desk.phone.on_ring("ignore")
-    number, _ = tenant.inbound_line(browser, desk, strategy="Simultaneous")
-    stream = tenant.stream(after=0)
-    tenant.world.plivo.call(number)
-    assert browser.phone.wait_ring().to == f"sip:{browser.endpoint_username}_{tenant.auth_id}@phone.plivo.com"
-    assert desk.phone.wait_ring().to == f"sip:{desk.endpoint_username}@phone.plivo.com"
-    stream.wait_for("offer.accepted", agent_id=browser.id)
-
-
 def test_deleting_an_agent_removes_its_endpoint_but_not_while_on_a_call(world, tenant):
     live = connect(tenant)
     error(tenant.api.delete(f"{A}/{live.agent.id}"), 409)
@@ -123,8 +93,25 @@ def test_deleting_an_agent_removes_its_endpoint_but_not_while_on_a_call(world, t
     idle = tenant.agent("Idle")
     endpoint_id = ok(tenant.api.get(f"{A}/{idle.id}"))["endpoint_id"]
     ok(tenant.api.delete(f"{A}/{idle.id}"))
-    assert any(r.method == "DELETE" and f"/Endpoint/{endpoint_id}" in r.path for r in world.plivo.requests)
+    world.wait(lambda: ("Endpoint", endpoint_id) not in world.plivo.resources, what="the endpoint deleted")
     error(tenant.api.get(f"{A}/{idle.id}"), 404)
+
+
+def test_deleting_an_agent_does_not_wait_on_plivo_and_the_endpoint_goes_when_it_answers(world, tenant):
+    agent = tenant.agent("Slow")
+    endpoint_id = ok(tenant.api.get(f"{A}/{agent.id}"))["endpoint_id"]
+    slow = world.plivo.fault(
+        "refuse",
+        lambda r: r.method == "DELETE" and f"/Endpoint/{endpoint_id}" in r.path,
+        account=tenant.auth_id,
+        status=503,
+        after_sec=4,
+    )
+    began = time.monotonic()
+    ok(tenant.api.delete(f"{A}/{agent.id}"))
+    assert time.monotonic() - began < 2
+    world.wait(lambda: slow.hits, what="the endpoint delete reached Plivo")
+    world.wait(lambda: ("Endpoint", endpoint_id) not in world.plivo.resources, timeout=30, what="the endpoint deleted")
 
 
 def test_revoking_sessions_or_changing_the_role_kills_tokens_and_streams(tenant):
@@ -194,6 +181,7 @@ def test_me_returns_profile_role_status_and_desk_settings(tenant):
     assert (me["id"], me["role"], me["endpoint_username"]) == (agent.id, "agent", agent.endpoint_username)
     assert me["status"]["name"] == "Available"
     assert me["settings"]["agent_direct_dial"] is False and me["settings"]["wrap_up"]["mode"] in ("manual", "auto")
+    assert me["settings"]["recording"] == {"inbound": False, "outbound": False, "allow_pause": True}
 
 
 def test_caller_id_must_be_a_registered_number(tenant):
@@ -202,3 +190,96 @@ def test_caller_id_must_be_a_registered_number(tenant):
     number = registered_number(tenant)
     ok(tenant.api.patch(f"{A}/{agent.id}", json={"caller_id": number}))
     assert ok(tenant.api.get(f"{A}/{agent.id}"))["caller_id"] == number
+
+
+def test_missed_heartbeats_take_the_agent_offline(tenant):
+    agent = tenant.agent().login()
+    stream = tenant.stream(after=0)
+    offline = tenant.status_id("Offline")
+    went = tenant.world.wait(
+        lambda: [
+            e
+            for e in seen(stream, "agent.status_changed", agent_id=agent.id, reason="heartbeat")
+            if e["data"]["to_status"]["id"] == offline
+        ],
+        timeout=75,
+        what="the agent swept offline about 40 s after the last heartbeat",
+    )
+    assert went[0]["data"]["from_status"]["name"] == "Available" and status_of(tenant, agent) == offline
+
+
+def test_deleting_a_team_or_skill_takes_it_off_its_agents(tenant):
+    sales, french = team(tenant, "Sales"), skill(tenant, "French")
+    agent = tenant.agent(teams=[sales], skills=[{"skill_id": french, "level": 5}])
+    ok(tenant.api.delete(f"/api/v1/teams/{sales}"))
+    ok(tenant.api.delete(f"/api/v1/skills/{french}"))
+    got = ok(tenant.api.get(f"{A}/{agent.id}"))
+    assert (got["teams"], got["skills"]) == ([], [])
+
+
+def test_deleting_a_status_an_agent_holds_moves_the_agent_to_a_default_one(tenant):
+    lunch = ok(tenant.api.post("/api/v1/agent-statuses", json={"name": "Lunch", "availability": False}))
+    agent = tenant.agent()
+    ok(set_status(tenant, agent, "Lunch"))
+    ok(tenant.api.delete(f"/api/v1/agent-statuses/{lunch['id']}"))
+    error(tenant.api.get(f"/api/v1/agent-statuses/{lunch['id']}"), 404)
+    assert ok(tenant.api.get(f"/api/v1/agents/{agent.id}/status"))["status"]["name"] == "Break"
+
+
+def test_an_agent_named_like_a_person_gets_its_endpoint(world, tenant):
+    agent = ok(tenant.api.post(A, json={"name": "Agent One", "role": "agent", "external_id": "u-1"}))
+    assert agent["name"] == "Agent One"
+    assert world.plivo.endpoint(tenant.auth_id, agent["endpoint_id"])["alias"] == agent["id"]
+
+
+def test_the_plivo_token_is_minted_by_plivo_for_the_endpoint_app_and_session(world, tenant):
+    agent = tenant.agent()
+    s = session(tenant, agent)
+    assert s["plivo"]["access_token"] in world.plivo.tokens, "HS signed the token itself instead of asking Plivo"
+    claims = world.plivo.tokens[s["plivo"]["access_token"]]
+    app = ok(world.operator.get(f"/api/v1/tenants/{tenant.id}"))["plivo_app_id"]
+    assert (claims["iss"], claims["sub"], claims["app"]) == (tenant.auth_id, agent.endpoint_username, app)
+    assert claims["per"]["voice"] == {"incoming_allow": True, "outgoing_allow": False}
+    assert claims["nbf"] <= time.time() < claims["exp"] == datetime.fromisoformat(s["plivo"]["expires_at"]).timestamp()
+    assert claims["exp"] <= datetime.fromisoformat(s["expires_at"]).timestamp()
+    settings(tenant, agent_direct_dial=True)
+    later = world.plivo.tokens[session(tenant, agent)["plivo"]["access_token"]]
+    assert later["per"]["voice"]["outgoing_allow"] is True
+
+
+def test_a_browser_agent_rings_at_its_sdk_login_and_a_sip_device_at_its_endpoint(tenant):
+    browser, desk = tenant.agent("Browser"), tenant.agent("Desk")
+    browser.phone.unregister()
+    browser.login()
+    ok(set_status(tenant, desk, "Available"))
+    desk.phone.on_ring("ignore")
+    number, _ = tenant.inbound_line(browser, desk, strategy="simultaneous")
+    stream = tenant.stream(after=0)
+    tenant.world.plivo.call(number)
+    assert browser.phone.wait_ring().to == f"sip:{browser.endpoint_username}_{tenant.auth_id}@phone.plivo.com"
+    assert desk.phone.wait_ring().to == f"sip:{desk.endpoint_username}@phone.plivo.com"
+    stream.wait_for("offer.accepted", agent_id=browser.id)
+
+
+@pytest.mark.parametrize("browser_first", [True, False], ids=["session_ends", "session_opens"])
+def test_a_transfer_rung_again_rings_its_agent_where_it_is_logged_in_by_then(world, tenant, browser_first):
+    settings(tenant, ring_timeout_sec=120)
+    target = tenant.agent("Target")
+    sip = f"sip:{target.endpoint_username}@phone.plivo.com"
+    sdk = f"sip:{target.endpoint_username}_{tenant.auth_id}@phone.plivo.com"
+    if browser_first:
+        target.login()
+    else:
+        ok(set_status(tenant, target, "Available"))
+    target.phone.on_ring("ignore")
+    live = connect(tenant)
+    transfer = {"mode": "warm", "target": {"type": "agent", "agent_id": target.id}}
+    ok(live.agent.api().post(f"/api/v1/calls/{live.id}/transfers", json=transfer))
+    first = target.phone.wait_ring().to
+    if browser_first:
+        target.expire_tokens()
+    else:
+        target.login(available=False)
+    live.leg.hangup()
+    again = world.wait(lambda: [c.to for c in world.plivo.calls if c.to in (sip, sdk)][1:], what="a second ring")
+    assert [first, *again] == ([sdk, sip] if browser_first else [sip, sdk])

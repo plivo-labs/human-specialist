@@ -11,12 +11,9 @@ import uuid
 import pytest
 
 from tests.contract import routes
-from tests.harness import ALL_SCOPES
+from tests.harness import ALL_SCOPES, fixtures
 
 app = routes.import_app()
-if app is None:
-    pytest.skip("hs.app not built yet", allow_module_level=True)
-fixtures = pytest.importorskip("tests.harness.fixtures", reason="harness fixtures not built yet")
 world = fixtures.world  # registers the session fixture in this module
 
 pytestmark = pytest.mark.xdist_group("harness")
@@ -50,12 +47,8 @@ def send(client, method: str, path: str):
 
 
 @pytest.fixture(scope="module")
-def env(request):
-    try:
-        world = request.getfixturevalue("world")
-        return world, world.new_tenant("Home"), world.new_tenant("Other")
-    except NotImplementedError:
-        pytest.skip("harness not implemented yet")
+def env(world):
+    return world, world.new_tenant("Home"), world.new_tenant("Other")
 
 
 @pytest.fixture(scope="module")

@@ -1,76 +1,45 @@
-"""Click-to-call. One path for both entry points: POST /calls rings the agent with a Make Call, and an
-agent's own device may dial out only with agent_direct_dial. At answer the agent's leg becomes the call's contact
-and enters `mpc_{run}`, the inbound shape, so hold, recording, transfer and hangup work unchanged; the lead is added
-when the agent joins."""
+"""Agent-first outbound calls. POST /calls rings the agent (`dial`); once the agent's leg answers it takes
+its seat in the conversation's room and the lead is dialed into it as the customer. An agent's own device may
+dial out only with agent_direct_dial, and its leg is then the agent's from the start.
 
-import json
+voice/flow.py hands this module the agent leg's answer (/answer with `c`, or from an endpoint) and every status of
+both legs (/hangup with `c`: the agent leg's Make Call hangup and the lead's call status), each with `a`, the stint of
+the dial it belongs to. The conversation stays `open` until the lead answers; a call that ends before that fails with
+the result of its hangup cause. A call from a text conversation has a room of its own on it."""
+
 import re
-import uuid
-from urllib.parse import quote
-from xml.sax.saxutils import quoteattr
+from contextlib import suppress
+from uuid import UUID
 
-import httpx
-from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import text
+from fastapi import APIRouter, Response
+from pydantic import BaseModel, Field
+from sqlalchemy import select, update
+from sqlalchemy.engine import Connection, Row
 
-from hs import events
-from hs.access import Call, Principal, redis_client, ring_address, tenant_plivo
-from hs.conversations import child_update as ccu
-from hs.conversations import management as cm
-from hs.conversations.models import ConversationDataDict, ConversationStates, ConvParentInsertModel
-from hs.errors import ApiError
-from hs.infra.db import core_engine
-from hs.infra.helpers import get_now
-from hs.infra.log import logger
-from hs.infra.settings import settings
-from hs.plivo import rest
-from hs.plivo import voice as pv
-from hs.routing import constants as rc
-from hs.routing.redis_store import RoutingRedis
-from hs.setup.actions import E164_PATTERN
-from hs.setup.api import is_registered
-from hs.voice import controls
-from hs.voice import hangup as voice_hangup
-from hs.voice.intake import hold_music
-from hs.voice.redis_store import VoiceRedis
+from hs import access, agents, config, conversations, jobs, plivo
+from hs.access import Principal
+from hs.config import models as m
+from hs.core import PUBLIC, ApiError, T, read, tx
+from hs.voice import flow, mpc
 
-DIAL_TTL = 24 * 3600
-LEAD_RING_TIMEOUT = 120
-REJECT = '<Response><Hangup reason="rejected"/></Response>'
-EVENTS = "mpc-state-changes,participant-state-changes,add-participant-api-events,participant-digit-input-events"
-
-_AGENT = text(
-    "SELECT aom.uuid::text AS id, aom.sip_endpoint, aom.sip_endpoint_id, aom.caller_id, o.auth_id,"
-    " COALESCE(st.availability, false) AS available, o.call_recording_outbound AS record,"
-    " COALESCE((rs.reservation_timeout->>'call')::int, 30) AS ring"
-    " FROM account_org_mapping aom JOIN organization o ON o.id = aom.organization"
-    " LEFT JOIN org_statuses st ON st.id = aom.agent_status"
-    " LEFT JOIN routing_settings rs ON rs.organization = o.id AND rs.is_deleted IS NOT TRUE"
-    " WHERE aom.uuid = :agent AND aom.organization = :org AND aom.is_deleted IS NOT TRUE"
-)
-_ENDPOINT_AGENT = text(
-    "SELECT uuid::text FROM account_org_mapping WHERE organization = :org AND is_deleted IS NOT TRUE"
-    " AND split_part(regexp_replace(sip_endpoint, '^sip:', ''), '@', 1) = :user"
-)
-_OPENED = text("SELECT uuid::text, conversation_number FROM conversation_parent WHERE contact_uuid = :contact")
-# The agent's leg becomes the conversation's contact, as a caller's leg is on an inbound call.
-_RECONTACT = text(
-    "WITH p AS (UPDATE conversation_parent SET contact_uuid = :call WHERE uuid = :cid RETURNING id)"
-    " UPDATE conversation SET contact_uuid = :call WHERE parent = (SELECT id FROM p) AND contact_uuid = :old"
-)
-_CONSENT = text(
-    "SELECT s.voice_settings->'consent'->'outbound' FROM org_setting s JOIN organization o ON o.id = s.organization"
-    " WHERE o.auth_id = :auth_id"
-)
+router = APIRouter()
+CALLS = access.require("key:calls", "agent")
+LEAD_RING = 120
+# The result of a call that ended before the lead answered, by Plivo's hangup cause; any other is failed_carrier.
+RESULTS = {"1000": "cancelled", "3000": "no_answer", "6010": "no_answer", "3010": "busy", "3100": "busy"}
+RESULTS |= {"3020": "rejected", "3110": "rejected", "2000": "failed_invalid", "3050": "failed_invalid"}
+REJECTED = ("Hangup", {"reason": "rejected"})
 
 
-class DialIn(BaseModel):
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
-    agent_id: uuid.UUID
+class DialIn(m.Body):
+    agent_id: UUID
     to: str
     from_: str | None = Field(None, alias="from")
     ring_timeout_sec: int | None = Field(None, ge=5, le=120)
     context: dict | None = None
+    conversation_id: UUID | None = Field(
+        None, description="The agent's live text conversation; the call to `to` joins it."
+    )
 
 
 class Dialing(BaseModel):
@@ -78,292 +47,301 @@ class Dialing(BaseModel):
     status: str
 
 
-def hs_header(value: str) -> str:
-    """An Hs* SIP header value: Plivo takes only [A-Za-z0-9%], so everything else is percent-encoded."""
-    return re.sub(r"[^A-Za-z0-9%]", lambda m: f"%{ord(m[0]):02X}", quote(value, safe=""))
-
-
-def _key(ref: str) -> str:
-    return f"DIAL:{ref}"
-
-
-def dialed(ref: str, tenant_id: str = "") -> dict | None:
-    """The dial by its conversation id or, once answered, by its agent leg (the call's contact): the engine's MPC
-    callbacks branch on it. With `tenant_id`, only that tenant's: a callback's query names it, and any tenant signs."""
-    raw = redis_client().get(_key(ref))
-    dial = json.loads(raw) if raw else None
-    return dial if dial and tenant_id in ("", dial["tenant_id"]) else None
-
-
-def _put(dial: dict, *refs: str) -> None:
-    pipe = redis_client().pipeline()
-    for ref in refs:
-        pipe.set(_key(ref), json.dumps(dial), ex=DIAL_TTL)
-    pipe.execute()
-
-
-def _registered(p: Principal, endpoint_id: str) -> bool:
-    try:
-        r = rest.call(tenant_plivo(p.tenant_id), "GET", f"Endpoint/{endpoint_id}/")
-    except httpx.HTTPError as e:
-        raise ApiError(503, "plivo_unavailable", "Plivo did not answer") from e
-    return r.is_success and str(r.json().get("sip_registered")).lower() == "true"
-
-
-def _open(p: Principal, body: DialIn, device: bool = False) -> dict:
-    """Check the dial, open the outbound conversation and hold the agent's call slot.
-    Returns the dial: what the answer, the lead's add and the hangups read."""
-    if not re.fullmatch(E164_PATTERN, body.to):
+def _check(db: Connection, p: Principal, body: DialIn) -> tuple[dict, str]:
+    if not re.fullmatch(m.E164_PATTERN, body.to):
         raise ApiError(422, "invalid_number", "to must be an E.164 number")
-    if body.context is not None and len(context := json.dumps(body.context)) > 2048:
-        raise ApiError(422, "context_too_large", "context is at most 2 KB")
-    if body.context is not None and "\\u0000" in context:
-        # the event relay casts context to jsonb, which cannot hold a NUL
-        raise ApiError(422, "context_invalid", "context may not contain a NUL character")
-    with core_engine.connect() as conn:
-        agent = conn.execute(_AGENT, {"agent": str(body.agent_id), "org": p.org_id}).first()
-    if agent is None:
-        raise ApiError(422, "foreign_id", "unknown id in agent_id", {"field": "agent_id", "ids": [str(body.agent_id)]})
-    caller_id = body.from_ or agent.caller_id
-    if not caller_id or not is_registered(p.org_id, caller_id):
+    access.owned(db, p, "agent", [body.agent_id])
+    agent = config.get(db, p.tenant_id, "agent", body.agent_id)
+    default = config.tenant_settings(db, p.tenant_id).default_from.get("call", "")
+    caller_id = body.from_ or agent.get("caller_id") or default
+    if not config.by_key(db, p.tenant_id, "number", caller_id):
         raise ApiError(422, "from_not_allowed", "from must be a number registered with PUT /numbers")
-    if not agent.available:
+    return agent, caller_id
+
+
+def _open(db: Connection, p: Principal, body: DialIn, agent: dict, caller_id: str, address=None, leg=None):
+    """The conversation and the agent's stint on it at `address`, else where the agent rings now: offered while its
+    leg rings, active once it has `leg`. The agent's presence row is share-locked first, so a status change in flight
+    is seen, and the stint takes the agent's one call slot, so two dials cannot both take it."""
+    P, t = T.presence, p.tenant_id
+    status = db.execute(select(P.c.status_id).where(P.c.agent_id == agent["id"]).with_for_update(read=True)).scalar()
+    if not (config.get(db, t, "status", status) or {}).get("availability"):
         raise ApiError(409, "agent_unavailable", "the agent is not available")
-    if redis_client().scard(rc.agent_capacity_key(agent.auth_id, agent.sip_endpoint, rc.CHANNEL_CALL)):
-        raise ApiError(409, "agent_on_call", "the agent is on a call")
-    browser = ring_address(agent.sip_endpoint) != agent.sip_endpoint  # Plivo shows no registration for an SDK login
-    if not (device or browser or _registered(p, agent.sip_endpoint_id)):
-        raise ApiError(409, "agent_not_registered", "the agent has no registered device")
-    contact = str(uuid.uuid4())
-    conv = ConvParentInsertModel(
-        parent_channel=rc.CHANNEL_CALL,
-        phone_or_email=body.to,
-        parent_contact_uuid=contact,
-        org_auth_id=agent.auth_id,
-        agent_sip_or_uuid=agent.id,
-        direction_inbound=False,
-        sender_id=caller_id,
-        conversation_data=ConversationDataDict(conversation_custom_data=body.context) if body.context else None,
-    )
-    if (created := cm.create_parent_conversation(conv)).error:
-        logger.error(f"dial: the conversation was not created: {created.error}")
-        raise ApiError(409, "conversation_failed", "the call's conversation could not be opened")
-    with core_engine.connect() as conn:
-        cid, number = conn.execute(_OPENED, {"contact": contact}).one()
-    data = {"number": caller_id, "entry_point_id": None, "hours": "none"}
-    events.emit("conversation.started", tenant_id=p.tenant_id, conversation_id=cid, agent_id=agent.id, data=data)
-    dial = {
-        "tenant_id": p.tenant_id,
-        "conversation_id": cid,
-        "conversation_number": str(number),
-        "contact": contact,
-        "run_id": str(uuid.uuid4()),
-        "agent_id": agent.id,
-        "agent_sip": agent.sip_endpoint,
-        "auth_id": agent.auth_id,
-        "to": body.to,
-        "from": caller_id,
-        "ring_timeout": body.ring_timeout_sec or LEAD_RING_TIMEOUT,
-        "record": bool(agent.record),
-        "agent_ring": agent.ring,
-    }
-    code, _err = RoutingRedis().increase_agent_capacity(agent.auth_id, agent.sip_endpoint, rc.CHANNEL_CALL, 1, number)
-    if code == -2:
-        _fail(dial, "cancelled", None)
-        raise ApiError(409, "agent_on_call", "the agent is on a call")
-    _put(dial, cid)
-    return dial
+    C = T.conversation
+    ring = {"lead_ring": body.ring_timeout_sec or LEAD_RING, "lead_from": caller_id, "lead_to": body.to}
+    if body.conversation_id:
+        conv = access.conversation(db, p, body.conversation_id, lock=True)
+        mine = str(getattr(conversations.primary_agent(db, conv.id), "agent_id", None)) == str(agent["id"])
+        if conv.channel == "call" or conv.state not in conversations.LIVE or not mine:
+            raise ApiError(409, "conversation_not_joinable", "the call joins the agent's live text conversation")
+        if _agent(db, conv):
+            raise ApiError(409, "agent_on_call", "the agent is on a call")
+        values = {"routing": C.c.routing.concat(ring) - "lead_up", "call_uuid": None, "room": C.c.room + 1}
+    else:
+        parties = {"customer": body.to, "ours": caller_id, "context": body.context, "number": caller_id}
+        conv = conversations.open(db, t, channel="call", direction="outbound", agent_id=agent["id"], **parties)
+        values = {"routing": ring}
+    conv = db.execute(update(C).where(C.c.id == conv.id).values(**values).returning(*C.c)).one()
+    return conv, conversations.dial(db, conv, agent["id"], address or agents.ring_address(db, t, agent), leg)
 
 
-def dial(p: Principal, body: DialIn) -> dict:
-    """POST /calls: ring the agent's endpoint; the lead is dialled once the agent is in the MPC."""
-    dial = _open(p, body)
-    base, cid = f"{settings.public_base_url}/plivo/{p.tenant_id}", dial["conversation_id"]
-    headers = {"HsKind": "outbound", "HsConversation": cid}
-    call = {
-        "from": dial["from"],
-        "to": ring_address(dial["agent_sip"]),
-        "answer_url": f"{base}/answer?dial={cid}",
-        "answer_method": "POST",
-        "hangup_url": f"{base}/hangup?dial={cid}",
-        "hangup_method": "POST",
-        "ring_timeout": dial["agent_ring"],
-        "sip_headers": ",".join(f"{k}={hs_header(v)}" for k, v in headers.items()),
-    }
-    try:
-        r = rest.call(tenant_plivo(p.tenant_id), "POST", "Call/", **call)
-    except httpx.HTTPError as e:
-        _fail(dial, "failed_carrier", None)
-        raise ApiError(503, "plivo_unavailable", "Plivo did not answer") from e
-    if r.status_code == 429:
-        _fail(dial, "failed_carrier", None)
-        retry = r.headers.get("retry-after", "")
-        raise ApiError(429, "carrier_rate_limited", "Plivo refused the dial", {"retry_after": int(retry or 1)})
-    if not r.is_success:
-        _fail(dial, "failed_carrier", None)
-        raise rest.refused(r)
-    _put(dial | {"request_uuid": r.json().get("request_uuid")}, cid)
+def _dialing(cid: str) -> dict:
     return {"conversation_id": cid, "status": "dialing_agent"}
 
 
-def _fail(dial: dict, result: str, code: int | None) -> None:
-    """The dial ended before the agent answered: call.failed, call.ended, and the conversation closes."""
-    redis_client().delete(_key(dial["conversation_id"]))
-    RoutingRedis().decrease_agents_capacity(
-        dial["auth_id"], dial["agent_sip"], rc.CHANNEL_CALL, dial["conversation_number"]
-    )
-    extra = {"hangup_cause_code": str(code or ""), "result": result}
-    failed = ConversationStates.outbound_contact_failed.name
-    ccu.ChildConversationStateManagement(failed, dial["contact"], get_now(), extra_update_data_dict=extra).invoke()
-    _ended(dial, result, code, "system")
+@router.post("/calls", status_code=201, response_model=Dialing)
+def dial(body: DialIn, p: Principal = CALLS):
+    """Ring the agent's SDK login or registered endpoint; the lead is dialed once the agent answers. An agent token
+    dials only for itself, and only with agent_direct_dial on. Plivo's refusal is the answer (422, or 429 with
+    Retry-After)."""
+    with read() as db:
+        if p.kind == "agent" and not config.tenant_settings(db, p.tenant_id).agent_direct_dial:
+            raise ApiError(403, "dial_requires_server", "agents dial only with agent_direct_dial on")
+        if p.kind == "agent" and p.agent_id != str(body.agent_id):
+            raise ApiError(403, "forbidden", "an agent dials only for itself")
+        (agent, caller_id), tenant = _check(db, p, body), config.live_tenant(db, p.tenant_id)
+        address = agents.ring_address(db, p.tenant_id, agent)
+    if address == agents.SIP.format(agent["endpoint_username"]):
+        registered = plivo.rest(tenant, "GET", f"Endpoint/{agent['endpoint_id']}/").get("sip_registered")
+        if str(registered).lower() != "true":
+            raise ApiError(409, "agent_not_registered", "the agent has no registered device")
+    with tx() as db:
+        conv, a = _open(db, p, body, agent, caller_id, address)
+        access.created(db, cid := str(conv.id))
+        t, ring = p.tenant_id, config.tenant_settings(db, p.tenant_id).ring_timeout_sec
+        call = {f"{u}_url": plivo.url(t, u, c=cid, a=a.id) for u in ("answer", "hangup")}
+        call |= {"from": caller_id, "to": a.address, "ring_timeout": ring}
+        call["sip_headers"] = f"HsKind=outbound,HsConversation={mpc.sip_header(cid)}"
+        dialing = {"tenant_id": t, "conversation_id": cid, "assignment_id": str(a.id), "check": ring + 30}
+        dialing["claim"] = access.claimed()
+        key = plivo.command(db, "dial", str(a.id), dialing | {"path": "Call/", "params": call}, wait=True)
+    plivo.verdict(key)
+    return _dialing(cid)
 
 
-def _ended(dial: dict, result: str, code: int | None, by: str) -> None:
-    data = {"from": dial["from"], "to": dial["to"], "result": result, "queue_id": None, "hangup_cause": None}
-    data |= {"hangup_cause_code": code, "duration_sec": None, "talk_sec": 0, "ended_by": by}
-    ids = {"tenant_id": dial["tenant_id"], "conversation_id": dial["conversation_id"], "agent_id": dial["agent_id"]}
-    events.emit("call.ended", data=data, **ids)
+access.VIEWS[f"POST {PUBLIC}/calls"] = lambda db, p, cid: (
+    access.conversation(db, p, UUID(cid), offer=True) and _dialing(cid)
+)
 
 
-def cancel(p: Principal, call: Call) -> tuple[bool, str | None]:
-    """POST /calls/{id}/hangup while the agent still rings: cancel the Make Call. Its hangup closes the call.
-    (whether the agent was ringing, Plivo's error); a 404 means the dial already ended."""
-    dial = dialed(call.conversation_id)
-    if dial is None or dial.get("call_uuid"):
-        return False, None
-    if not (request_uuid := dial.get("request_uuid")):
-        return True, None
-    _body, status, err = pv.PlivoVoiceClient(*tenant_plivo(p.tenant_id)).request_cancel(request_uuid)
-    return True, None if status == 404 else err
+def _agent(db: Connection, conv: Row, aid=None) -> Row | None:
+    """The stint of dial `aid`, else the conversation's newest dial. A text conversation outlives each call on it, so
+    there a dial whose call is over reads None."""
+    dials = [a for a in conversations.rows(db, conv.id) if a.via == "outbound"]
+    a = next((d for d in dials if str(d.id) == str(aid)), None) if aid else (dials[-1] if dials else None)
+    return a if conv.channel == "call" or (a and a.state in conversations.ON) else None
 
 
-def answer(p: Principal, form: dict, dial: str | None) -> str:
-    """The answer URL of the calls this module owns: an agent leg of POST /calls (`dial`), or a dial-out from one of
-    the tenant's endpoints, which only agent_direct_dial allows (to an E.164 number, from the caller ID)."""
-    if dial:
-        found = dialed(dial, p.tenant_id)
-        return REJECT if found is None or found.get("call_uuid") else _agent_answered(found, form["CallUUID"])
-    from hs.voice.api import direct_dial
-
-    user = str(form.get("From", "")).removeprefix("sip:").partition("@")[0]
-    with core_engine.connect() as conn:
-        agent_id = conn.execute(_ENDPOINT_AGENT, {"org": p.org_id, "user": user}).scalar()
-    if agent_id is None or not direct_dial(p):
-        logger.info(f"refused an endpoint dial-out tenant={p.tenant_id}")
-        return REJECT
-    try:
-        found = _open(p, DialIn(agent_id=uuid.UUID(agent_id), to="+" + str(form.get("To", "")).removeprefix("+")), True)
-    except ApiError as e:
-        logger.info(f"refused an endpoint dial-out tenant={p.tenant_id}: {e.code}")
-        return REJECT
-    return _agent_answered(found, form["CallUUID"])
+def _seat(db: Connection, conv: Row, a: Row | None = None) -> Response:
+    """The agent's seat in the room. A newly seated agent's `a` also has call.started told and the lead rung into the
+    room as its customer."""
+    _, attrs, name, *hold = flow.room(db, conv, None)[0]
+    room = {k: v for k, v in attrs.items() if k not in mpc.SEAT}
+    t, cid, ring = str(conv.tenant_id), str(conv.id), conv.routing["lead_ring"]
+    if a:
+        ours, to = conv.routing.get("lead_from", conv.ours), conv.routing.get("lead_to", conv.customer)
+        flow.emit(db, "call.started", conv, a.agent_id, **{"from": ours, "to": to})
+        lead = {re.sub("(?=[A-Z])", "_", k).lower(): v for k, v in room.items()} | {"role": "Customer"}
+        lead |= {"from": ours, "to": to, "ring_timeout": ring, "end_mpc_on_exit": True}
+        lead["call_status_callback_url"] = plivo.url(t, "hangup", c=cid, a=a.id)
+        adding = {"tenant_id": t, "conversation_id": cid, "room": conv.room, "check": ring + 30}
+        plivo.command(db, "dial", cid, adding | {"path": f"{mpc.room_of(adding)}/Participant/", "params": lead})
+    return plivo.xml(("MultiPartyCall", room | {"role": "Agent", "startMpcOnEnter": True}, name, *hold))
 
 
-def _agent_answered(dial: dict, call_uuid: str) -> str:
-    """The agent's leg answered: it becomes the call's contact, the engine's capacity, mapping and contact record
-    are set for the run, and the agent enters `mpc_{run}`."""
-    run, cid, auth_id = dial["run_id"], dial["conversation_id"], dial["auth_id"]
-    dial |= {"call_uuid": call_uuid}
-    _put(dial, cid, call_uuid)
-    with core_engine.begin() as conn:
-        conn.execute(_RECONTACT, {"call": call_uuid, "cid": cid, "old": dial["contact"]})
-    engine = {"agent_sip_endpoint": dial["agent_sip"], "agent_uuid": dial["agent_id"], "auth_id": auth_id}
-    engine |= {"flow_run_id": run, "to_number": dial["to"], "from_number": dial["from"]}
-    engine["conversation_data"] = {"conversation_number": dial["conversation_number"]}
-    if (err := controls.handle_outbound_call(call_uuid, engine)) is not None:
-        logger.error(f"outbound answer: capacity or mapping failed call_uuid={call_uuid}: {err}")
-        return REJECT
-    contact = {"conversation_number": dial["conversation_number"], "flow_run_uuid": run}
-    contact |= {"queue_and_route_run_uuid": run, "contact_channel": rc.CHANNEL_CALL, "contact_uuid": call_uuid}
-    contact |= {"from_number": dial["to"], "to": dial["from"], "auth_id": auth_id}
-    contact["auth_token"] = tenant_plivo(dial["tenant_id"])[1]
-    RoutingRedis().store_contact_params(call_uuid, run, json.dumps(contact, separators=(",", ":")))
-    if err := VoiceRedis().set_mpc_call_uuids(run, run, [call_uuid], 4 * 3600):
-        logger.error(f"outbound answer: could not store the MPC legs call_uuid={call_uuid}: {err}")
-    joined = ConversationStates.outbound_contact_agent_joined.name
-    ccu.ChildConversationStateManagement(joined, call_uuid, get_now()).invoke()
-    data = {"from": dial["from"], "to": dial["to"]}
-    events.emit("call.started", tenant_id=dial["tenant_id"], conversation_id=cid, agent_id=dial["agent_id"], data=data)
-    record = str(dial["record"]).lower()
-    attrs = {
-        "role": "Agent",
-        "statusCallbackUrl": pv.mpc_status_callback_url(auth_id, call_uuid, run),
-        "statusCallbackEvents": EVENTS,
-        "startMpcOnEnter": "true",
-        "enterSound": "none",
-        "relayDTMFInputs": "true",
-        "record": record,
-        "recordParticipantTrack": record,
-        "recordingCallbackUrl": pv.mpc_recording_callback_url(auth_id, call_uuid, run),
-        "transcript": record,
-        "transcriptionUrl": pv.mpc_transcription_callback_url(auth_id, call_uuid),
-    }
-    mpc = " ".join(f"{k}={quoteattr(v)}" for k, v in attrs.items())
-    return f"<Response><MultiPartyCall {mpc}>mpc_{run}{hold_music()}</MultiPartyCall></Response>"
+def answer(tenant: Row, form: dict, c: UUID | None, aid: UUID | None = None) -> Response:
+    """The agent's leg answered: a dial of POST /calls (`c`), or the agent's own device dialing out from its endpoint
+    or its SDK login, which takes agent_direct_dial and an E.164 number. A repeated answer gets its seat again;
+    anything else is rejected."""
+    A, call_uuid = T.assignment, form.get("CallUUID", "")
+    with tx() as db:
+        dialed = select(A.c.id, A.c.conversation_id).where(A.c.call_uuid == call_uuid, A.c.via == "outbound")
+        if (seen := db.execute(dialed).first()) and (conv := mpc.find_conv(db, tenant, seen.conversation_id)):
+            return _seat(db, conv) if _agent(db, conv, seen.id) else plivo.xml(REJECTED)
+        if c and (conv := mpc.find_conv(db, tenant, c)) and (a := _agent(db, conv, aid)) and a.state == "offered":
+            return _seat(db, conv, conversations.move(db, a, "answer", call_uuid=call_uuid))
+        user = mpc.bare_user(form.get("From", "")).removesuffix(f"_{tenant.plivo_auth_id}")
+        found = not c and config.by_key(db, tenant.id, "agent", user)
+        if not found or not config.tenant_settings(db, tenant.id).agent_direct_dial:
+            return plivo.xml(REJECTED)
+        p, body = Principal(str(tenant.id), "plivo"), DialIn(agent_id=found[0], to=plivo.e164(form.get("To", "")))
+        with suppress(ApiError):
+            return _seat(db, *_open(db, p, body, *_check(db, p, body), leg=call_uuid))
+        return plivo.xml(REJECTED)
 
 
-def hangup(p: Principal, form: dict, dial: str | None) -> tuple[str, str, dict] | None:
-    """The hangup URL of the calls this module owns: an agent leg that never answered closes the call as
-    cancelled. An answered one has no call-status callback of its own, so it returns the (call, run, callback) of
-    the agent leaving for the caller to hand to the engine; Plivo's retries of it share one claim key."""
-    found = dialed(dial, p.tenant_id) if dial else None
-    if found is None:
+def _hang(db: Connection, conv: Row, call_uuid: str) -> None:
+    plivo.command(db, "hangup", call_uuid, {"tenant_id": str(conv.tenant_id), "call_uuid": call_uuid})
+
+
+def _bind(db: Connection, conv: Row, call_uuid: str) -> Row:
+    """The lead's leg, first seen in a status or the add-member reply; one seen once the call is over is hung up."""
+    C = T.conversation
+    conv = db.execute(update(C).where(C.c.id == conv.id).values(call_uuid=call_uuid).returning(*C.c)).one()
+    if conv.state not in conversations.LIVE or not _agent(db, conv):
+        _hang(db, conv, call_uuid)
+    return conv
+
+
+def _up(conv: Row) -> bool:
+    """The lead answered. A call joined to a text conversation has no state of its own, so a mark says so."""
+    return bool(conv.routing.get("lead_up")) if conv.channel != "call" else conv.state != "open"
+
+
+def _live(db: Connection, conv: Row, a: Row, speak: bool = False) -> Row | None:
+    """The lead answered: the call is live and call.answered told, naming the agent `a` who dialed it, and with
+    `speak` the tenant's outbound notice is played to the lead."""
+    if conv.channel == "call":
+        live = conversations.set_state(db, conv, "live")
+    else:
+        C = T.conversation
+        marked = update(C).where(C.c.id == conv.id, ~C.c.routing.has_key("lead_up"))
+        live = db.execute(marked.values(routing=C.c.routing.concat({"lead_up": True})).returning(*C.c)).first()
+    if live is None:
         return None
-    if not found.get("call_uuid"):
-        code = str(form.get("HangupCauseCode", ""))
-        _fail(found, "cancelled", int(code) if code.isdigit() else None)
-        return None
-    left = {"EventName": "Hangup", "Role": "agent", "CallUUID": found["call_uuid"], "To": found["agent_sip"]}
-    left |= {"AnswerTime": form.get("AnswerTime", ""), "HangupTime": form.get("EndTime", "")}
-    left |= {"PlivoHangupCauseCode": form.get("HangupCauseCode", ""), "PlivoHangupSource": form.get("HangupSource", "")}
-    return found["call_uuid"], found["run_id"], left
+    t, cid = str(live.tenant_id), str(live.id)
+    flow.emit(db, "call.answered", live, a.agent_id, call_uuid=live.call_uuid)
+    if speak and (notice := config.tenant_settings(db, t).consent.outbound):
+        say = notice.model_dump(mode="json", exclude_none=True)
+        lead = {"tenant_id": t, "conversation_id": cid, "room": live.room, "call_uuid": live.call_uuid}
+        plivo.command(db, "consent", cid, lead | {k.removeprefix("audio_"): v for k, v in say.items()})
+    return live
 
 
-def on_agent_join(call_uuid: str, run: str, dial: dict) -> str | None:
-    """The agent is in the MPC: dial the lead in as its Customer; the MPC ends when either of them leaves."""
-    record = dial["record"]
-    body = {
-        "role": "Customer",
-        "from": dial["from"],
-        "to": dial["to"],
-        "ring_timeout": dial["ring_timeout"],
-        "call_status_callback_url": pv.mpc_call_status_callback_url(dial["auth_id"], call_uuid, run),
-        "call_status_callback_method": "POST",
-        "status_callback_url": pv.mpc_status_callback_url(dial["auth_id"], call_uuid, run),
-        "status_callback_method": "POST",
-        "status_callback_events": EVENTS,
-        "end_mpc_on_exit": True,
-        "enter_sound": "none",
-        "relay_dtmf_inputs": True,
-        "record": record,
-        "record_participant_track": record,
-        "recording_callback_url": pv.mpc_recording_callback_url(dial["auth_id"], call_uuid, run),
-        "recording_callback_method": "POST",
-        "transcript": record,
-        "transcription_url": pv.mpc_transcription_callback_url(dial["auth_id"], call_uuid),
-    }
-    client = pv.PlivoVoiceClient(*tenant_plivo(dial["tenant_id"]))
-    return client.mpc_add_participant(pv.make_mpc_id(f"mpc_{run}"), body, raw_body=pv.compact_json(body))[2]
+def room(db: Connection, conv: Row, event: str, form: dict) -> bool:
+    """A room event of a call that is still `open`, by the status rule: the lead in the room answered (the room
+    then takes its exit), and the agent leaving before that cancels the call. True when that ends the event; a call
+    joined to a text conversation takes every room event here, since the room never moves its conversation."""
+    leg, a = form.get("ParticipantCallUUID"), _agent(db, conv)
+    if a and leg and leg == conv.call_uuid and event in ("ParticipantJoin", "ParticipantExit"):
+        _live(db, conv, a, speak=event == "ParticipantJoin")
+    elif a and leg and leg == a.call_uuid and event == "ParticipantExit" and not _up(conv):
+        _failed(db, conv, a, "cancelled", flow.hangup_facts({}, "agent"), leg)
+        return True
+    return conv.channel != "call"
 
 
-def on_customer_join(call_uuid: str, run: str, dial: dict, member_id: str) -> str | None:
-    """The lead answered: call.answered, then the outbound consent, once."""
-    answered = ConversationStates.outbound_contact_answered.name
-    ccu.ChildConversationStateManagement(answered, call_uuid, get_now()).invoke()
-    with core_engine.connect() as conn:
-        consent = conn.execute(_CONSENT, {"auth_id": dial["auth_id"]}).scalar()
-    if not consent or not redis_client().set(f"CONSENT:{call_uuid}", 1, nx=True, ex=DIAL_TTL):
-        return None
-    client, mpc = pv.PlivoVoiceClient(*tenant_plivo(dial["tenant_id"])), pv.make_mpc_id(f"mpc_{run}")
-    if consent.get("audio_url"):
-        return client.mpc_start_play_audio(mpc, member_id, {"url": consent["audio_url"]})[2]
-    return client.mpc_start_speak(mpc, member_id, {k: v for k, v in consent.items() if v})[2]
+def _failed(db: Connection, conv: Row, a: Row, result: str, hangup: dict, ended: str | None = None) -> None:
+    """The call ended before the lead answered: call.failed and call.ended, told to the agent too, and it closes
+    with `result`. The agent's dial `a` is let go without wrap-up, and every leg but the one that `ended` is hung up."""
+    flow.emit(db, "call.failed", conv, a.agent_id, result=result, hangup_cause_code=hangup["hangup_cause_code"])
+    if a.state == "offered":
+        conversations.move(db, a, "withdraw", reason="cancelled")
+    else:
+        conversations.move(db, a, "end", reason=result)
+    for leg in {a.call_uuid, conv.call_uuid} - {ended, None}:
+        _hang(db, conv, leg)
+    if conv.channel == "call":
+        C = T.conversation
+        conv = db.execute(update(C).where(C.c.id == conv.id).values(result=result).returning(*C.c)).one()
+    _ended(db, conv, hangup, a, result)
 
 
-def on_customer_failed(call_uuid: str, run: str, dial: dict, code: str) -> str | None:
-    """The lead was not reached: call.failed with the cause's result and call.ended; the agent is let go."""
-    failed = ConversationStates.outbound_contact_failed.name
-    extra = {"hangup_cause_code": code}
-    ccu.ChildConversationStateManagement(failed, call_uuid, get_now(), extra_update_data_dict=extra).invoke()
-    _ended(dial, ccu.call_result(code), int(code) if code.isdigit() else None, "customer")
-    return voice_hangup.end_mpc(f"mpc_{run}", *tenant_plivo(dial["tenant_id"]), call_uuid, run)
+def _ended(db: Connection, conv: Row, hangup: dict, a: Row, result: str | None = None) -> None:
+    """The call is over: a call closes its conversation; one joined to a text conversation only tells call.ended, from
+    the number the call was dialed from."""
+    if conv.channel == "call":
+        flow.finish_call(db, conv, hangup, a.agent_id)
+    else:
+        call = (conv.routing.get("lead_from", conv.ours), conv.routing.get("lead_to", conv.customer))
+        conversations.call_ended(db, conv, hangup, a.agent_id, result, call)
+
+
+def status(tenant: Row, form: dict, c: UUID, aid: UUID | None = None) -> Response:
+    """A leg of an outbound call changed. The agent's leg ending before the lead answers cancels the call; once both
+    are on, the room takes the agent's end. The lead's leg is bound when first seen. The lead answering, or a hangup
+    that says it answered, makes the call live; its end tells call.ended, or fails a call it never answered."""
+    call_uuid, event = form.get("CallUUID", ""), form.get("EventName", "Hangup")
+    with tx() as db:
+        if (conv := mpc.find_conv(db, tenant, c)) is None or (a := _agent(db, conv, aid)) is None:
+            return Response()
+        if a.state == "offered" or call_uuid == a.call_uuid:
+            if not _up(conv) and a.state in ("offered", "active"):  # not once a move has let the agent go
+                by = "system" if a.state == "offered" else "agent"
+                _failed(db, conv, a, "cancelled", flow.hangup_facts(form, by), call_uuid)
+            elif conv.channel != "call" and a.state == "active" and event == "Hangup":
+                conversations.move(db, a, "end")
+                _hang(db, conv, conv.call_uuid)
+                _ended(db, conv, flow.hangup_facts(form, "agent"), a)
+            return Response()
+        if conv.call_uuid is None and call_uuid:
+            conv = _bind(db, conv, call_uuid)
+        if call_uuid != conv.call_uuid:
+            return Response()
+        if (event == "Answered" or form.get("AnswerTime")) and (live := _live(db, conv, a, event == "Answered")):
+            conv = live
+        if event == "Hangup" and not _up(conv):
+            code = form.get("PlivoHangupCauseCode", "")
+            _failed(db, conv, a, RESULTS.get(code, "failed_carrier"), flow.hangup_facts(form, "customer"), call_uuid)
+        elif event == "Hangup":
+            source, agent_left = form.get("PlivoHangupSource"), a.state != "active"
+            by = "customer" if source == "Callee" else "agent" if source == "API Request" or agent_left else "system"
+            if conv.channel == "call":
+                flow.finish_call(db, conv, flow.hangup_facts(form, by))
+            else:
+                conversations.move(db, a, "end")
+                _ended(db, conv, flow.hangup_facts(form, by), a)
+    return Response()
+
+
+def _consent(tenant: Row, p: dict) -> dict:
+    """The tenant's outbound notice, to the lead once Plivo shows it in the room."""
+    members = plivo.rest(tenant, "GET", f"{mpc.room_of(p)}/Participant/").get("objects", [])
+    if (member := next((x["member_id"] for x in members if x["call_uuid"] == p["call_uuid"]), None)) is None:
+        raise LookupError("the lead is not in the room yet")
+    return mpc.speak_to(tenant, p | {"member_id": member})
+
+
+def _done(p: dict, reply: dict) -> None:
+    """The agent's dial keeps its Make Call's request id, which cancels it while the agent rings; the lead's leg is
+    bound from the reply unless a status bound it first."""
+    with tx() as db:
+        conv = conversations.lock(db, UUID(p["conversation_id"]))
+        if "assignment_id" in p:
+            conversations.edit(db, UUID(p["assignment_id"]), ring=reply["request_uuid"])
+        elif conv.call_uuid is None and p["room"] == conv.room and (calls := reply.get("calls")):
+            _bind(db, conv, calls[0]["call_uuid"])
+        _check_later(db, p)
+
+
+def _lost(p: dict, refused: plivo.Refused | None = None) -> None:
+    """A dial Plivo refused, or any dial once it would have stopped ringing: a lead Plivo shows in the room answered,
+    and a call still waiting on its lead fails, unless this was the agent's dial and the agent answered it. A call
+    whose lead or room changed meanwhile is read from Plivo again."""
+    cid = UUID(p["conversation_id"])
+    while True:
+        with read() as db:
+            seen = db.execute(select(T.conversation).where(T.conversation.c.id == cid)).one()
+        tenant = plivo.account(seen.tenant_id)
+        path = f"{mpc.room_of({'conversation_id': cid, 'room': seen.room})}/Participant/"
+        members = plivo.rest(tenant, "GET", path).get("objects", []) if not _up(seen) and seen.call_uuid else []
+        joined = any(m["call_uuid"] == seen.call_uuid and not m.get("exit_cause") for m in members)
+        with tx() as db:
+            if refused:
+                access.refused(db, refused, p.get("claim"))
+            if ((conv := conversations.lock(db, cid)).call_uuid, conv.room) != (seen.call_uuid, seen.room):
+                continue
+            a = _agent(db, conv, p.get("assignment_id"))
+            if a is None or p.get("room", conv.room) != conv.room:
+                return
+            answered = "assignment_id" in p and a.state != "offered"
+            if not _up(conv) and not answered and not (joined and _live(db, conv, a)):
+                _failed(db, conv, a, "failed_carrier", flow.hangup_facts({}, "system"))
+            return
+
+
+def _unknown(p: dict) -> None:
+    with tx() as db:
+        _check_later(db, p)
+
+
+def _check_later(db: Connection, p: dict) -> None:
+    """The agent's dial and its lead's are checked apart."""
+    jobs.schedule(db, "dial_check", p, delay=p["check"], key=p.get("assignment_id", p["conversation_id"]))
+
+
+jobs.handler("dial_check", lane="plivo")(lambda job: _lost(job.payload))
+flow.DIALED |= {"answer": answer, "status": status, "room": room}
+plivo.OPS["dial"] = plivo.Op(True, lambda t, p: plivo.rest(t, "POST", p["path"], **p["params"]), _done, _lost, _unknown)
+plivo.OPS["consent"] = plivo.Op(False, _consent)
+plivo.OPS["cancel"] = plivo.Op(False, lambda t, p: plivo.rest(t, "DELETE", f"Request/{p['request_uuid']}/"))

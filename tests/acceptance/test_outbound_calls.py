@@ -1,8 +1,15 @@
 """Click-to-call: one Make Call path to the agent, the lead added at answer; dialing is a server right."""
 
+import json
+import math
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+
+import httpx
 
 from tests.acceptance.conftest import (
+    app_call,
     connect,
     dial,
     error,
@@ -12,9 +19,12 @@ from tests.acceptance.conftest import (
     lead,
     ok,
     registered_number,
+    replayed,
     set_status,
     settings,
+    team,
     types,
+    with_query,
 )
 
 C = "/api/v1/calls"
@@ -38,6 +48,53 @@ def test_click_to_call_rings_the_agent_then_the_lead(world, tenant):
     assert customer.mpc == leg.mpc and customer.to == number
     mine = [e for e in stream.events if e.get("conversation_id") == cid]
     assert in_order(types(mine), "conversation.started", "call.started", "call.answered")
+    named = {e["type"]: e["agent_id"] for e in mine}
+    assert [named[t] for t in ("conversation.started", "call.started", "call.answered")] == [agent.id] * 3
+
+
+def test_only_the_dialing_agent_reads_its_dial_before_its_leg_answers(world, tenant):
+    floor = team(tenant, "Floor")
+    settings(tenant, permissions={"agent": {"view": "team"}})
+    agent = tenant.agent(teams=[floor]).login()
+    mate = tenant.agent("Mate", teams=[floor]).login(available=False)
+    sup = tenant.agent("Sup", role="supervisor", teams=[floor]).login(available=False)
+    agent.phone.on_ring("ignore")
+    cid = ok(tenant.api.post(C, json=body(tenant, agent, lead(world)[0])))["conversation_id"]
+    agent.phone.wait_ring()
+    url = f"/api/v1/conversations/{cid}"
+    assert ok(agent.api().get(url))["id"] == cid
+    for reader in (mate.api(), sup.api(), world.new_tenant("Other").api):
+        error(reader.get(url), 404, "conversation_not_found")
+    error(agent.api().patch(url, json={"attributes": {"k": "v"}}), 404, "conversation_not_found")
+
+
+def test_a_dial_plivo_refuses_answers_with_plivos_status_and_reason(world, tenant):
+    number, _ = lead(world)
+    agent = tenant.agent().login()
+    world.plivo.fault(
+        "reject", lambda r: r.method == "POST" and r.path.endswith("/Call/"), account=tenant.auth_id, status=402
+    )
+    err = error(tenant.api.post(C, json=body(tenant, agent, number)), 422, "plivo_refused")
+    assert err["details"]["status"] == 402 and err["details"]["errors"] == {"error": "rejected by the test"}
+
+
+def test_talk_never_runs_past_the_calls_own_duration_when_its_hangup_reaches_hs_late(world, tenant):
+    number, phone = lead(world)
+    stream = tenant.stream(after=0)
+    _, cid = dial(tenant, to=number)
+    stream.wait_for("call.answered", conversation_id=cid)
+    customer = phone.legs[0]
+
+    def hangup(r) -> bool:
+        return "/hangup" in r.path and r.params.get("CallUUID") == customer.call_uuid
+
+    late = world.plivo.fault("delay", hangup, account=tenant.auth_id, times=math.inf)
+    customer.hangup()
+    since = time.monotonic()
+    world.wait(lambda: time.monotonic() > since + 2.2, timeout=4, what="the hangup held two seconds")
+    late.release()
+    ended = stream.wait_for("call.ended", conversation_id=cid)["data"]
+    assert 0 <= ended["talk_sec"] <= ended["duration_sec"]
 
 
 def test_the_lead_hanging_up_ends_the_call_and_starts_wrap_up(world, tenant):
@@ -49,6 +106,15 @@ def test_the_lead_hanging_up_ends_the_call_and_starts_wrap_up(world, tenant):
     ended = stream.wait_for("call.ended", conversation_id=cid)
     assert ended["data"]["ended_by"] == "customer" and ended["direction"] == "outbound"
     assert stream.wait_for("conversation.wrap_up_started", conversation_id=cid)["agent_id"] == agent.id
+    assert [e["agent_id"] for e in replayed(tenant, "call.ended", conversation_id=cid)] == [agent.id]
+
+
+def test_the_dialing_agent_is_told_its_call_failed_and_ended(world, tenant):
+    agent = tenant.agent().login()
+    desk = tenant.stream(token=agent.stream_token, after=0)
+    _, cid = dial(tenant, agent, to=lead(world, "busy")[0])
+    assert desk.wait_for("call.failed", conversation_id=cid)["data"]["result"] == "busy"
+    desk.wait_for("call.ended", conversation_id=cid)
 
 
 def test_a_bad_from_or_to_is_422(world, tenant):
@@ -95,7 +161,7 @@ def test_with_direct_dial_an_agent_token_dials_only_for_itself(world, tenant):
 
 
 def test_sdk_and_sip_device_dial_outs_are_refused_while_direct_dial_is_off(world, tenant):
-    browser, desk_phone = tenant.agent("Browser").login(), tenant.agent("Desk phone")
+    browser, desk_phone = tenant.agent("Browser").login(), tenant.agent("Desk")
     ok(tenant.api.post(f"/api/v1/agents/{desk_phone.id}/sip-credentials"))
     ok(set_status(tenant, desk_phone, "Available"))
     number, phone = lead(world)
@@ -153,7 +219,7 @@ def test_a_plivo_outage_on_cancelling_a_ringing_dial_is_a_503_and_a_retry_cancel
     stream = tenant.stream(after=0)
     _, cid = dial(tenant, agent)
     leg = agent.phone.wait_ring()
-    world.plivo.reject_next("/Request/", 503)
+    world.plivo.reject_next("/Request/", 503, account=tenant.auth_id)
     err = error(tenant.api.post(f"{C}/{cid}/hangup"), 503, "dependency_unavailable")
     assert "503" not in err["message"] and leg.state == "ringing"
     ok(tenant.api.post(f"{C}/{cid}/hangup"))
@@ -163,7 +229,7 @@ def test_a_plivo_outage_on_cancelling_a_ringing_dial_is_a_503_and_a_retry_cancel
 
 def test_a_carrier_rate_limit_is_429_with_retry_after(world, tenant):
     agent = tenant.agent().login()
-    world.plivo.reject_next("/Call/", 429)
+    world.plivo.reject_next("/Call/", 429, account=tenant.auth_id)
     r = tenant.api.post(C, json=body(tenant, agent, lead(world)[0]))
     error(r, 429, "carrier_rate_limited")
     assert int(r.headers["Retry-After"]) >= 0
@@ -179,3 +245,37 @@ def test_post_calls_with_an_idempotency_key_dials_once(world, tenant):
     agent.phone.wait_ring()
     fence(tenant)
     assert len(agent.phone.legs) == 1
+
+
+def test_a_dialers_parallel_calls_bring_only_the_answered_lead_to_the_agent(world, tenant):
+    agent = tenant.agent().login()
+    q = tenant.queue(name="Dialer", agents=[agent.id])
+    stream = tenant.stream(after=0)
+    phones = {}
+    for outcome in ("busy", "no_answer", "answer"):
+        number, phones[outcome] = lead(world, outcome)
+        app_call(tenant, number, with_query(q["enqueue_url"], agents=agent.id, context=json.dumps({"lead": outcome})))
+    offer = stream.wait_for("offer.created", agent_id=agent.id)
+    assert offer["context"] == {"lead": "answer"}
+    stream.wait_for("offer.accepted", conversation_id=offer["conversation_id"])
+    for outcome in ("busy", "no_answer"):
+        phones[outcome].wait_ring().wait_state("completed")
+    world.wait(world.plivo.idle)
+    fence(tenant)
+    assert [e["conversation_id"] for e in tenant.events(type="conversation.started")] == [offer["conversation_id"]]
+    assert len(agent.phone.legs) == 1
+
+
+def test_a_dial_whose_replica_died_before_its_commit_frees_the_agent_at_the_next_sweep(world, tenant):
+    agent, replica = tenant.agent().login(), world.replica()
+    number, _ = lead(world)
+    with world.passes_held():
+        with world.stall("assignment") as waiting, ThreadPoolExecutor(1) as pool:
+            dialing = pool.submit(replica.client(tenant.key).post, C, json=body(tenant, agent, number))
+            world.wait(waiting, what="the dial to wait on its stint's insert, past its slot take")
+            replica.kill()
+        assert isinstance(dialing.exception(), httpx.TransportError)
+        error(tenant.api.post(C, json=body(tenant, agent, number)), 409, "agent_on_call")
+    world.run_jobs("sweep")
+    assert tenant.api.post(C, json=body(tenant, agent, number)).status_code == 201
+    agent.phone.wait_ring()

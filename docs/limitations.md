@@ -1,25 +1,29 @@
 # What it does not do
 
+These are out of scope. Where a part is yours to build, the API, the event stream and webhooks are the way in.
+
+- A production UI, a dialer, agent scripts or CRM sync. [The reference UI](ui.md) takes calls, texts, tasks and callbacks on its desk, signs people in with email and password, and covers basic setup. A production agent desk, any power or campaign dialer, and writes to your CRM are yours to build.
 - Emergency calling (911/E911). Plivo does not offer it, so a softphone on this stack cannot be your only line.
 - Answering-machine detection. An outbound call connects the agent to whatever answers, a person or a voicemail.
+- Parallel dialing. An agent has one call slot: a second `POST /calls` while the agent is on a call answers 409 `agent_on_call`. A queue can ring several agents for one contact (`agents_at_once`), but one agent never dials several numbers at once; a dialer that does so is yours to build.
+- Agents on a plain phone number. An agent takes calls on the Plivo Browser SDK or a SIP endpoint.
+- A chat widget or socket, an email provider, or a media store. Your gateway opens a chat or email conversation at `POST /api/v1/queues/{id}/enqueue`, sends its later customer messages to `POST /api/v1/messages`, and agent replies on those channels go out as `message.sent` events for your gateway to deliver.
+- Managing WhatsApp templates. Create, edit and delete them at Plivo; HS lists them and checks a message against them.
+- Bots or AI. The service never calls a bot and stores no bot transcript. A bot hands a call or a contact over with `POST /queues/{id}/enqueue` and its `context`.
+- Exporting recordings in bulk. List them with `GET /recordings` and fetch each signed `audio_url`.
+- Long-lived file links in the content export. A Plivo-hosted file's link is the signed media URL the message API returns, valid for 5 minutes; read the message again for a fresh one.
+- Transfers recorded before HS kept a record of each one. The content export reads such a transfer from the stints it started: a transfer to a queue, a menu, voicemail or a URL, or one no one took, has no row, and a transfer to a team reads as one to the agent who took it.
+- Number buying, porting, bulk import, reputation and do-not-call scrubbing. Do these at Plivo or in your own systems.
+- Moving data in from another contact-center product.
 - Per-tenant spend, concurrency or call-rate caps. Plivo limits apply to the whole Plivo account.
+- Tested loads at the top of the API's bounds. A queue's capacity up to 10,000, retries up to 10 and a wait up to 86,400 s are what the API accepts, not loads the test suite runs, and Plivo may end a call before a long wait does.
 - Rate limiting of the API. Put a rate limiter at your ingress.
 - Keeping a call alive through a browser refresh.
-- Offering a waiting caller again, within five minutes, to an agent who already missed, declined or could not be reached on that call. Once every agent the queue can offer has been tried, the caller waits.
-- Fitting a queue's wait to its offers. `wait_timeout_sec` defaults to 20 seconds and an offer rings for `ring_timeout_sec`, 30 seconds by default, so with both defaults the first offer is cut off and no retry runs. Set the wait above `ring_timeout_sec` × (1 + `retries`).
-- Taking the caller off hold after a transfer that ends without a hand-over. The caller stays held until the agent resumes them, including after a warm transfer to a busy number that emits no `call.transferred`. [Call control errors](api.md#call-control-errors) lists the cases.
-- Moving an outbound call to a queue or to voicemail. The transfer answers 409 `transfer_failed`; transfer the lead to an agent, a team or a number instead.
-- Ending a transfer that is cancelled after its target's ring timeout. The cancel answers 204 but hangs up nobody, so a target who answered stays on the call until they hang up. A number target can be removed with `DELETE /calls/{id}/participants/{number}`, the number without its `+`.
-- Stopping a ringing transfer when the agent hangs up an outbound call. The target can keep ringing until its ring timeout. Cancel the transfer before the agent hangs up.
-- Running one transfer at a time after a lost callback or a restart. A transfer left in progress gives way to a new request after the ring timeout, but not while an added participant is on the call. Two requests that find it at the same moment can both dial.
-- Pausing or resuming a recording after someone left the call. HS includes participants who already left, and stops at the first participant that refuses. After a supervisor or a transfer target leaves, the request can answer 409 `recording_control_failed` with some tracks changed and others not.
-- Waiting more than about 155 seconds for a transcript. If Plivo has not published a track's transcript that long after its transcription callback, HS stops asking. The recording's transcript then reads `complete: false` without that track's text, and `transcript.ready` is never sent.
-- Telling who ended every answered call. When Plivo reports the end of the call's room before the exit of the party who hung up, `call.ended` reads `ended_by: "system"` though the caller or the agent ended the call.
-- Telling a caller who left from a missed offer in one narrow window. If an agent's ring fails after the caller pressed a key to leave the queue or the queue's wait ran out, but before HS has recorded that exit, the offer reads `offer.missed` instead of `offer.withdrawn` with reason `caller_left`. That miss adds no strike toward the agent's Break.
-- Rejoining as a supervisor right after leaving. A supervisor who joins a call again before HS has processed their previous leave can be removed as if a second supervisor were already on the call. Wait for `supervisor.left` before joining again.
+- Call controls on a call placed for a callback or a task. Hold, transfer, recording and hangup through the API answer 409 `call_not_live` for such a call; the reference desk ends it through the softphone.
+- SMS and WhatsApp on live Plivo. The text path is tested against a simulated Plivo, not yet with live messages.
+- Calls in the seconds after a Redis loss. Until the sweep rebuilds a tenant's hot state, up to about 15 seconds, a call that arrives answers 503 and Plivo ends it unless the number has a fallback answer URL.
+- Sign-in limits per client behind a proxy you have not named. The limit of failed sign-ins per client address counts the address the service sees. Behind a proxy or load balancer that is the proxy's, so every client shares one limit until you set `FORWARDED_ALLOW_IPS` to the proxy's address, as [API](api.md#auth) describes.
+- Calls across a session renewal on real telephony. A call still in progress when the desk renews its session, and the next call that rings after it, are tested only against a simulated softphone, not yet with real telephony.
 - Per-tenant data purge. You can delete a recording; events expire after `EVENT_RETENTION_DAYS`.
 - Transcription in languages other than English.
 - Deleting call detail records, which Plivo keeps.
-- SMS, WhatsApp, chat, email, a UI or a dialer. It is voice only; the UI, dialer and CRM sync are yours to build.
-- Telling every Redis outage from a missing record. Call controls check, but elsewhere a read Redis drops can answer like a miss (for example a 404) instead of a 503. When such a read, or the write that schedules a job, fails partway through a Plivo callback, Plivo's retry can leave that callback's work undone. For example, a caller who hung up while queued can get no `call.ended`, and a caller the queue refused can stay in its `waiting` count.
-- Closing calls whose end HS missed. If HS is down longer than Plivo retries its callbacks, a call that ended in that window is not closed automatically.

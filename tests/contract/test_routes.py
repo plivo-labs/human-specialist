@@ -1,7 +1,7 @@
 from tests.contract.routes import ROUTES, SPEC, norm, served
 from tests.harness import ALL_SCOPES
 
-AUTH = {"op", "agent", "sup", "stream", "sig", "plivo", "none", *(f"key:{s}" for s in ALL_SCOPES)}
+AUTH = {"op", "agent", "sup", "admin", "stream", "sig", "plivo", "none", *(f"key:{s}" for s in ALL_SCOPES)}
 
 
 def test_spec_rows_are_well_formed():

@@ -3,3 +3,5 @@
 .venv
 .env
 docker/.env
+ui/node_modules
+ui/dist

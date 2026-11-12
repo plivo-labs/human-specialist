@@ -105,3 +105,16 @@ def test_extend_is_only_for_the_agents_own_auto_wrap_up(tenant):
     refused(extend(tenant.api, auto.id, 5))
     other = tenant.agent("Other").login(available=False)
     error(extend(other.api(), auto.id, 5), 404)
+
+
+def test_an_agent_who_hangs_up_a_call_it_moved_to_sms_goes_on_there_with_no_wrap_up(world, tenant):
+    live = connect(tenant)
+    sms = {"channel": "sms", "text": "Here is the tracking link"}
+    thread = ok(live.agent.api().post(f"/api/v1/conversations/{live.id}/messages", json=sms))["conversation_id"]
+    live.leg.hangup()
+    assert live.stream.wait_for("call.ended", conversation_id=live.id)["agent_id"] == live.agent.id
+    assert not starts(live)
+    live.stream.wait_for("conversation.closed", conversation_id=live.id)
+    assert ok(tenant.api.get(f"/api/v1/conversations/{thread}"))["state"] == "active"
+    world.plivo.call(live.number)
+    live.agent.phone.wait_ring()

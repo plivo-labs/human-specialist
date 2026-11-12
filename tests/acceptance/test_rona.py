@@ -1,6 +1,11 @@
 """Ring timeout, ring-no-answer strikes and the RONA status move; only available agents are offered."""
 
+import contextlib
+
+import pytest
+
 from tests.acceptance.conftest import connect, fence, finish, hs_header, ok, seen, settings
+from tests.harness import World
 
 
 def ringing_out(tenant, agent, behaviour: str = "timeout") -> str:
@@ -26,6 +31,20 @@ def test_the_ring_timeout_reaches_the_offer_and_a_change_applies_to_the_next_cal
     stream.wait_for("offer.created", agent_id=agent.id, ring_timeout_sec=9)
 
 
+def test_a_ring_timeout_changed_through_the_replica_applies_to_the_next_call_routed_on_the_first():
+    with contextlib.closing(World()) as world:
+        tenant = world.new_tenant()
+        agent = tenant.agent().login()
+        stream = tenant.stream(after=0)
+        number = ringing_out(tenant, agent, "decline")
+        world.plivo.call(number)
+        assert stream.wait_for("offer.created", agent_id=agent.id)["data"]["ring_timeout_sec"] == 30
+        stream.wait_for("offer.rejected", agent_id=agent.id)
+        ok(world.replica().client(tenant.key).patch("/api/v1/settings", json={"ring_timeout_sec": 9}))
+        world.plivo.call(number)
+        stream.wait_for("offer.created", agent_id=agent.id, ring_timeout_sec=9)
+
+
 def test_two_missed_rings_move_the_agent_to_break(tenant):
     settings(tenant, ring_timeout_sec=5, rona={"strikes": 2})
     agent = tenant.agent().login()
@@ -37,6 +56,67 @@ def test_two_missed_rings_move_the_agent_to_break(tenant):
     changed = stream.wait_for("agent.status_changed", agent_id=agent.id, reason="rona")
     assert changed["data"]["to_status"]["name"] == "Break"
     assert status_name(tenant, agent) == "Break"
+
+
+def test_a_ring_plivo_never_confirmed_is_no_strike(tenant):
+    world = tenant.world
+    settings(tenant, ring_timeout_sec=5, rona={"strikes": 2})
+    agents = [tenant.agent("A").login(), tenant.agent("B").login()]
+    stream = tenant.stream(after=0)
+    number, _ = tenant.inbound_line(*agents, agents_at_once=2, retries=0)
+    rings = world.plivo.fault(
+        "reject",
+        lambda r: r.method == "POST" and r.path.rstrip("/").endswith("/Participant"),
+        account=tenant.auth_id,
+        times=2,
+        status=503,
+    )
+    for caller in ("+14155550371", "+14155550372"):
+        world.plivo.call(number, from_=caller)
+        cid = stream.wait_for("conversation.queued", **{"from": caller})["conversation_id"]
+        world.wait(lambda cid=cid: len(seen(stream, "offer.created", conversation_id=cid)) == 2, what="two offers")
+        world.advance(6)
+        world.wait(lambda cid=cid: len(seen(stream, "offer.missed", conversation_id=cid)) == 2, what="two misses")
+        missed = {(e["data"]["reason"], e["data"]["strike"]) for e in seen(stream, "offer.missed", conversation_id=cid)}
+        assert missed == {("ring_unconfirmed", 0)}
+    assert len(rings.hits) == 2 and [status_name(tenant, a) for a in agents] == ["Available", "Available"]
+
+
+@pytest.mark.parametrize("rung_by", ["queue", "warm_transfer"])
+def test_an_agent_whose_ring_hs_timed_out_is_offered_the_next_call_once_that_leg_ends(tenant, rung_by):
+    world = tenant.world
+    settings(tenant, ring_timeout_sec=30)  # the simulator rings 3 s
+    agent = tenant.agent().login()
+    agent.phone.on_ring("ignore")
+    stream = tenant.stream(after=0)
+    if rung_by == "queue":
+        world.plivo.call(tenant.inbound_line(agent, retries=0)[0])
+    else:
+        live = connect(tenant)
+        body = {"mode": "warm", "target": {"type": "agent", "agent_id": agent.id}}
+        ok(live.agent.api().post(f"/api/v1/calls/{live.id}/transfers", json=body))
+    leg = agent.phone.wait_ring()
+    world.run_jobs("offer_timeout")
+    stream.wait_for("offer.missed", agent_id=agent.id, reason="timeout")
+    world.run_jobs("sweep")
+    world.plivo.call(tenant.inbound_line(agent)[0], from_="+14155550381")
+    agent.phone.wait_ring(timeout=10)
+    assert leg.state == "completed"
+
+
+def test_a_missed_leg_whose_hangup_never_reaches_hs_frees_its_agent_a_minute_on(tenant):
+    world = tenant.world
+    settings(tenant, ring_timeout_sec=30)
+    agent = tenant.agent().login()
+    agent.phone.on_ring("ignore")
+    lost = world.plivo.fault("drop", lambda r: r.params.get("EventName") == "Hangup", account=tenant.auth_id)
+    world.plivo.call(tenant.inbound_line(agent, retries=0)[0])
+    agent.phone.wait_ring()
+    world.run_jobs("offer_timeout")
+    world.wait(lambda: lost.hits, timeout=10, what="the leg's hangup lost")
+    world.run_jobs("missed_leg")
+    world.plivo.call(tenant.inbound_line(agent)[0], from_="+14155550382")
+    agent.phone.wait_ring()
 
 
 def test_the_rona_target_status_is_configurable(tenant):
@@ -83,7 +163,7 @@ def test_a_losing_simultaneous_invite_is_not_a_strike(tenant):
     settings(tenant, rona={"strikes": 1})
     winner, loser = tenant.agent("Winner").login(), tenant.agent("Loser").login()
     loser.phone.on_ring("ignore")
-    live = connect(tenant, winner, also=[loser], strategy="Simultaneous")
+    live = connect(tenant, winner, also=[loser], strategy="simultaneous")
     live.stream.wait_for("offer.withdrawn", agent_id=loser.id, reason="taken")
     loser.phone.legs[0].wait_state("completed")
     fence(tenant)

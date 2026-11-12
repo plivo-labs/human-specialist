@@ -2,6 +2,7 @@
 
 import hashlib
 import hmac
+import math
 import random
 import re
 import time
@@ -223,6 +224,19 @@ def seen(stream, type_: str, **match) -> list[dict]:
     ]
 
 
+def replayed(tenant, type_: str, **match) -> list[dict]:
+    """Events of `type_` matching `match` from GET /events, read after a fence and again after a second one that
+    must find nothing new: complete, which the stream is not, and settled."""
+
+    def read() -> list[dict]:
+        fence(tenant)
+        return [e for e in tenant.events(type=type_) if all(e.get(k, e["data"].get(k)) == v for k, v in match.items())]
+
+    first = read()
+    assert [e["id"] for e in read()] == [e["id"] for e in first], f"{type_} {match} still arriving"
+    return first
+
+
 def types(events: list[dict]) -> list[str]:
     return [e["type"] for e in events]
 
@@ -331,18 +345,6 @@ def run_jobs_until(world, find, what: str = "", timeout: float = 10.0):
     return world.wait(lambda: (world.run_jobs(), find())[1], timeout=timeout, what=what)
 
 
-def hang_up_with_the_room_alive(world, tenant, live) -> None:
-    """The agent hangs up and their leave asks Plivo to end the room, but HS has not yet heard the room end."""
-    room = live.caller.mpc
-    world.plivo.fault("delay", lambda r: r.params.get("EventName") == "MPCEnd", account=tenant.auth_id)
-    ok(live.agent.api().post(f"/api/v1/calls/{live.id}/hangup"))
-    stop = f"/name_{room}/"
-    world.wait(
-        lambda: any(r.method == "DELETE" and r.path.endswith(stop) for r in world.plivo.requests),
-        what="the agent's leave to ask Plivo to end the room",
-    )
-
-
 def fence(tenant) -> None:
     """Emit an event and wait until it is replayable. Events are stamped in commit order, so after this
     every event committed earlier is visible too, and "no such event" checks are deterministic."""
@@ -358,3 +360,15 @@ def fresh_second(world) -> None:
     """Wait for a new wall-clock second. Plivo stamps a leg's HangupTime to the second, so two legs that end
     soon after this end inside the same one."""
     world.wait(lambda: time.time() % 1 < 0.05, what="a new second")
+
+
+def hang_up_with_the_room_alive(world, tenant, live) -> None:
+    """The agent hangs up and HS's hangup has reached Plivo, but no status callback about the call's end has reached
+    HS yet: they are held until the test ends."""
+    world.plivo.fault("delay", lambda r: True, account=tenant.auth_id, times=math.inf)
+    ok(live.agent.api().post(f"/api/v1/calls/{live.id}/hangup"))
+    ended = (f"/name_{live.caller.mpc}/", live.caller.call_uuid, live.leg.call_uuid)
+    world.wait(
+        lambda: any(r.method == "DELETE" and any(e in r.path for e in ended) for r in world.plivo.requests),
+        what="the agent's hangup to reach Plivo",
+    )

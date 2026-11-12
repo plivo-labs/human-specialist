@@ -1,181 +1,115 @@
-import time
-import uuid
+"""The service: every router once, the lifespan, `/status` and the plugin loader."""
+
+import logging
+import re
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from importlib.metadata import entry_points
 
 import prometheus_client
-from fastapi import Depends, FastAPI, Request, Response
+from fastapi import APIRouter, Depends, FastAPI, Security
+from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
+from fastapi.security import HTTPBearer
+from sqlalchemy.exc import SQLAlchemyError
 
-# Mapped-model registration: every ORM module must import before the first configure_mappers().
-import hs.admin.account
-import hs.admin.dispositions
-import hs.conversations.search_store
-import hs.conversations.store
-import hs.setup.number
-import hs.voice.call_store  # noqa: F401
-from hs import api, events, jobs
-from hs.errors import status_of
-from hs.infra import status
-from hs.infra.context import context_request_id
-from hs.infra.counters import record_request_outcome
-from hs.infra.log import logger
-from hs.infra.metrics import http_request_response_metric
-from hs.infra.settings import settings
+from hs import access, agents, config, conversations, core, events, jobs, plivo, reports, routing, search, tasks, text
+from hs.export import router as export
+from hs.text import plivo as text_plivo
+from hs.text import templates
+from hs.views import router as views
+from hs.voice import calls, flow, media, mpc, outbound
+
+log = logging.getLogger(__name__)
+VOICE = (flow, calls, outbound, media)
+API = (access, config, agents, conversations, routing, *VOICE, text, templates, tasks, search, reports, events)
+VOICE_CALLBACKS = (flow, mpc, media)
+# Declares the scheme in OpenAPI only; access.require checks the credential.
+BEARER = HTTPBearer(
+    auto_error=False, description="A tenant API key, the operator key, or an agent, supervisor or stream token."
+)
 
 
-def _shutdown_cleanup():
-    try:
-        from hs.infra.redis import Cache
+@dataclass(frozen=True)
+class Host:
+    """What a plugin's `setup(hs)` receives: the three hooks."""
 
-        Cache.get_instance().close_redis()
-    except Exception:
-        logger.warning("_shutdown_cleanup:: failed to close redis", exc_info=1)
-    try:
-        from hs.infra.db import core_engine
+    plugin: str
 
-        core_engine.dispose()
-    except Exception:
-        logger.warning("_shutdown_cleanup:: failed to dispose core_engine", exc_info=1)
+    @property
+    def app(self) -> FastAPI:
+        return app
+
+    def on_event(self, fn):
+        events.HOOKS[f"{self.plugin}:{fn.__module__}.{fn.__qualname__}"] = fn
+        return fn
+
+    def add_resolver(self, fn):
+        access.RESOLVERS.append(fn)
+        return fn
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from hs.admin.heartbeat_sweeper import start_heartbeat_sweeper
-
-    start_heartbeat_sweeper()
-    import hs.conversations.timers  # noqa: F401  registers the job kinds the runner claims
-
-    metrics_server = prometheus_client.start_http_server(settings.metrics_port)[0] if settings.metrics_port else None
+    core.init()
+    core.check_versions()
+    core.check_eviction()
+    for ep in entry_points(group="hs.plugins"):  # setup(hs) of each plugin; one that raises stops startup
+        try:
+            ep.load()(Host(ep.name))
+        except Exception:
+            log.exception("plugin %s failed to set up", ep.name)
+            raise
+    port = core.settings.metrics_port
+    metrics = prometheus_client.start_http_server(port)[0] if port else None
     stops = [jobs.start(), events.start()]
     yield
     for stop in stops:
         stop()
-    if metrics_server:
-        metrics_server.shutdown()
-        metrics_server.server_close()
-    _shutdown_cleanup()
+    if metrics:
+        metrics.shutdown()
+        metrics.server_close()
+    core.engine.dispose()
 
 
-async def _scoped_db_session_guard():
-    from hs.infra.context import context_db_session, fallback_session_active, remove_db_session, set_db_session_rollback
-
-    failed = False
-    try:
-        yield
-    except Exception:
-        failed = True
-        raise
-    finally:
-        # Tear down only an existing fallback session on this loop thread; worker sessions have their own guard.
-        if context_db_session.get() is None and fallback_session_active():
-            if failed:
-                set_db_session_rollback()
-            remove_db_session()
+def operation_id(route: APIRoute) -> str:
+    """Method and path without /api/v1, e.g. post_conversations_conversation_id_notes: unique and readable."""
+    return re.sub(r"\W+", "_", f"{min(route.methods)} {route.path_format.removeprefix(core.PUBLIC)}").strip("_").lower()
 
 
+core.setup_logging()
 app = FastAPI(
     title="human-specialist",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
     docs_url=None,
     redoc_url=None,
-    dependencies=[Depends(_scoped_db_session_guard)],
-    generate_unique_id_function=api.operation_id,
+    generate_unique_id_function=operation_id,
 )
+# Added first, so it runs inside the request id and CORS middleware that install adds.
+app.middleware("http")(access.idempotency)
+core.install(app)
+api = APIRouter(
+    prefix=core.PUBLIC, responses={"default": {"model": core.ErrorEnvelope}}, dependencies=[Security(BEARER)]
+)
+for module in API:
+    api.include_router(module.router)
+api.include_router(export)
+api.include_router(views)
+app.include_router(api)
+for module in VOICE_CALLBACKS:
+    app.include_router(module.callbacks, prefix="/plivo/{tenant_id}", dependencies=[Depends(plivo.voice_signed)])
+app.include_router(text_plivo.callbacks, prefix="/plivo/{tenant_id}")
+app.webhooks.include_router(events.webhook_docs)
 
 
-def _patch_background_tasks_db_guard():
-    from starlette.background import BackgroundTasks as _BT
-
-    if getattr(_BT, "_hs_db_guarded", False):
-        return
-    from starlette._utils import is_async_callable
-
-    from hs.infra.context import bg_db_guard
-
-    _orig_add_task = _BT.add_task
-
-    def add_task(self, func, *args, **kwargs):
-        if not is_async_callable(func):
-            func = bg_db_guard(func)
-        return _orig_add_task(self, func, *args, **kwargs)
-
-    _BT.add_task = add_task
-    _BT._hs_db_guarded = True
-
-
-_patch_background_tasks_db_guard()
-
-
-def _patch_def_endpoint_db_guard():
-    # Run fallback session teardown on the same worker thread as the sync endpoint.
-    # The guard must remain harmless for response validation when no fallback session exists.
-    import fastapi.routing as _fr
-
-    if getattr(_fr, "_hs_db_guarded", False):
-        return
-    from hs.infra.context import threadpool_db_guard
-
-    _orig_run_in_threadpool = _fr.run_in_threadpool
-
-    async def _guarded_run_in_threadpool(func, *args, **kwargs):
-        return await _orig_run_in_threadpool(threadpool_db_guard(func), *args, **kwargs)
-
-    _fr.run_in_threadpool = _guarded_run_in_threadpool
-    _fr._hs_db_guarded = True
-
-
-_patch_def_endpoint_db_guard()
-
-
-def _observe_request(request: Request, status_code: int, start_time: float) -> None:
-    response_time = time.time() - start_time
-    path = request.url.path
-    for key, val in request.path_params.items():
-        path = path.replace(val, f":{key}", 1)
-    # Bound label cardinality: an UNMATCHED request (404 — no route in scope) would otherwise
-    # mint a new Prometheus series per unique scanner/typo URL, growing the registry (and
-    # /metrics payload) for the life of the process. Matched routes keep the exact same
-    # labels as before.
-    route = request.scope.get("route")
-    if route is None:
-        path = "<unmatched>"
-    http_request_response_metric.observe(
-        {"endpoint": path, "method": request.method, "response_code": status_code}, response_time
-    )
-    record_request_outcome(getattr(route, "path", "<unmatched>"), request.method, status_code)
-
-
-# An uncaught exception unwinds this middleware before the Exception handler (outermost
-# ServerErrorMiddleware) builds its 500/499, so observe with the status it will pick, then re-raise.
-async def add_response_time_metric(request: Request, call_next):
-    start_time = time.time()
+@app.get("/status", tags=["status"])
+def status() -> JSONResponse:
+    """Liveness for load balancers: only booleans, never exception text or hosts."""
     try:
-        response: Response = await call_next(request)
-    except Exception as exc:
-        _observe_request(request, status_of(exc), start_time)
-        raise
-    _observe_request(request, response.status_code, start_time)
-    return response
-
-
-REQUEST_ID_HEADER = "X-Request-Id"
-
-
-# Registered AFTER add_response_time_metric so it wraps OUTERMOST (Starlette runs the
-# last-added @app.middleware("http") first) — it must see/stamp every request before
-# add_response_time_metric (and any handler) runs, and see the response last on the
-# way out so the echoed header survives untouched. Pure-async, O(1): no I/O, no DB.
-@app.middleware("http")
-async def add_request_id(request: Request, call_next):
-    request_id = request.headers.get(REQUEST_ID_HEADER) or uuid.uuid4().hex
-    context_request_id.set(request_id)
-    request.state.request_id = request_id
-    response: Response = await call_next(request)
-    response.headers[REQUEST_ID_HEADER] = request_id
-    return response
-
-
-app.include_router(status.router)
-api.mount(app)
-# Register last so request metrics include every middleware's failures.
-app.middleware("http")(add_response_time_metric)
+        with core.read() as db:
+            db.exec_driver_sql("SELECT 1")
+    except SQLAlchemyError as e:
+        log.warning("status: the database did not answer (%s)", type(e).__name__)
+        return JSONResponse({"db": False}, 503)
+    return JSONResponse({"db": True})

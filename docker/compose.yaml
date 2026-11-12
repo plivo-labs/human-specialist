@@ -1,11 +1,11 @@
-# Self-hosted stack: the service, Postgres and Redis.
+# Self-hosted stack: the service, Postgres and Redis, and with `--profile ui` the optional UI.
 # `cp docker/.env.example docker/.env`, fill it in, then `docker compose -f docker/compose.yaml up`.
 # `migrate` runs `alembic upgrade head` once; the service starts only if it succeeded.
 name: human-specialist
 
 x-hs: &hs
-  image: ghcr.io/plivo-labs/human-specialist:0.1.0
-  # Builds from this checkout when the image cannot be pulled.
+  image: ${COMPOSE_PROJECT_NAME:-human-specialist}:local
+  # `up --build` builds this checkout and tags it with this project's name; compose never pulls it.
   build:
     context: ..
     dockerfile: docker/Dockerfile
@@ -26,7 +26,20 @@ services:
       # - "9100:9100"
     depends_on:
       migrate: { condition: service_completed_successfully }
-      redis: { condition: service_healthy }
+      redis: { condition: service_started }
+    restart: unless-stopped
+
+  ui:
+    image: ${COMPOSE_PROJECT_NAME:-human-specialist}-ui:local
+    build:
+      context: ..
+      dockerfile: docker/ui.Dockerfile
+    profiles: [ui]
+    ports:
+      - "${UI_PORT:-6005}:6005"
+    environment:
+      HS_UPSTREAM: ${HS_UPSTREAM:-hs:6004}
+    depends_on: [hs]
     restart: unless-stopped
 
   postgres:
@@ -44,10 +57,8 @@ services:
 
   redis:
     image: redis:7-alpine
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 2s
-      retries: 30
+    # HS rebuilds what a Redis loss takes, but never a key Redis evicted.
+    command: ["redis-server", "--maxmemory-policy", "noeviction"]
     restart: unless-stopped
 
 volumes:

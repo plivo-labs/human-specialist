@@ -68,7 +68,7 @@ def test_the_timeline_shows_overflow_and_voicemail(world, tenant):
     tenant.route_number(number, queue_action(q))
     stream = tenant.stream(after=0)
     world.plivo.call(number)
-    cid = stream.wait_for("voicemail.received", timeout=10)["conversation_id"]
+    cid = run_jobs_until(world, lambda: seen(stream, "voicemail.received"), "voicemail.received")[0]["conversation_id"]
     run_jobs_until(world, lambda: seen(stream, "conversation.closed", conversation_id=cid), "closed")
     kinds = types(timeline(tenant.api, cid))
     assert in_order(

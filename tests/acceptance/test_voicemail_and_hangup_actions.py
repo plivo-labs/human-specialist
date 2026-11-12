@@ -11,7 +11,7 @@ from tests.acceptance.conftest import (
     menu_line,
     plivo_post,
     queue_action,
-    seen,
+    replayed,
     voicemail_action,
 )
 
@@ -43,9 +43,9 @@ def test_a_caller_who_hangs_up_during_the_greeting_leaves_no_voicemail(world, te
     assert plivo_post(world, tenant.id, "answer", params, tenant.auth_token).status_code == 200
     hangup = {**params, "CallStatus": "completed", "HangupCauseCode": "4000", "HangupCauseName": "Normal Hangup"}
     plivo_post(world, tenant.id, "hangup", {**hangup, "HangupSource": "Caller", "Duration": "1"}, tenant.auth_token)
-    world.run_jobs("close_call")
+    world.run_jobs("delayed_close")
     closed = stream.wait_for("conversation.closed")
-    assert closed["data"]["result"] == "after_hours" and not seen(stream, "voicemail.received")
+    assert closed["data"]["result"] == "after_hours" and not replayed(tenant, "voicemail.received")
 
 
 def test_a_closed_number_with_no_closed_action_hangs_up(world, tenant):
@@ -56,7 +56,7 @@ def test_a_closed_number_with_no_closed_action_hangs_up(world, tenant):
     caller = world.plivo.call(number)
     caller.wait_state("completed")
     assert stream.wait_for("conversation.after_hours")["data"]["number"] == number
-    assert not seen(stream, "conversation.queued")
+    assert not replayed(tenant, "conversation.queued")
 
 
 def test_a_number_that_hangs_up_plays_its_greeting_first(world, tenant):

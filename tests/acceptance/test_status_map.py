@@ -99,7 +99,7 @@ def test_an_unanswered_agent_leg_is_call_failed_cancelled_with_the_mapped_dispos
     _, cid = dial(tenant, agent, to=number)
     assert stream.wait_for("call.failed", conversation_id=cid)["data"]["result"] == "cancelled"
     closed = closed_with(tenant, stream, cid)
-    failed, ended = (stream.wait_for(t, conversation_id=cid) for t in ("call.failed", "call.ended"))
+    failed, ended = (seen(stream, t, conversation_id=cid)[0] for t in ("call.failed", "call.ended"))
     assert int(failed["id"]) < int(ended["id"]) and phone.legs == []
     assert closed["data"]["result"] == "cancelled" and mapped in mapped_ids(closed)
 

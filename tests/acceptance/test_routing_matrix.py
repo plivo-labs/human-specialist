@@ -12,10 +12,10 @@ from tests.acceptance.conftest import (
     menu,
     ok,
     queue_action,
+    replayed,
     seen,
     set_status,
     settings,
-    team,
     unavailable,
     voicemail_action,
 )
@@ -40,14 +40,14 @@ def test_an_agent_who_is_not_available_is_never_offered_and_an_available_one_is(
 
 
 def test_a_call_with_only_unavailable_agents_rings_nobody_and_overflows(world, tenant):
-    agents = [unavailable(tenant, f"Away {n}") for n in "12"]
+    agents = [unavailable(tenant, f"Away-{n}") for n in "12"]
     ok(set_status(tenant, agents[1], "Break"))
     q = tenant.queue(agents=[a.id for a in agents], wait_timeout_sec=1, overflow_action=hangup_action("Nobody here"))
     stream = tenant.stream(after=0)
     caller = world.plivo.call(line(tenant, q))
     assert stream.wait_for("conversation.overflowed", timeout=10)["data"]["reason"] == "wait_timeout"
     world.wait(lambda: "Nobody here" in caller.said, what="the overflow greeting")
-    assert not seen(stream, "offer.created") and [a.phone.legs for a in agents] == [[], []]
+    assert not replayed(tenant, "offer.created") and [a.phone.legs for a in agents] == [[], []]
 
 
 def wait_timeout(tenant):
@@ -117,11 +117,11 @@ def test_a_second_call_waits_while_the_agent_is_on_the_first_and_is_offered_when
     agent = first.agent
     number, _ = tenant.inbound_line(agent)
     stream = first.stream
-    rings, offers = len(agent.phone.legs), len(seen(stream, "offer.created"))
+    rings, offers = len(agent.phone.legs), len(replayed(tenant, "offer.created"))
     world.plivo.call(number)
     world.wait(lambda: len(seen(stream, "conversation.queued")) == 2, what="the second call waiting")
     world.wait(world.plivo.idle, what="the second call settled")
-    assert len(agent.phone.legs) == rings and len(seen(stream, "offer.created")) == offers
+    assert len(agent.phone.legs) == rings and len(replayed(tenant, "offer.created")) == offers
     finish(first)
     assert hs_header(agent.phone.wait_ring(), "HsKind") == "offer"
 
@@ -138,41 +138,7 @@ def test_two_simultaneous_calls_go_to_two_available_agents_once_each(world, tena
     assert all(c.state == "in_progress" for c in callers)
 
 
-def test_a_team_queue_offers_only_members_of_the_team(world, tenant):
-    sales = team(tenant, "Sales")
-    member = tenant.agent("Member", teams=[sales]).login()
-    outsider = tenant.agent("Outsider").login()
-    q = tenant.queue(teams=[sales])
-    world.plivo.call(line(tenant, q))
-    assert hs_header(member.phone.wait_ring(), "HsKind") == "offer"
-    world.wait(world.plivo.idle, what="the offer's dials settled")
-    assert outsider.phone.legs == []
-
-
-def waiting(world, tenant, *queues) -> list[str]:
-    """One caller per queue, in order, each waiting for an Away agent. Returns their conversation ids."""
-    stream = tenant.stream(after=0)
-    ids = []
-    for q in queues:
-        world.plivo.call(line(tenant, q))
-        ids.append(stream.wait_for("conversation.queued", queue_id=q["id"])["conversation_id"])
-        world.wait(world.plivo.idle, what="the call settled in the queue")
-    return ids
-
-
-def test_a_lower_priority_number_is_dequeued_first_whatever_the_arrival_order(world, tenant):
-    agent = unavailable(tenant)
-    slow = tenant.queue(agents=[agent.id], priority=9, wait_timeout_sec=600)
-    urgent = tenant.queue(agents=[agent.id], priority=1, wait_timeout_sec=600)
-    slow_call, urgent_call = waiting(world, tenant, slow, urgent)
-    agent.phone.on_ring("ignore")
-    agent.set_status("Available")
-    assert hs_header(agent.phone.wait_ring(), "HsConversation") == urgent_call != slow_call
-
-
-@pytest.mark.parametrize(
-    ("order", "first"), [("first-in-first-out", 0), ("last-in-first-out", 1)], ids=["fifo", "lifo"]
-)
+@pytest.mark.parametrize(("order", "first"), [("fifo", 0), ("lifo", 1)])
 def test_equal_priority_callers_are_dequeued_by_the_queue_order(world, tenant, order, first):
     agent = unavailable(tenant)
     q = tenant.queue(agents=[agent.id], dequeue_order=order, wait_timeout_sec=600)

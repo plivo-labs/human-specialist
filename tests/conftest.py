@@ -6,6 +6,7 @@ imports hs (the acceptance harness boots HS with its own env). Each run migrates
 """
 
 import os
+import socket
 import subprocess
 import sys
 import uuid
@@ -30,10 +31,13 @@ def _url(database: str) -> str:
 
 
 os.environ["DATABASE_URL"] = _url(WORKER_DB)
-os.environ["REDIS_URL"] = os.environ.get("HS_TEST_REDIS_URL", "redis://127.0.0.1:57379/0")
+with socket.socket() as _s:
+    _s.bind(("127.0.0.1", 0))
+    # The unit suite's redis-server takes this port (tests/unit/conftest.py); a World passes HS its own.
+    os.environ["REDIS_URL"] = f"redis://127.0.0.1:{_s.getsockname()[1]}/0"
 for name, value in {
     "PUBLIC_BASE_URL": "http://testserver",
-    "HS_OPERATOR_KEY": "test-operator-key",
+    "HS_OPERATOR_KEY": "test-operator-key-of-at-least-32-bytes",
     "HS_SECRET_KEY": "test-secret-key-of-at-least-32-bytes",
     "METRICS_PORT": "0",
 }.items():
@@ -89,31 +93,9 @@ def pytest_unconfigure(config):
 def db_engine():
     """The engine on this worker's migrated database (the app's own engine: DATABASE_URL points here)."""
     _create_worker_db()
-    from hs.infra.db import core_engine
+    from hs import core
 
-    yield core_engine
-    core_engine.dispose()
+    core.init()
+    yield core.engine
+    core.engine.dispose()
     _admin(_drop(WORKER_DB))
-
-
-@pytest.fixture()
-def db(db_engine):
-    """A session in a transaction that is rolled back after the test."""
-    from sqlalchemy.orm import Session
-
-    connection = db_engine.connect()
-    connection.begin()
-    session = Session(bind=connection)
-    yield session
-    session.rollback()
-    connection.close()
-
-
-@pytest.fixture()
-def client():
-    """A TestClient that does not run the lifespan."""
-    from fastapi.testclient import TestClient
-
-    from hs.app import app
-
-    return TestClient(app)

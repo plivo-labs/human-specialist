@@ -1,6 +1,6 @@
 """Writes across tenants in the other direction, a slow webhook, and direct dial without a caller id."""
 
-from tests.acceptance.conftest import error, fence, lead, ok, run_jobs_until, settings, skill, team, webhook
+from tests.acceptance.conftest import error, fence, lead, ok, settings, skill, team, webhook
 from tests.acceptance.test_events_and_webhooks import bump, delivered
 
 A = "/api/v1"
@@ -29,16 +29,19 @@ def test_a_second_tenant_cannot_write_with_the_first_tenants_ids(world, tenant):
     assert not bad and ok(tenant.api.get(f"{A}/agents/{mine.id}"))["name"] == "Mine"
 
 
-def test_a_webhook_that_answers_too_slowly_is_retried(world, tenant):
+def test_a_webhook_that_answers_too_slowly_rests_30_seconds_then_gets_each_delivery_again(world, tenant):
     sink = world.webhook_sink()
     sink.stall_next()
     hook = webhook(tenant, sink.url)
     [event] = bump(tenant, "Away")
     sink.wait_for("agent.status_changed")
-    retry = run_jobs_until(world, lambda: delivered(sink, event["id"])[1:], "a retry after the timeout", timeout=30)
-    assert len(delivered(sink, event["id"])) == 2
-    assert retry[0].json == event
-    assert ok(tenant.api.get(f"{A}/webhooks/{hook['id']}"))["id"] == hook["id"]
+    world.advance(0)
+    [later] = bump(tenant, "Busy")
+    world.advance(15)
+    assert len(delivered(sink, event["id"])) == 1 and not delivered(sink, later["id"]), "called while it rests"
+    world.travel(90)
+    assert [d.json for d in delivered(sink, event["id"])[1:] + delivered(sink, later["id"])] == [event, later]
+    assert ok(tenant.api.get(f"{A}/webhooks/{hook['id']}"))["enabled"] is True
 
 
 def test_direct_dial_without_a_caller_id_is_refused_for_the_sdk_and_the_agent_token(world, tenant):

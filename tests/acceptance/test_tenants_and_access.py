@@ -1,5 +1,6 @@
 """Tenants, credentials, scopes, isolation, and the conventions every public route shares."""
 
+import contextlib
 import json
 import uuid
 
@@ -7,6 +8,7 @@ from tests.acceptance.conftest import (
     answer_params,
     connect,
     data_frames,
+    disposition,
     error,
     ok,
     plivo_post,
@@ -17,6 +19,8 @@ from tests.acceptance.conftest import (
     status_changes,
     team,
 )
+from tests.acceptance.test_views import grouped
+from tests.harness import World
 
 T = "/api/v1/tenants"
 
@@ -48,15 +52,6 @@ def test_registering_a_registered_subaccount_is_409_tenant_exists(world, tenant)
     body = {"name": "Again", "plivo_auth_id": tenant.auth_id, "plivo_auth_token": tenant.auth_token}
     err = error(world.operator.post(T, json=body), 409, "tenant_exists")
     assert err["details"]["tenant_id"] == tenant.id
-
-
-def test_registration_relays_why_plivo_refused_the_application(world):
-    sub = world.plivo.subaccount("Bad")
-    world.plivo.reject_next("/Application/", 400)
-    body = {"name": "Bad", "plivo_auth_id": sub.auth_id, "plivo_auth_token": sub.auth_token}
-    err = error(world.operator.post(T, json=body), 502, "plivo_error")
-    assert err["details"] == {"status": 400, "errors": {"error": "rejected by the test"}}
-    assert sub.auth_token not in str(err)
 
 
 def test_registration_is_refused_when_plivo_rejects_the_credentials(world):
@@ -96,8 +91,27 @@ def test_delete_revokes_keys_sessions_streams_and_plivo_resources(world, tenant)
     error(tenant.api.get("/api/v1/settings"), 401)
     error(agent.api().get("/api/v1/me"), 401)
     stream.wait_closed()
-    deleted = [r.path for r in world.plivo.requests if r.method == "DELETE"]
-    assert any(f"/Endpoint/{endpoint_id}" in p for p in deleted) and any(f"/Application/{app_id}" in p for p in deleted)
+    made = {("Endpoint", endpoint_id), ("Application", app_id)}
+    world.wait(lambda: not made & world.plivo.resources.keys(), what="the tenant's endpoint and application deleted")
+
+
+def test_a_change_on_a_replica_whose_cache_bump_fails_reaches_the_first_replica_within_the_job_lag():
+    with contextlib.closing(World()) as world:
+        tenant = world.new_tenant()
+        world.redis("ACL", "SETUSER", "reader", "on", "nopass", "~*", "&*", "+@all", "-@write")
+        replica = world.replica(redis_user="reader")
+
+        def ring_timeout() -> int:
+            return ok(tenant.api.get("/api/v1/settings"))["ring_timeout_sec"]
+
+        def hangup() -> int:
+            return plivo_post(world, tenant.id, "hangup", answer_params("+14155550100"), tenant.auth_token).status_code
+
+        assert ring_timeout() == 30 and hangup() == 200
+        ok(replica.client(tenant.key).patch("/api/v1/settings", json={"ring_timeout_sec": 9}))
+        world.wait(lambda: ring_timeout() == 9, timeout=30, what="the first reads the change within the job lag")
+        ok(replica.operator.delete(f"{T}/{tenant.id}"))
+        world.wait(lambda: hangup() == 401, timeout=30, what="the first refuses the deleted tenant's callback")
 
 
 def test_operator_mints_lists_and_revokes_scoped_keys(world, tenant):
@@ -162,7 +176,7 @@ def test_another_tenants_conversation_and_call_ids_are_404(world, tenant):
         ("POST", f"/calls/{live.id}/hold", {"on": True}),
         ("POST", f"/calls/{live.id}/recording", {"action": "pause"}),
         ("POST", f"/calls/{live.id}/participants", {"target": {"type": "number", "number": "+14155550199"}}),
-        ("POST", f"/calls/{live.id}/monitor", {"mode": "listen", "supervisor_id": other.agent().id}),
+        ("POST", f"/calls/{live.id}/monitor", {"mode": "listen", "supervisor_id": other.agent(role="supervisor").id}),
         ("POST", f"/calls/{live.id}/hangup", None),
     ]
     bad = [
@@ -191,6 +205,17 @@ def test_foreign_ids_in_bodies_are_422(world, tenant):
         (m, p, b, r.status_code) for m, p, b in attempts if (r := tenant.api.request(m, p, json=b)).status_code != 422
     ]
     assert not bad
+
+
+def test_another_tenants_ids_in_a_search_or_export_body_are_422(world, tenant):
+    other = world.new_tenant("Other")
+    theirs = {"queue_id": other.queue(name="X")["id"], "team_id": team(other), "agent_id": other.agent().id}
+    theirs["disposition_id"] = disposition(other)["id"]
+    for path in ("search", "export", "export/content"):
+        for field, value in theirs.items():
+            for body in ({field: value}, grouped({"field": field, "op": "is", "value": [value]})):
+                error(tenant.api.post(f"/api/v1/conversations/{path}", json=body), 422, "foreign_id")
+        assert tenant.api.post(f"/api/v1/conversations/{path}", json={"team_id": team(tenant)}).status_code == 200
 
 
 def test_errors_share_one_envelope(tenant):
@@ -290,3 +315,12 @@ def test_only_the_public_surface_is_mounted(world):
     assert status and all(v is True for v in status.values())
     paths = ok(world.anon().get("/openapi.json"))["paths"]
     assert "/api/v1/calls" in paths and not [p for p in paths if p.startswith("/v1/")]
+
+
+def test_registration_relays_why_plivo_refused_the_application(world):
+    sub = world.plivo.subaccount("Bad")
+    world.plivo.reject_next("/Application/", 400, account=sub.auth_id)
+    body = {"name": "Bad", "plivo_auth_id": sub.auth_id, "plivo_auth_token": sub.auth_token}
+    err = error(world.operator.post(T, json=body), 422, "plivo_refused")
+    assert err["details"] == {"status": 400, "errors": {"error": "rejected by the test"}}
+    assert sub.auth_token not in str(err)
