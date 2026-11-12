@@ -9,12 +9,12 @@ requires-python = ">=3.13"
 dependencies = [
     "alembic==1.19.2",
     "cryptography==50.0.2",
-    "fastapi==0.136.1",
+    "fastapi==0.162.2",
     "httpx==0.28.1",
     "prometheus-client==0.26.0",
     "psycopg2-binary==2.9.13",
-    "pydantic==2.13.4",
-    "python-multipart==0.0.32",
+    "pydantic==2.14.3",
+    "python-multipart==0.0.33",
     "redis==8.1.0",
     "SQLAlchemy==1.4.54",
     "starlette==1.10.0",
@@ -35,7 +35,7 @@ dev = [
     "pytest==8.4.2",
     "pytest-xdist==3.8.0",
     # Pinned exactly: ruff's formatting shifts between releases.
-    "ruff==0.16.3",
+    "ruff==0.17.4",
 ]
 
 [tool.commitizen]
