@@ -30,46 +30,46 @@ It is for:
 
 ## What you get
 
-### 📞 Every channel, one queue
+### Every channel, one queue
 
 - Calls, SMS, WhatsApp, email, chat, callbacks and agent tasks share queues, skills, capacity, offers and wrap-up.
 - SMS and WhatsApp go out through Plivo or your own gateway. Chat and email go through your gateway.
 - WhatsApp messages can use templates, reply buttons and lists. Every conversation keeps notes, attributes and a timeline.
 
-### 🧭 Routing is configuration, not a drawn flow
+### Routing is configuration, not a drawn flow
 
 - Queues with four strategies: `availability`, `simultaneous`, `fewest_handled` and `least_handle_time`.
 - Teams, skills with levels, capacity per channel, sticky agents and overflow.
 - Business hours with holidays, keypad menus, a consent notice and voicemail.
 - An offer rings several agents at once, and the first to answer gets the call. An agent who lets calls ring out collects strikes and moves to a status you pick.
 
-### 🎧 Live calls you control with the API
+### Live calls you control with the API
 
 - Hold, warm and cold transfer to an agent, a team, a queue or a number, and up to two extra participants.
 - Recordings you can pause and resume, with English transcripts. The audio stays at Plivo and plays through short-lived signed URLs.
 - Supervisors listen, whisper or barge in.
 - Agents take calls in the browser with the Plivo Browser SDK, or on any SIP softphone.
 
-### ✅ Every conversation ends with an outcome
+### Every conversation ends with an outcome
 
 - Dispositions and sub-dispositions, a wrap-up timer and automatic wrap-up.
 - System dispositions from each contact's result, so an unanswered call still gets an outcome.
 - CSAT scores on the conversation.
 
-### 📊 Watch the floor and the numbers
+### Watch the floor and the numbers
 
 - A live floor of agents, their calls and the callers waiting.
 - Reports on conversations by channel, direction, state, disposition and handle time, and on agent activity.
 - Search over closed conversations in Postgres, or in OpenSearch at volume. Saved views, and CSV exports of what a search finds.
 
-### 🔌 An API, a stream, webhooks and plugins
+### An API, a stream, webhooks and plugins
 
 - An HTTP API under `/api/v1`, described at `/openapi.json`.
 - A server-sent event stream with replay, and signed webhooks with retries.
 - Plugins that receive every event, add routes, or accept your own sign-in.
 - Roles for admins, supervisors and agents. Each role sees the whole tenant, its team's work or its own, as you set it.
 
-### 🏠 Runs on your servers
+### Runs on your servers
 
 - One container image, with Postgres and Redis. OpenSearch is optional.
 - One install serves many tenants. Each tenant is one Plivo account or sub-account, and its credential scopes every request to it.
@@ -80,7 +80,7 @@ It is for:
 
 ```mermaid
 flowchart TD
-    caller(["📱 A caller dials your number"]) -->|Plivo asks the answer URL| hours{"Open now?"}
+    caller(["A caller dials your number"]) -->|Plivo asks the answer URL| hours{"Open now?"}
     hours -->|closed| closed["Voicemail, another queue or hang up"]
     hours -->|open| menu["A menu, or straight to a queue"]
     menu --> queue[("Queue")]
@@ -252,7 +252,7 @@ flowchart LR
     hs -->|event stream and<br/>signed webhooks| yours
     hs <--> stores[("Postgres<br/>and Redis")]
     hs <-->|REST and callbacks| plivo["Plivo: numbers, calls,<br/>SIP, SMS, WhatsApp"]
-    people(["📱 Customers and<br/>agents' phones"]) <--> plivo
+    people(["Customers and<br/>agents' phones"]) <--> plivo
 ```
 
 | To | Use |
@@ -336,7 +336,7 @@ docker compose -f docker/compose.test.yaml up -d   # Postgres and OpenSearch for
 make check                                         # lint, format, unit, contract, migration and acceptance tests
 ```
 
-The tests start their own Redis, so put `redis-server` and `redis-cli` from Redis 7 or later on your `PATH` (`brew install redis`, or `apt-get install redis-server` on Ubuntu 24.04 or later). [CONTRIBUTING.md](CONTRIBUTING.md) has the checks, the code rules and the commit conventions. Report a vulnerability as [SECURITY.md](SECURITY.md) describes, and follow the [code of conduct](CODE_OF_CONDUCT.md).
+The tests start their own Redis, so put `redis-server` and `redis-cli` from Redis 7 or later on your `PATH` (`brew install redis`, or `apt-get install redis-server tzdata-legacy` on Ubuntu 24.04 or later). [CONTRIBUTING.md](CONTRIBUTING.md) has the checks, the code rules and the commit conventions. Report a vulnerability as [SECURITY.md](SECURITY.md) describes, and follow the [code of conduct](CODE_OF_CONDUCT.md).
 
 ## License
 

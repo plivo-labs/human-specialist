@@ -35,7 +35,7 @@ jobs:
           rc=$?
           set -e
           [ "$rc" -eq 1 ] || { echo "internal reference found or git failed (exit $rc)"; exit 1; }
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends redis-server redis-tools
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends redis-server redis-tools tzdata-legacy
       - run: docker compose -f docker/compose.test.yaml up -d --wait
       - run: make check
 

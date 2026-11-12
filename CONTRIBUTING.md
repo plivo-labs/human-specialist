@@ -2,7 +2,7 @@
 
 ## Setup
 
-You need [uv](https://docs.astral.sh/uv/), Docker, and `redis-server` and `redis-cli` from Redis 7 or later on your `PATH` (`brew install redis`, or `apt-get install redis-server` on Ubuntu 24.04 or later): each acceptance test starts its own Redis.
+You need [uv](https://docs.astral.sh/uv/), Docker, and `redis-server` and `redis-cli` from Redis 7 or later on your `PATH` (`brew install redis`, or `apt-get install redis-server tzdata-legacy` on Ubuntu 24.04 or later): each acceptance test starts its own Redis.
 
 ```sh
 uv sync                                            # .venv with Python 3.13 and the dev tools
