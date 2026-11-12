@@ -9,6 +9,7 @@ human-specialist is one container image, `ghcr.io/plivo-labs/human-specialist:<v
 - **A public HTTPS URL that reaches HS.** Plivo calls HS back at `PUBLIC_BASE_URL`, so a load balancer, an ingress or a tunnel must route it to the container's port 6004.
 - **Two secrets.** `HS_OPERATOR_KEY` guards the tenant routes and `HS_SECRET_KEY` encrypts Plivo tokens at rest. Load both from your platform's secret store.
 - **One migration step before each start and each upgrade.** Run `alembic upgrade head` once, with the service's environment, and start the service only after it succeeds.
+- **The legacy time zone names, if you run HS outside the image.** The image installs them. On Debian 13, Ubuntu 24.04 or later, install `tzdata-legacy`, or business hours refuse names that browsers still offer, such as `Asia/Calcutta`.
 
 [Configuration](configuration.md) lists every setting.
 

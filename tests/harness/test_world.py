@@ -332,6 +332,14 @@ def test_a_world_restores_the_environment_it_changed_when_it_ends():
     assert dict(os.environ) == before
 
 
+def test_a_world_ends_a_replica_whose_event_stream_is_still_open():
+    w = World()
+    try:
+        w.replica().new_tenant().stream()
+    finally:
+        w.close()
+
+
 def test_a_worlds_redis_on_a_port_another_server_holds_moves_to_a_fresh_one(monkeypatch):
     holder = _Redis()
     ports = iter([holder.port])

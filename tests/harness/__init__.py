@@ -898,6 +898,7 @@ class EventStream:
         self.status: int | None = None  # HTTP status of the stream response (0: connection failed)
         self._cond, self._closed, self._ended = threading.Condition(), False, threading.Event()
         self._client = httpx.Client(timeout=httpx.Timeout(10, read=None))
+        self._sock: socket.socket | None = None
         params = {} if after is None else {"after": after}
         headers = {} if query else {"Authorization": f"Bearer {token}"}
         if query:
@@ -909,6 +910,7 @@ class EventStream:
     def _read(self, url: str, headers: dict, params: dict) -> None:
         try:
             with self._client.stream("GET", url, params=params, headers=headers) as r:
+                self._sock = r.extensions["network_stream"].get_extra_info("socket")
                 self._set_status(r.status_code)
                 data: list[str] = []
                 for line in r.iter_lines():
@@ -945,6 +947,11 @@ class EventStream:
 
     def close(self) -> None:
         self._closed = True
+        if self._sock:
+            # On Linux, closing a socket another thread is blocked reading neither wakes that read nor sends FIN, so
+            # HS keeps the stream open, and waits on it to stop, until its next ping. shutdown ends both sides.
+            with contextlib.suppress(OSError):
+                self._sock.shutdown(socket.SHUT_RDWR)
         self._client.close()
 
 
