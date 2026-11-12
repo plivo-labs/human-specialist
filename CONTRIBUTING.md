@@ -33,7 +33,8 @@ Each domain in `src/hs/` owns its routes, logic and storage. [docs/architecture.
 ## Checks
 
 ```sh
-make check        # the definition of green: ruff, format, unit, contract, simulator, migration and acceptance tests
+make check        # the definition of green: lint, test and acceptance, in that order
+make lint         # ruff and format
 make test         # unit, contract, simulator and migration tests
 make fuzz         # a seeded random walk over a live service, outside make check (HS_FUZZ_SEED=8,1 walks those seeds)
 make snapshot     # rewrite the OpenAPI snapshot after an API change
@@ -43,6 +44,8 @@ make run          # the service with reload on port 6004
 ```
 
 The Plivo simulator (`tests/harness/sim.py`) stands in for Plivo in the acceptance suite. It signs callbacks with Plivo's V3 algorithm, answers REST calls, and replays the callbacks a real call produces, so a full call runs with no carrier.
+
+`make test` and `make acceptance` run on pytest-xdist workers, one per CPU. `make acceptance` starts at most 4, because each worker runs its own service, Redis, Plivo simulator and database, and their Postgres connections must fit the test stack's limit of 100. Plain `uv run pytest tests/acceptance/test_rona.py` runs one module in a single process. CI runs `make lint test` and `make acceptance` as two jobs side by side.
 
 ## Definition of done
 1. `make check` exits 0.

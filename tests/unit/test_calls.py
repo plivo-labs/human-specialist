@@ -12,7 +12,7 @@ from functools import partial
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import delete, func, insert, select, text, update
+from sqlalchemy import delete, event, func, insert, select, text, update
 
 from hs import access, agents, config, core, hot, jobs, plivo
 from hs import conversations as cv
@@ -20,7 +20,9 @@ from hs.access import Principal
 from hs.config import models as m
 from hs.core import ApiError, T
 from hs.hot import rebuilt
-from hs.voice import calls, flow, media, mpc
+from hs.voice import calls, flow, media, mpc, outbound
+from tests.unit.tenants import Tenant
+from tests.unit.test_config import waiter
 from tests.unit.test_routing import CAP, while_held
 
 NUMBER = "+14155550123"
@@ -1073,3 +1075,55 @@ def test_a_transfer_whose_only_target_goes_offline_while_it_rings_fails(call):
     [failed] = call.events("call.transferred", status="failed")
     assert (failed["transfer_id"], failed["status"], failed["agent_id"]) == (tid, "failed", str(call.agent_id))
     assert failed["target"] == {"type": "agent", "agent_id": str(target)} and call.primaries()[0].id == call.primary.id
+
+
+def test_a_dial_into_a_text_conversation_and_the_accept_of_an_offer_there_both_commit():
+    """The dial pauses right after it share-locks the agent's presence; the accept of the agent's offer on the same
+    text conversation holds that conversation, then resets the agent's misses."""
+    t, P = Tenant(), T.presence
+    a = t.agent()
+    with core.tx() as db:
+        free = t.doc(db, "status", name="Ready", availability=True)
+        db.execute(update(P).where(P.c.agent_id == a).values(status_id=free))
+    with core.tx() as db:
+        conv = cv.lock(db, t.open(channel="sms").id)
+        offer = cv.offer(db, conv, a)
+    paused, release, dialer = Future(), threading.Event(), []
+
+    def pause(conn, cursor, statement, *_) -> None:
+        if (
+            threading.get_ident() in dialer
+            and "hs.presence" in statement
+            and "FOR SHARE" in statement
+            and not paused.done()
+        ):
+            paused.set_result(cursor.connection.get_backend_pid())
+            release.wait(10)
+
+    def dial() -> None:
+        dialer.append(threading.get_ident())
+        body = outbound.DialIn(agent_id=a, to="+15550001", conversation_id=conv.id)
+        with core.tx() as db:
+            outbound._open(db, t.key, body, {"id": str(a)}, "+15550002", "sip:u@phone.plivo.com")
+
+    def accept() -> None:
+        with core.tx() as db:
+            cv.lock(db, conv.id)
+            cv.move(db, offer, "accept")
+
+    event.listen(core.engine, "after_cursor_execute", pause)
+    try:
+        with ThreadPoolExecutor(2) as pool:
+            try:
+                dialing = pool.submit(dial)
+                pid = paused.result(5)
+                accepting = pool.submit(accept)
+                assert waiter(pid), "the accept waits for the paused dial"
+            finally:
+                release.set()
+    finally:
+        event.remove(core.engine, "after_cursor_execute", pause)
+    accepting.result()
+    with pytest.raises(ApiError) as refused:
+        dialing.result()
+    assert refused.value.code == "conversation_not_joinable"

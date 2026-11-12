@@ -1,10 +1,13 @@
 """Self-tests for World against a real HS and Postgres."""
 
 import os
+import socket
 import subprocess
 import sys
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
 import httpx
@@ -13,7 +16,7 @@ import pytest
 
 import tests.harness as harness
 from tests.conftest import REPO
-from tests.harness import SEARCH_URL, World, _Redis, require_search, slow
+from tests.harness import SEARCH_URL, EventStream, World, _Redis, require_search, slow
 
 pytestmark = pytest.mark.xdist_group("harness")
 
@@ -100,6 +103,54 @@ def test_travel_runs_a_job_due_in_300_s_and_expires_a_300_s_key(world):
     world.travel(11)
     assert stream.wait_for("conversation.overflowed")["data"]["reason"] == "wait_timeout"
     assert (caller.wait_state("completed").said[-1], world.redis("EXISTS", "travel")) == ("Nobody here", "0")
+
+
+def test_a_later_tests_travel_never_runs_an_earlier_tests_timer(world):
+    world.begin_test()
+    tenant = world.new_tenant()
+    hangup = {"type": "hangup", "greeting": {"text": "Nobody here"}}
+    number, _ = tenant.inbound_line(tenant.agent(), wait_timeout_sec=300, overflow_action=hangup)
+    stream = tenant.stream(after=0)
+    caller = world.plivo.call(number)
+    stream.wait_for("conversation.queued")
+    world.end_test()
+    world.begin_test()
+    world.travel(301)
+    world.end_test()
+    assert (caller.state, tenant.events(type="conversation.overflowed")) == ("in_progress", [])
+
+
+def test_a_timer_a_transaction_holds_as_its_test_ends_is_parked_once_let_go(world):
+    world.begin_test()
+    tenant = world.new_tenant()
+    number, _ = tenant.inbound_line(tenant.agent(), wait_timeout_sec=300, overflow_action={"type": "hangup"})
+    for _ in range(2):
+        world.plivo.call(number)
+    world.wait(lambda: len(tenant.events(type="conversation.queued")) == 2, what="both callers queued")
+    parked = "SELECT count(*) FROM hs.jobs WHERE id > %s AND locked_until = 'infinity'"
+    other = psycopg2.connect(world._env["DATABASE_URL"])
+    try:
+        cur = other.cursor()
+        cur.execute(parked, (world._jobs_after,))
+        before = cur.fetchone()
+        cur.execute("SELECT max(id) FROM hs.jobs WHERE id > %s AND kind = 'queue_timeout'", (world._jobs_after,))
+        cur.execute("SELECT id FROM hs.jobs WHERE id = %s FOR UPDATE", cur.fetchone())
+        (held,) = cur.fetchone()
+
+        def release_once_a_pass_skipped_it() -> None:
+            try:
+                world.wait(lambda: cur.execute(parked, (world._jobs_after,)) or cur.fetchone() > before, timeout=10)
+            finally:
+                other.commit()
+
+        with ThreadPoolExecutor(1) as pool:
+            release = pool.submit(release_once_a_pass_skipped_it)
+            world.end_test()
+            release.result()
+        cur.execute("SELECT locked_until = 'infinity' FROM hs.jobs WHERE id = %s", (held,))
+        assert cur.fetchone() == (True,)
+    finally:
+        other.close()
 
 
 def test_two_timers_inside_one_jump_run_in_order_each_at_its_own_time(world):
@@ -332,18 +383,38 @@ def test_a_world_restores_the_environment_it_changed_when_it_ends():
     assert dict(os.environ) == before
 
 
-def test_a_world_ends_a_replica_whose_event_stream_is_still_open():
-    w = World()
-    try:
-        w.replica().new_tenant().stream()
-    finally:
-        w.close()
+def test_closing_an_event_stream_ends_its_connection_at_once():
+    server, conns = socket.create_server(("127.0.0.1", 0)), []
+
+    def answer() -> None:
+        conns.append(conn := server.accept()[0])
+        conn.recv(65536)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+
+    threading.Thread(target=answer, daemon=True).start()
+    with server:
+        EventStream(f"http://127.0.0.1:{server.getsockname()[1]}/", "token").close()
+        with conns[0] as conn:
+            conn.settimeout(10 * slow())
+            assert conn.recv(1) == b""
+
+
+def test_each_xdist_worker_draws_its_redis_ports_from_a_slice_of_its_own(monkeypatch):
+    for count in (1, 2, 3, 4, 8):
+        monkeypatch.setenv("PYTEST_XDIST_WORKER_COUNT", str(count))
+        edges = []
+        for worker in range(count):
+            monkeypatch.setenv("PYTEST_XDIST_WORKER", f"gw{worker}")
+            for pick in (min, max):
+                monkeypatch.setattr(harness.secrets, "randbelow", lambda n, pick=pick: pick(0, n - 1))
+                edges.append(harness._redis_port())
+        assert edges[0] >= 20000 and edges[-1] <= 32767 and edges == sorted(set(edges)), (count, edges)
 
 
 def test_a_worlds_redis_on_a_port_another_server_holds_moves_to_a_fresh_one(monkeypatch):
     holder = _Redis()
     ports = iter([holder.port])
-    monkeypatch.setattr(harness, "_free_port", lambda free=harness._free_port: next(ports, None) or free())
+    monkeypatch.setattr(harness, "_redis_port", lambda draw=harness._redis_port: next(ports, None) or draw())
     mine = _Redis()
     try:
         assert mine.port != holder.port

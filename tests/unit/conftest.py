@@ -4,6 +4,7 @@ from urllib.parse import urlsplit
 
 import pytest
 
+import hs.app  # noqa: F401  # every module the service loads, whose job kinds and Plivo ops a file run alone schedules
 from hs import jobs
 from tests.harness import _Redis
 

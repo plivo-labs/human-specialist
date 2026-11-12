@@ -346,7 +346,8 @@ def shown(via: str, conv: Row) -> str:
 def move(db: Connection, a: Row | Offer | UUID, event: str, **cols) -> Row | Offer | None:
     """Apply `event` to the stint or open offer, then its effects; None when its state does not allow it. An accept
     makes the offer a stint of the same id. Any other end leaves its tombstone after COMMIT, and a row too when it
-    names the member of a leg that exited before HS heard it join, so its late join finds it."""
+    names the member of a leg that exited before HS heard it join, so its late join finds it. A dial on a text or
+    task conversation that leaves offered or active ends its call."""
     A = T.assignment
     froms, to, stamp, effect = ASSIGNMENT[event]
     if stamp:
@@ -377,6 +378,8 @@ def move(db: Connection, a: Row | Offer | UUID, event: str, **cols) -> Row | Off
         if froms == ("offered",) and event != "answer":
             jobs.cancel(db, "offer_timeout", str(row.id))
         effect(db, row)
+        if to not in ON and (row.via, row.role) == ("outbound", "secondary"):
+            end_joined(db, row)
     return row
 
 
@@ -723,6 +726,40 @@ def call_ended(db: Connection, conv: Row, hangup: dict, agent_id, result, partie
     emit_event(db, "call.ended", conv.tenant_id, conv.id, data | hangup, agent_id)
 
 
+def hang_dial(db: Connection, conv: Row | None, aid, role: str, call_uuid: str | None) -> None:
+    """Hang up the `role` leg of dial `aid` under that dial's own key, so a leg Plivo reports late never binds to the
+    conversation or to a later dial."""
+    if conv and call_uuid:
+        plivo.command(db, "hangup", f"{aid}:{role}", {"tenant_id": str(conv.tenant_id), "call_uuid": call_uuid})
+
+
+def no_cause(by: str, duration_sec: int | None = None) -> dict:
+    """The facts of a call's end HS caused, with no Plivo hangup to tell its cause."""
+    return {"hangup_cause": None, "hangup_cause_code": None, "duration_sec": duration_sec, "ended_by": by}
+
+
+def end_joined(db: Connection, a: Row, hangup: dict | None = None, result=None) -> None:
+    """The call of dial `a` on a text or task conversation ends, told once while the conversation's `call_on` mark
+    stands. `hangup` defaults to HS's own facts; `result` is set when its customer never answered."""
+    C = T.conversation
+    on = update(C).where(C.c.id == a.conversation_id, C.c.routing.has_key("call_on"))
+    if (conv := db.execute(on.values(routing=C.c.routing - "call_on", **UNHELD).returning(*C.c)).first()) is None:
+        return
+    if a.ring and not a.call_uuid:
+        plivo.command(db, "cancel", str(a.id), {"tenant_id": str(a.tenant_id), "request_uuid": str(a.ring)})
+    for role, leg in (("agent", a.call_uuid), ("customer", conv.call_uuid)):
+        hang_dial(db, conv, a.id, role, leg)
+    if hangup is None:
+        up = conv.routing.get("lead_up") and a.started_at
+        hangup = no_cause("system", int((datetime.now(UTC) - a.started_at).total_seconds()) if up else 0)
+        result = None if up else "cancelled"
+    if result:
+        failed = {"result": result, "hangup_cause_code": hangup["hangup_cause_code"]}
+        emit_event(db, "call.failed", conv.tenant_id, conv.id, failed, a.agent_id)
+    call_ended(db, conv, hangup, a.agent_id, result, (conv.routing["lead_from"], conv.routing["lead_to"]))
+    move_out(db, a, "cancelled" if a.state == "offered" else result)
+
+
 def depart(db: Connection, conv: Row, action: dict, by: str = "system", transfer: dict | None = None) -> Row | None:
     """The customer leaves the room for `action` (a menu, voicemail, a redirect, a number): the room generation
     moves on, so the old room's callbacks are no-ops but its end, its rows come off and the customer is redirected.
@@ -734,8 +771,7 @@ def depart(db: Connection, conv: Row, action: dict, by: str = "system", transfer
     if moved is None:
         return None
     if on:
-        hangup = {"hangup_cause": None, "hangup_cause_code": None, "duration_sec": None, "ended_by": by}
-        call_ended(db, conv, hangup, on.agent_id, conv.result, written=True)
+        call_ended(db, conv, no_cause(by), on.agent_id, conv.result, written=True)
     for a in by_agent([a for a in every if a.state in ON]):
         move_out(db, a, "caller_left")
         if a.state == "active":

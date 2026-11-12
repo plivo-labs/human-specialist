@@ -2947,7 +2947,7 @@
                 "type": "null"
               }
             ],
-            "description": "The agent's live text conversation; the call to `to` joins it.",
+            "description": "The agent's live text, task or callback conversation; the call to `to` joins it.",
             "title": "Conversation Id"
           },
           "from": {
@@ -19234,7 +19234,7 @@
     },
     "/api/v1/calls/{cid}/hangup": {
       "post": {
-        "description": "The agent leaves the call, as when its phone hangs up; a tenant key leaves as the primary. An agent with a\nstint of its own that is not the primary's ends only its own leg. The primary's connected warm consult takes\nthe caller. Otherwise the call is torn down: the primary's leg ends first, so an outage there leaves the call as\nit was, then every other leg, and call.ended reads ended_by agent. A retry, or HS on its own, finishes a teardown\nan outage or a refusal cut short, whoever is on the call by then, and sends again each leg Plivo has not confirmed\ngone. A call that is over, or that the teardown handed back, is 409 until a queue takes it again.",
+        "description": "The agent leaves the call, as when its phone hangs up; a tenant key leaves as the primary. An agent with a\nstint of its own that is not the primary's ends only its own leg. The primary's connected warm consult takes\nthe caller. Otherwise the call is torn down: the primary's leg ends first, so an outage there leaves the call as\nit was, then every other leg, and call.ended reads ended_by agent. A retry, or HS on its own, finishes a teardown\nan outage or a refusal cut short, whoever is on the call by then, and sends again each leg Plivo has not confirmed\ngone. A call that is over, or that the teardown handed back, is 409 until a queue takes it again. A call joined to\na text or task conversation ends as when its agent's phone hangs up, whoever sends it: its agent's leg is hung\nup, and a dial still ringing its agent, or still being placed, is cancelled now.",
         "operationId": "post_calls_cid_hangup",
         "parameters": [
           {
@@ -23247,7 +23247,7 @@
         "summary": "Get Number"
       },
       "put": {
-        "description": "Checks at Plivo that the number is the Plivo account's, points it at the tenant's application unless `repoint` is\nfalse or the tenant has none, stores it. An email address, a sender of the tenant's agent emails, is stored as it\nis.",
+        "description": "Checks at Plivo that the number is the Plivo account's, stores it, then points it at the tenant's application\nunless `repoint` is false or the tenant has none. A write that is refused changes nothing at Plivo; if Plivo\nrefuses the repoint, the number stays stored, and putting it again retries. An email address, a sender of the\ntenant's agent emails, is stored as it is.",
         "operationId": "put_numbers_number",
         "parameters": [
           {

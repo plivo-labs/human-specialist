@@ -3,6 +3,7 @@ and a silent desk is swept Offline while a beating one stays on."""
 
 import hashlib
 import threading
+import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from datetime import timedelta
@@ -10,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import event, func, insert, select, update
+from sqlalchemy import event, func, insert, select, text, update
 
 from hs import access, agents, core, hot, jobs, plivo
 from hs import app as service
@@ -160,6 +161,19 @@ def test_a_session_closed_while_its_sign_in_rereads_the_credential_ends_offline(
     assert desk.presence().status_id == desk.offline
 
 
+def test_the_rebuild_after_a_redis_loss_gives_each_signed_in_desk_40_s_to_beat():
+    desk = Desk()
+    assert [beat(desk.tokens.agent_token) for _ in range(2)] == [204, 204]
+    core.redis.delete(*(k % (desk.tenant, desk.agent) for k in (hot.HB, hot.BEATS)), hot.EPOCH % desk.tenant)
+    with core.tx() as db:
+        jobs.schedule(db, "sweep", {}, key="sweep")
+    began = time.monotonic()
+    jobs.run_now("sweep", "sweep", wait=True)
+    left = core.redis.pttl(hot.HB % (desk.tenant, desk.agent))
+    # The rebuild set it after `began`, so it lost at most the time since then, plus a few ms of rounding.
+    assert 40_000 - (time.monotonic() - began) * 1000 - 5 < left <= 40_000
+
+
 def test_a_beat_between_the_rebuilds_read_and_its_write_leaves_a_break_agent_on_break(monkeypatch):
     desk, beats, pipeline = Desk(), [], core.redis.pipeline
     with core.tx() as db:
@@ -269,6 +283,38 @@ def test_closing_sessions_and_deleting_the_agent_both_take_presence_before_token
         finally:
             release.set()
     assert (closing.result().status_code, deleting.result().status_code) == (204, 204)
+
+
+def test_a_sign_out_into_the_status_being_deleted_and_the_delete_both_commit():
+    """The agent is in the sign-out status. Its delete holds the tenant's presence rows while it waits to repoint the
+    sign-out setting; the sign-out waits for it and then commits, and the agent is on a status that exists."""
+    desk, C, P = Desk(), T.config, T.presence
+    api = sessions_admin(desk)
+    with core.tx() as db:
+        db.execute(update(C).where(C.c.id == desk.online).values(body=C.c.body.concat({"default": True})))
+        floor = desk.doc(db, "status", {"name": "Floor", "availability": True})
+        db.execute(update(P).where(P.c.agent_id == desk.agent).values(status_id=floor))
+        sign_out = T.tenant.c.settings.concat({"sign_out": {"status_id": str(floor)}})
+        db.execute(update(T.tenant).where(T.tenant.c.id == desk.tenant).values(settings=sign_out))
+    tenant = select(T.tenant.c.id).where(T.tenant.c.id == desk.tenant).with_for_update(key_share=True)
+    ready, release = Future(), threading.Event()
+    blocked = text("SELECT 1 FROM pg_stat_activity WHERE :pid = ANY(pg_blocking_pids(pid))")
+    with ThreadPoolExecutor(3) as pool:
+        try:
+            pool.submit(held, tenant, ready, release)
+            deleting = pool.submit(api.delete, f"/api/v1/agent-statuses/{floor}")
+            deleter = waiter(ready.result(5))
+            assert deleter, "the delete holds the presence rows and waits for the settings"
+            closing = pool.submit(api.delete, f"/api/v1/agents/{desk.agent}/sessions")
+            deadline = time.monotonic() + 5
+            with core.read() as db:
+                while not (closing.done() or db.execute(blocked, {"pid": deleter}).first()):
+                    assert time.monotonic() < deadline, "the sign-out neither finished nor waited for the delete"
+                    time.sleep(0.02)
+        finally:
+            release.set()
+    assert (closing.result().status_code, deleting.result().status_code) == (204, 204)
+    assert desk.presence().status_id in (desk.offline, desk.online)
 
 
 def test_a_session_opened_while_its_agent_is_deleted_gets_no_tokens(monkeypatch):
@@ -777,6 +823,27 @@ def test_a_sip_rotation_whose_admin_is_demoted_meanwhile_shows_no_password(monke
     monkeypatch.setattr(plivo, "rest", demoted_meanwhile)
     rotated = me.post(f"/api/v1/agents/{desk.agent}/sip-credentials")
     assert (rotated.status_code, "password" in rotated.text) == (401, False)
+
+
+def test_a_number_put_whose_admin_is_demoted_meanwhile_repoints_nothing_at_plivo(monkeypatch):
+    desk, calls = Desk(), []
+    whole(desk, role="admin")
+    with core.tx() as db:
+        db.execute(update(T.tenant).where(T.tenant.c.id == desk.tenant).values(plivo_app_id="a1"))
+    other_admin = sessions_admin(desk)
+    me = TestClient(service.app, headers={"Authorization": f"Bearer {desk.tokens.agent_token}"})
+
+    def rest(t, method, path, **params) -> dict:
+        calls.append((method, path, params))
+        if len(calls) == 1:
+            assert other_admin.patch(f"/api/v1/agents/{desk.agent}", json={"role": "agent"}).status_code == 200
+        return {}
+
+    monkeypatch.setattr(plivo, "rest", rest)
+    hangup = {"open_action": {"type": "hangup"}}
+    assert me.put("/api/v1/numbers/+15550003", json=hangup).status_code == 401
+    assert other_admin.put("/api/v1/numbers/+15550003", json=hangup).status_code == 200
+    assert calls == [("GET", "Number/15550003/", {})] * 2 + [("POST", "Number/15550003/", {"app_id": "a1"})]
 
 
 def test_every_sign_in_runs_one_scrypt_and_one_without_a_tenant_on_a_shared_install_runs_none(monkeypatch):

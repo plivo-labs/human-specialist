@@ -43,7 +43,7 @@ import psycopg2
 from psycopg2 import sql
 
 from tests._gate import gate
-from tests.harness.sim import PlivoSim, SimCall, SimCallback, SimPhone, SimRequest, free_socket, serve, slow
+from tests.harness.sim import KEEP_ALIVE, PlivoSim, SimCall, SimCallback, SimPhone, SimRequest, free_socket, serve, slow
 
 __all__ = [
     "ALL_SCOPES",
@@ -109,6 +109,11 @@ ROUTE_JOB = (
     "SELECT run_at - now(), locked_until - now(), attempts, last_error FROM hs.jobs"
     " WHERE kind = 'route_agent' AND key = %s"
 )
+# SKIP LOCKED so the park never deadlocks with HS; a row a transaction holds is missed, so end_test repeats it until
+# none is left.
+UNFROZEN = "id > %s AND key IS DISTINCT FROM kind AND locked_until IS DISTINCT FROM 'infinity'"
+FREEZE = "UPDATE hs.jobs SET locked_until = 'infinity' WHERE id IN (SELECT id FROM hs.jobs WHERE " + UNFROZEN
+FREEZE += " FOR UPDATE SKIP LOCKED)"
 
 
 def require_search() -> None:
@@ -152,6 +157,7 @@ class World:
     def __init__(self, search_url: str | None = None) -> None:
         self.search_url = search_url
         self._stack = contextlib.ExitStack()
+        self._until_test_ends = contextlib.ExitStack()
         self._jobs_after = 0
         self._desks: set[Agent] = set()  # desks still pinging, which travel beats
         self._signed_in: set[Agent] = set()
@@ -181,7 +187,8 @@ class World:
             "HS_SECRET_KEY": secrets.token_urlsafe(32),
             "PLIVO_API_URL": self.plivo.url,
             "PLIVO_MEDIA_URL": self.plivo.media_url,
-            "METRICS_PORT": str(_free_port()),
+            # Off: a metrics port picked here could be taken before HS binds it.
+            "METRICS_PORT": "0",
             "WEBHOOK_PRIVATE_HOSTS": "127.0.0.1,localhost",
             "CORS_ALLOWED_ORIGINS": self.cors_origin,
             "EVENT_RETENTION_DAYS": "90",
@@ -213,11 +220,10 @@ class World:
         if self.search_url:
             self._stack.callback(self._drop_indices)
         self._app = os.environ.get("HS_TEST_APP", "hs.app:app")
-        if "hs.core" in sys.modules:
-            # This process imported HS already (a contract test listing its routes), so its settings are frozen:
-            # boot HS in its own process with this World's env.
-            sock.close()
-            self._spawn(self.base_url, dict(os.environ))
+        # A process that already imported HS has frozen settings, so HS boots in its own process. A search World always
+        # does: this process's one HS stays the plain World's, and specs read its log through caplog.
+        if self.search_url or "hs.core" in sys.modules:
+            self._spawn(sock, dict(os.environ), self._stack)
         else:
             module, _, attr = self._app.partition(":")
             app = getattr(importlib.import_module(module), attr)
@@ -228,37 +234,40 @@ class World:
             self._stack.callback(serve(app, sock)[1])
         self.operator = self.client(self._env["HS_OPERATOR_KEY"])
 
-    def _spawn(self, base_url: str, env: dict[str, str]) -> subprocess.Popen:
-        """Boot HS in a process of its own with `env`, listening at `base_url`."""
-        port = str(urlsplit(base_url).port)
-        uvicorn = [sys.executable, "-m", "uvicorn", self._app, "--port", port, "--log-level", "warning"]
-        proc = subprocess.Popen(uvicorn, cwd=REPO, env=env)
+    def _spawn(self, sock: socket.socket, env: dict[str, str], stack: contextlib.ExitStack) -> subprocess.Popen:
+        """Boot HS in a process of its own with `env`, serving on `sock`, which it inherits bound: a port picked and
+        let go before HS binds it could be taken by another process meanwhile. Closing `stack` stops it."""
+        base_url = f"http://127.0.0.1:{sock.getsockname()[1]}"
+        uvicorn = [sys.executable, "-m", "uvicorn", self._app, "--fd", str(sock.fileno()), "--log-level", "warning"]
+        uvicorn += ["--timeout-keep-alive", str(KEEP_ALIVE)]
+        with sock:
+            proc = subprocess.Popen(uvicorn, cwd=REPO, env=env, pass_fds=(sock.fileno(),))
         _outlive_never(proc)
-        self._stack.callback(proc.wait, 10)
-        self._stack.callback(proc.terminate)
+        stack.callback(proc.wait, 10)
+        stack.callback(proc.terminate)
         self.wait(lambda: _up(base_url) or proc.poll() is not None, timeout=30, what="HS to boot")
         if proc.poll() is not None:
             raise RuntimeError("HS exited during boot")
         return proc
 
     def replica(self, redis_user: str | None = None, *, gated: bool = False) -> World:
-        """Start a second HS process on this world's database and Redis, with its own port and job runner, and return
-        a view of this world whose clients, tenants and agents talk to it. Plivo still calls the first. `redis_user`
-        is the Redis ACL user it signs in as, one the test made with world.redis("ACL", "SETUSER", ...). A `gated`
-        replica reaches Redis through a gate that `redis_held` can close."""
-        view = copy.copy(self)
-        view.base_url = f"http://127.0.0.1:{_free_port()}"
+        """Start a second HS process on this world's database and Redis, with its own port and job runner, until the
+        test ends, and return a view of this world whose clients, tenants and agents talk to it. Plivo still calls the
+        first. `redis_user` is the Redis ACL user it signs in as, one the test made with world.redis("ACL", "SETUSER",
+        ...). A `gated` replica reaches Redis through a gate that `redis_held` can close."""
+        view, sock = copy.copy(self), free_socket()
+        view.base_url = f"http://127.0.0.1:{sock.getsockname()[1]}"
         env = {k: v for k, v in os.environ.items() if k != "SEARCH_URL"} | self._env
         port = self._redis.port
         if gated:
             view._redis_gate = _RedisGate(port)
-            self._stack.callback(view._redis_gate.close)
+            self._until_test_ends.callback(view._redis_gate.close)
             port = view._redis_gate.port
         env["REDIS_URL"] = f"redis://{f'{redis_user}:-@' if redis_user else ''}127.0.0.1:{port}/0"
         # libpq names the replica's sessions, so `kill` can wait for Postgres to end them.
         view._appname = f"hs-replica-{urlsplit(view.base_url).port}"
-        env |= {"METRICS_PORT": str(_free_port()), "PGAPPNAME": view._appname}
-        view._proc = self._spawn(view.base_url, env)
+        env["PGAPPNAME"] = view._appname
+        view._proc = self._spawn(sock, env, self._until_test_ends)
         view.operator = view.client(self._env["HS_OPERATOR_KEY"])
         return view
 
@@ -287,7 +296,10 @@ class World:
 
         def ended() -> bool:
             with self._db.cursor() as cur:
-                cur.execute("SELECT count(*) FROM pg_stat_activity WHERE application_name = %s", (self._appname,))
+                cur.execute(
+                    "SELECT count(*) FROM pg_stat_activity WHERE application_name = %s AND datname = current_database()",
+                    (self._appname,),
+                )
                 return cur.fetchone()[0] == 0
 
         self.wait(ended, what="Postgres to end the killed replica's sessions")
@@ -387,6 +399,7 @@ class World:
             log.warning("this world's search indices were not deleted", exc_info=True)
 
     def close(self) -> None:
+        self._until_test_ends.close()
         self._stack.close()
 
     def anon(self) -> httpx.Client:
@@ -422,8 +435,8 @@ class World:
         self._desks.clear()
 
     def end_test(self) -> None:
-        """Sign the test's agents out and close its streams: a signed-in agent stays a desk the sweep reads for its
-        hour-long session, and a Redis loss would rebuild every earlier test's."""
+        """Sign the test's agents out, close its streams, stop its replicas and freeze its timers, so none leaks into a
+        later test."""
         agents, streams, self._signed_in, self._streams = self._signed_in, self._streams, set(), []
         for stream in streams:
             stream.close()
@@ -431,6 +444,14 @@ class World:
             # A test that removed the agent, its tenant or the tenant's key signed it out already.
             if (r := agent.tenant.api.delete(f"/api/v1/agents/{agent.id}/sessions")).status_code not in (204, 401, 404):
                 _ok(r)
+        self._until_test_ends.close()
+        self.wait(self._frozen, what="every timer of the test parked")
+
+    def _frozen(self) -> bool:
+        with self._db.cursor() as cur:
+            cur.execute(FREEZE, (self._jobs_after,))
+            cur.execute("SELECT NOT EXISTS (SELECT 1 FROM hs.jobs WHERE " + UNFROZEN + ")", (self._jobs_after,))
+            return cur.fetchone()[0]
 
     def parked(self, kind: str, key: str) -> bool:
         """The job of this kind and key gave up after its last retry and waits for a sweep."""
@@ -609,11 +630,12 @@ def _up(base_url: str) -> bool:
     return True
 
 
-def _free_port() -> int:
-    sock = free_socket()
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
+def _redis_port() -> int:
+    """Below the ephemeral ranges (Linux 32768-60999, macOS 49152-65535), so no bind(0) or connect() takes it, and in
+    this xdist worker's own slice of 20000-32767, so no other worker's World takes it while redis_down leaves it free."""
+    worker = int(os.environ.get("PYTEST_XDIST_WORKER", "gw0").removeprefix("gw"))
+    width = (32768 - 20000) // int(os.environ.get("PYTEST_XDIST_WORKER_COUNT", "1"))
+    return 20000 + worker * width + secrets.randbelow(width)
 
 
 def _shift(table: str, columns: list[str]) -> sql.Composed:
@@ -654,9 +676,9 @@ class _Redis:
             raise RuntimeError(
                 "redis-server and redis-cli must be on PATH: brew install redis, or apt-get install redis-server"
             )
-        # A port nobody gave us may be taken between picking and binding: pick again. A given port raises.
+        # A port nobody gave us may be taken already: pick again. A given port raises.
         for _ in range(1 if port else 3):
-            self.port = port or _free_port()
+            self.port = port or _redis_port()
             try:
                 self.start()
             except RuntimeError as e:
@@ -790,7 +812,7 @@ class Tenant:
         """Open GET /api/v1/events/stream (tenant key unless `token`; `query` sends it as ?access_token=, as
         EventSource must) in a background reader."""
         stream = EventStream(f"{self.world.base_url}/api/v1/events/stream", token or self.key, after, query)
-        self.world._stack.callback(stream.close)
+        self.world._until_test_ends.callback(stream.close)
         self.world._streams.append(stream)
         return stream
 

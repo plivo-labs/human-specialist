@@ -351,14 +351,15 @@ def test_a_route_cannot_name_a_voicemail_queue_deleted_meanwhile(world, tenant):
         return {"open_action": hangup_action(), "closed_action": voicemail_action(q)}
 
     gone = tenant.queue(name="Box")
-    pointing = f"/Number/{number.removeprefix('+')}/"
-    held = world.plivo.fault("stall", lambda r: r.method == "POST" and pointing in r.path, account=tenant.auth_id)
+    pointing, since = f"/Number/{number.removeprefix('+')}/", len(world.plivo.requests)
+    held = world.plivo.fault("stall", lambda r: r.method == "GET" and pointing in r.path, account=tenant.auth_id)
     with ThreadPoolExecutor(1) as pool:
         put = pool.submit(tenant.api.put, url, json=route(gone))
-        world.wait(lambda: held.hits, what="the route to reach Plivo")
+        world.wait(lambda: held.hits, what="the route's Plivo check")
         assert tenant.api.delete(f"/api/v1/queues/{gone['id']}").status_code == 204
         held.release()
         error(put.result(), 422, "foreign_id")
+    assert [r.method for r in world.plivo.requests[since:] if pointing in r.path] == ["GET"], "nothing repointed"
     error(tenant.api.get(url), 404, "number_not_found")
     box = tenant.queue(name="Box")
     ok(tenant.api.put(url, json=route(box)))

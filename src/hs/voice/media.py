@@ -110,7 +110,7 @@ def _listed(db: Connection, p: access.Principal, *where, agent_id: UUID | None =
     """The tenant's recordings and voicemails, deleted ones too unless `where` drops them, of conversations `p` may
     see (and `agent_id` took, if given)."""
     E, A, C = T.entry, T.assignment, T.conversation
-    q = select(E, C.c.call_uuid.label("customer")).join(C, C.c.id == E.c.conversation_id)
+    q = select(E, C.c.call_uuid.label("customer"), C.c.channel).join(C, C.c.id == E.c.conversation_id)
     q = q.where(E.c.tenant_id == p.tenant_id, E.c.kind.in_(LISTED), *where)
     for agents in (access.visible_agents(db, p), agent_id and {str(agent_id)}):
         if agents is not None:
@@ -195,7 +195,7 @@ def get_transcript(rid: UUID, p: access.Principal = READ):
     for x in parts:
         leg, began, room = x.body.get("leg") or e.customer, x.body.get("began"), e.body.get("began")
         shift = (datetime.fromisoformat(began) - datetime.fromisoformat(room)).total_seconds() if began and room else 0
-        who = "Customer" if leg == e.customer else agents.get(leg) or leg
+        who = "Customer" if leg == e.customer or (e.channel != "call" and leg not in agents) else agents.get(leg) or leg
         said = ((s["start"] + shift, s["text"]) for s in x.body.get("segments", []))
         segments += [
             {"speaker": who, "start_time": math.ceil(at), "text": words}
@@ -377,7 +377,8 @@ def control_recording(cid: UUID, body: RecordingAction, p: access.Principal = CA
     ask = {"action": body.action, "by": p.agent_id, "request": uuid4().hex}
     with tx() as db:
         conv = access.conversation(db, p, cid, lock=True)
-        if conv.state not in conversations.LIVE or access.hung_up(conv):
+        off = conv.channel != "call" and mpc.dialed(db, conv) is None
+        if conv.state not in conversations.LIVE or access.hung_up(conv) or off:
             raise ApiError(409, "call_not_live", "the call has ended")
         if not config.tenant_settings(db, p.tenant_id).recording.allow_pause:
             raise ApiError(409, "pause_not_allowed", "this tenant does not allow pausing a recording")

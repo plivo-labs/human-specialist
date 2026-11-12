@@ -126,6 +126,11 @@ CALLBACK_FAULTS = ("drop", "duplicate", "race", "delay")
 MEETS = {"sent": CALLBACK_FAULTS, "released": (), "flushed": ("drop", "duplicate", "race")}
 
 
+# How long a server keeps an idle connection: past the 5 s an httpx client reuses one, so a server never closes a
+# connection a client is sending on (a request meeting that close is reset).
+KEEP_ALIVE = 30
+
+
 def free_socket() -> socket.socket:
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
@@ -136,7 +141,7 @@ def serve(app, sock: socket.socket | None = None) -> tuple[str, Callable[[], Non
     """Run an ASGI app (with its lifespan) under uvicorn in a thread; returns (base URL, stop). uvicorn's
     loggers, access log included, are left unconfigured so their records reach the root logger (caplog)."""
     sock = sock or free_socket()
-    server = uvicorn.Server(uvicorn.Config(app, lifespan="on", log_config=None))
+    server = uvicorn.Server(uvicorn.Config(app, lifespan="on", log_config=None, timeout_keep_alive=KEEP_ALIVE))
     thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
     thread.start()
     while not server.started:

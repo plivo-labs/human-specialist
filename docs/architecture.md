@@ -60,6 +60,8 @@ A conversation is one contact with a human, on one channel: `call`, `chat`, `sms
 
 A conversation moves through `open`, `queued`, `live`, `wrap_up` and `closed`. An offer is open while its `offer_timeout` timer row exists and its Redis field is open, and every end deletes the timer in its own transaction: an accept inserts the `active` assignment under the offer's id, and a decline, miss or withdrawal leaves no row, except a `missed` one for a leg that left before it joined. An assignment moves from `active` to `wrap_up` and `done`; an outbound dial's starts `offered` while it rings. Every write takes the conversation's row lock, and each transition is one guarded `UPDATE` or `DELETE`. When no row comes back, the event was a duplicate or arrived late, and the caller does nothing. That is how repeated and unordered Plivo callbacks converge.
 
+Every transaction takes its locks in one order and never goes back for an earlier one: the tenant's configuration lock first (a configuration write holds it alone, and other writes that name configuration ids share it), then conversation rows, a queue row, agents' presence rows (several in agent order, in one statement), status rows, agent and other configuration rows, and last the tenant row, credentials, passwords, job rows and events. A status delete therefore locks every presence row of its tenant before the status row, so no agent moves into the status while its agents move out.
+
 Capacity lives in Redis: each agent's slots per channel (`cap`), each held by the offer or stint that took it and counted once per conversation, so two offers of one conversation hold one slot, and the agents at their cap (`full`), whom routing skips.
 
 An offer takes a slot, and its stint gives it back once its end commits, or its wrap-up's end while wrap-up blocks routing (a cold transfer to a queue holds it at least until the room the caller left ends). A call offer HS's own timer missed keeps it until its leg's hangup reaches HS, 60 s at most, since that timer runs ahead of Plivo's ring and the leg may still ring or have answered unheard.
@@ -150,7 +152,18 @@ Its target or type changes only while no offer or queue holds it; a type change 
 2. The service opens an outbound conversation and rings the agent's endpoint (`call.started`).
 3. When the agent answers, the agent's leg takes its seat in the conversation's room, and the service dials the customer into it. The room has the inbound shape, so hold, transfer, recording and hangup work the same way, and a hold plays Plivo's default track. `call.answered` is emitted when the customer answers.
 4. A call that ends before the customer answers emits `call.failed`, then `call.ended`, and closes with the disposition mapped to its result.
-5. With a `conversation_id`, the call joins the agent's live text conversation instead: the agent's stint on it is secondary, the conversation's state never moves, and the call's end only tells `call.ended`.
+5. With a `conversation_id`, the call joins the agent's live text, task or callback conversation instead: the agent's stint on it is secondary, the conversation's state never moves, and the call's end only tells `call.ended`. That stint is the call's agent for hold, recording and hangup, and the conversation's end ends the call. It takes no transfer, participant or supervisor (409 `call_joined`), since those would move the conversation itself.
+
+The conversation outlives each call joined to it, so the call is the agent's dial stint, and its `call_on` mark on the conversation stands until the call's end is told:
+
+| Dial | Its stint | What each input does |
+|---|---|---|
+| requested | offered, no request id yet | An answer seats the agent. A hangup, or the conversation's end, ends the dial now, and the request id cancels the call when Plivo's reply brings it. |
+| ringing | offered, with the request id | An answer seats the agent. The ring's end, a hangup or the conversation's end ends the dial and cancels the request. |
+| answered | active, with the agent's leg | The customer is dialed into the room. Hold and recording act on the call. A hangup hangs up the agent's leg, and either leg's end ends the dial. |
+| ended | withdrawn or done | An answer is rejected, the request id that arrives late cancels the call, and a leg Plivo reports late (in the customer add's reply, in a status, or as a join in the dial's room) is hung up under the dial's own key, never bound to the conversation or to a later dial. A hold or recording that Plivo confirms late tells nothing. |
+
+Every move of the stint out of offered or active, from a hangup, a leg's end, a close, a task's resolve or cancel, a session timeout or an agent going offline, passes through `conversations.move`. It tells `call.failed` (when the customer never answered) and `call.ended` once, cancels a ring and hangs up both legs. A new call from the conversation may start as soon as the last one ended. It takes the next room, and its customer's add is its own Plivo command, keyed by its dial, so the old call's late legs never reach it. The old call's recordings stay the conversation's history, and its transcript names its own customer.
 
 ## Plivo writes
 

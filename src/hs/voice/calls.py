@@ -94,12 +94,15 @@ def _payload(conv: Row, **more) -> dict:
     return {"tenant_id": str(conv.tenant_id), "conversation_id": str(conv.id), "room": conv.room, **more}
 
 
-def _call(db: Connection, p: Principal, cid: UUID) -> Row:
-    """The live call `p` controls, locked: 404 unless it may see it, then 409 once the call is over or hung up,
-    then 404 unless it may control it."""
+def _call(db: Connection, p: Principal, cid: UUID, joins: bool = False) -> Row:
+    """The live call `p` controls, locked: 404 unless it may see it, then 409 once the call is over or hung up, or
+    unless `joins`, while it is a call joined to a text or task conversation, then 404 unless it may control it."""
     conv = access.conversation(db, p, cid, lock=True)
-    if conv.channel != "call" or conv.state not in conversations.LIVE or access.hung_up(conv):
+    joined = conv.channel != "call"
+    if conv.state not in conversations.LIVE or access.hung_up(conv) or (joined and not mpc.dialed(db, conv)):
         raise ApiError(409, "call_not_live", "the call is not live")
+    if joined and not joins:
+        raise ApiError(409, "call_joined", "a call joined to a text or task conversation takes no such control")
     return access.controlled(conv)
 
 
@@ -109,7 +112,9 @@ def _owner(p: Principal, a: Row | None) -> None:
 
 
 def _primary(db: Connection, conv: Row, p: Principal | None = None) -> Row:
-    if (a := conversations.primary_agent(db, conv.id)) is None:
+    """The stint whose agent has the call: its primary, or the agent's dial of a call joined to a conversation."""
+    a = conversations.primary_agent(db, conv.id) if conv.channel == "call" else mpc.dialed(db, conv)
+    if a is None or a.state != "active":
         raise ApiError(409, "call_not_connected", "no agent is connected to this call")
     if p:
         _owner(p, a)
@@ -134,15 +139,15 @@ def _off(db: Connection, conv: Row, a: Row, reason: str) -> str | None:
 
 
 def _holds(cid: UUID, p: Principal, named: str | None, want: Callable[[str | None], bool | None]) -> Response:
-    """Taking the caller off hold also keeps the rings sent so far from holding it when Plivo answers them late."""
+    """Taking any member off hold also keeps the rings sent so far from holding anyone when Plivo answers them late."""
     C, ask = T.conversation, uuid4().hex
     with tx() as db:
-        conv = _call(db, p, cid)
+        conv = _call(db, p, cid, joins=True)
         primary, on = _primary(db, conv), mpc.members(db, conv)
         if named not in (None, "all", *(k for k, _ in on)):
             raise ApiError(404, "participant_not_found", "no such participant or transfer target on this call")
         held = [(a, w) for k, a in on if (w := want(k)) is not None]
-        if any(a is None and not w for a, w in held):
+        if any(not w for _, w in held):
             resumes = {"resumes": conv.routing.get("resumes", 0) + 1}
             db.execute(update(C).where(C.c.id == conv.id).values(routing=C.c.routing.concat(resumes)))
         keys = mpc.hold(db, conv, held, primary.agent_id, by=p.agent_id, request=ask, wait=True)
@@ -179,30 +184,46 @@ def hangup(cid: UUID, p: Principal = CALLS) -> Response:
     the caller. Otherwise the call is torn down: the primary's leg ends first, so an outage there leaves the call as
     it was, then every other leg, and call.ended reads ended_by agent. A retry, or HS on its own, finishes a teardown
     an outage or a refusal cut short, whoever is on the call by then, and sends again each leg Plivo has not confirmed
-    gone. A call that is over, or that the teardown handed back, is 409 until a queue takes it again."""
+    gone. A call that is over, or that the teardown handed back, is 409 until a queue takes it again. A call joined to
+    a text or task conversation ends as when its agent's phone hangs up, whoever sends it: its agent's leg is hung
+    up, and a dial still ringing its agent, or still being placed, is cancelled now."""
     with tx() as db:
-        conv = access.conversation(db, p, cid, lock=True)
-        tearing, live = _tearing(conv, conv.room), conv.state in conversations.LIVE and not access.hung_up(conv)
-        if conv.channel != "call" or not (live or tearing):
-            raise ApiError(409, "call_not_live", "the call is not live")
-        primary, leaving, consult = conversations.primary_agent(db, conv.id), None, None
-        every = conversations.rows(db, conv.id)
-        mine = p.agent_id and next((a for a in reversed(every) if str(a.agent_id) == p.agent_id), None)
-        if mine and not tearing and not (primary and mine.id == primary.id):
-            leaving = mine
-        elif not tearing:
-            access.controlled(conv)
-            on = (getattr(primary, "id", None), "transfer", "active")
-            if consult := primary and next((a.id for a in every if (a.from_assignment, a.via, a.state) == on), None):
-                leaving = primary
+        conv, key = access.conversation(db, p, cid, lock=True), None
+        if conv.channel != "call":
+            leaving = mpc.dialed(db, conv := _call(db, p, cid, joins=True))
+            if leaving.state == "active":
+                key = _leg(db, conv, leaving.call_uuid)
             else:
-                _mark(db, conv, [])
-                jobs.schedule(db, "teardown", {"conversation_id": str(cid), "room": conv.room}, delay=10, key=str(cid))
-        key = mpc.complete(db, conv, primary, consult) if consult else leaving and _leg(db, conv, leaving.call_uuid)
+                conversations.end_joined(db, leaving, conversations.no_cause("agent", 0), "cancelled")
+        else:
+            key, leaving = _leave(db, p, conv)
     plivo.verdict(key)
     if leaving is None:
         _tear_down(cid, conv.room)
     return Response(status_code=204)
+
+
+def _leave(db: Connection, p: Principal, conv: Row) -> tuple[str | None, Row | None]:
+    """The hangup or complete the agent's hangup of a call waits on, and the stint that leaves, None for a
+    teardown."""
+    tearing, live = _tearing(conv, conv.room), conv.state in conversations.LIVE and not access.hung_up(conv)
+    if not (live or tearing):
+        raise ApiError(409, "call_not_live", "the call is not live")
+    primary, leaving, consult = conversations.primary_agent(db, conv.id), None, None
+    every = conversations.rows(db, conv.id)
+    mine = p.agent_id and next((a for a in reversed(every) if str(a.agent_id) == p.agent_id), None)
+    if mine and not tearing and not (primary and mine.id == primary.id):
+        leaving = mine
+    elif not tearing:
+        access.controlled(conv)
+        on = (getattr(primary, "id", None), "transfer", "active")
+        if consult := primary and next((a.id for a in every if (a.from_assignment, a.via, a.state) == on), None):
+            leaving = primary
+        else:
+            _mark(db, conv, [])
+            jobs.schedule(db, "teardown", _payload(conv), delay=10, key=str(conv.id))
+    key = mpc.complete(db, conv, primary, consult) if consult else leaving and _leg(db, conv, leaving.call_uuid)
+    return key, leaving
 
 
 def _mark(db: Connection, conv: Row, legs: list[str]) -> None:

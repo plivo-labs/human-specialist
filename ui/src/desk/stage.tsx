@@ -170,7 +170,7 @@ function LiveCall({ ctx, line }: { ctx: Ctx; line: Line }) {
     <Card>
       <div className="flex items-center justify-between gap-2 text-xs-400 text-tertiary">
         <To out={out} address={c.our_address && phone(c.our_address)} />
-        {!ringing && !joined && rec?.allow_pause && rec[c.direction] && (
+        {!ringing && rec?.allow_pause && rec[c.direction] && (
           <button
             type="button"
             className={cls("shrink-0 text-xxs-600 uppercase underline", line.paused ? "text-tertiary" : "text-destructive")}
@@ -202,7 +202,7 @@ function LiveCall({ ctx, line }: { ctx: Ctx; line: Line }) {
             {line.muted ? <MicOff aria-hidden /> : <Mic aria-hidden />}
           </Button>
         )}
-        {!ringing && !joined && (
+        {!ringing && (
           <>
             <Button
               {...tool(line.held ? "Unhold" : "Hold", line.held)}
@@ -213,9 +213,11 @@ function LiveCall({ ctx, line }: { ctx: Ctx; line: Line }) {
             >
               <Pause aria-hidden />
             </Button>
-            <Button {...tool("Transfer", transferring)} disabled={!!line.transfer} onClick={() => setTransferring(!transferring)}>
-              <UserRoundPlus aria-hidden />
-            </Button>
+            {!joined && (
+              <Button {...tool("Transfer", transferring)} disabled={!!line.transfer} onClick={() => setTransferring(!transferring)}>
+                <UserRoundPlus aria-hidden />
+              </Button>
+            )}
           </>
         )}
         <Button
@@ -223,7 +225,7 @@ function LiveCall({ ctx, line }: { ctx: Ctx; line: Line }) {
           size="icon"
           aria-label={ringing ? "Cancel the call" : "End call"}
           title="End call"
-          onClick={() => act("Hanging up", async () => void (joined ? sdk.current?.hangup() : await asAgent("POST", `/api/v1/calls/${cid}/hangup`)), ringing ? "Call cancelled" : joined ? "Call ended" : "Call ended. Wrap-up is open.")}
+          onClick={() => act("Hanging up", () => asAgent("POST", `/api/v1/calls/${cid}/hangup`), ringing ? "Call cancelled" : joined ? "Call ended" : "Call ended. Wrap-up is open.")}
         >
           {hangUp}
         </Button>

@@ -116,6 +116,8 @@ def ring(
     payload = {"tenant_id": t, "conversation_id": str(conv.id), "room": conv.room, "ring": str(g), "params": params}
     came = next((str(a.from_assignment) for a in offers if a.from_assignment), None)
     payload |= {"from": came, "resumes": conv.routing.get("resumes", 0), "via": next((a.via for a in offers), None)}
+    if payload["via"] == "participant":
+        payload["before"] = [str(a.id) for a in conversations.rows(db, conv.id, conversations.ON) if a.ring != g]
     payload["number"] = conv.ours if not (alias or "call_uuid" in extra) else None
     key = plivo.command(db, "ring", str(g), payload, wait=wait)
     _check_later(db, payload)
@@ -123,9 +125,10 @@ def ring(
 
 
 def members(db: Connection, conv: Row) -> list[tuple[str | None, Row | None]]:
-    """A leg Plivo has bound counts before HS hears its join, as Plivo's room may hold it already."""
+    """A leg Plivo has bound counts before HS hears its join, as Plivo's room may hold it already. The agent's own
+    leg of a call joined to a text or task conversation is no member."""
     on = conversations.rows(db, conv.id, conversations.ON)
-    legs = [a for a in on if a.call_uuid and a.role in ("secondary", "external")]
+    legs = [a for a in on if a.call_uuid and a.role in ("secondary", "external") and a.via != "outbound"]
     return [(None, None), *((str(a.transfer_id or a.id), a) for a in legs)]
 
 
@@ -155,9 +158,18 @@ def find_conv(db: Connection, tenant: Row, cid: UUID) -> Row | None:
 
 def still_live(db: Connection, p: dict, states: tuple[str, ...] = ("live",)) -> Row | None:
     """The call a Plivo command for room `p["room"]` acted on, locked, while it is still in that room and in one of
-    the `states` its request allowed."""
+    the `states` its request allowed; a call joined to a text or task conversation, while it is on."""
     conv = conversations.lock(db, UUID(p["conversation_id"]))
-    return conv if conv.state in states and conv.room == p["room"] else None
+    on = conv.channel == "call" or "call_on" in conv.routing
+    return conv if on and conv.state in states and conv.room == p["room"] else None
+
+
+def dialed(db: Connection, conv: Row, aid=None) -> Row | None:
+    """The stint of dial `aid`, else the conversation's newest dial. A text or task conversation outlives each call
+    joined to it, so there a dial whose call is over reads None."""
+    dials = [a for a in conversations.rows(db, conv.id) if a.via == "outbound"]
+    a = next((d for d in dials if str(d.id) == str(aid)), None) if aid else (dials[-1] if dials else None)
+    return a if conv.channel == "call" or (a and a.state in conversations.ON) else None
 
 
 def _primary(every: list) -> Row | None:
@@ -256,8 +268,7 @@ def mpc_status(c: UUID, r: int, tenant: Row = flow.TENANT, form: dict = flow.FOR
         return Response()
     with tx() as db:
         conv = find_conv(db, tenant, c)
-        if conv and event == "ParticipantExit":
-            _exited(db, conv, form, r == conv.room)
+        _seen(db, conv, r, event, call_uuid, form)
         if conv is None or r != conv.room:
             if conv and event == "MPCEnd":
                 conversations.room_ended(db, conv, r)
@@ -284,6 +295,17 @@ def mpc_status(c: UUID, r: int, tenant: Row = flow.TENANT, form: dict = flow.FOR
             to_miss = [a for a in dialed if a.state == "offered"]
             _ended(db, conv, to_miss, "miss", reason=FAILED)
     return Response()
+
+
+def _seen(db: Connection, conv: Row | None, r: int, event: str, leg: str | None, form: dict) -> None:
+    """Apply a member's exit, or hang up a late join to room `r` of a text or task conversation whose dial there is no
+    longer on. Each dial there takes the next room, and nothing else moves its room."""
+    if conv and event == "ParticipantExit":
+        _exited(db, conv, form, r == conv.room)
+    elif conv and event == "ParticipantJoin" and conv.channel != "call":
+        dials = [a for a in conversations.rows(db, conv.id) if (a.via, a.role) == ("outbound", "secondary")]
+        if (i := len(dials) - 1 - (conv.room - r)) >= 0 and dials[i].state not in conversations.ON:
+            conversations.hang_dial(db, conv, dials[i].id, form.get("ParticipantRole", "").lower(), leg)
 
 
 def _exited(db: Connection, conv: Row, form: dict, here: bool) -> None:
@@ -519,8 +541,9 @@ def _left(db: Connection, conv: Row, a: Row) -> None:
 
 
 def hand_over(db: Connection, conv: Row, t: Row, every: list | None = None) -> bool:
-    """Transfer target `t` takes the call. False, changing nothing, for a target the call's primary no longer waits
-    on: a repeat, a stale join. `every`, if given, is the conversation's rows, read after the lock."""
+    """Transfer target `t` takes the call and the caller comes off hold. Rings sent before that hold no one, even if
+    Plivo answers them late. False, changing nothing, for a target the call's primary no longer waits on: a repeat, a
+    stale join. `every`, if given, is the conversation's rows, read after the lock."""
     every = conversations.rows(db, conv.id) if every is None else every
     primary, consulted = _primary(every), t.state == "active"
     waits = t.from_assignment == primary.id if primary else t.state == "offered"
@@ -546,7 +569,8 @@ def hand_over(db: Connection, conv: Row, t: Row, every: list | None = None) -> b
         conversations.edit(db, t, role="primary")
     conversations.set_state(db, conv, "live")
     C = T.conversation
-    db.execute(update(C).where(C.c.id == conv.id).values(routing=C.c.routing.concat({"hung_up": None})))
+    fenced = {"hung_up": None, "resumes": conv.routing.get("resumes", 0) + 1}
+    db.execute(update(C).where(C.c.id == conv.id).values(routing=C.c.routing.concat(fenced)))
     hold(db, conv, [(None, False), *([(t, False)] if consulted else [])], t.agent_id or came.agent_id)
     if (conv.routing.get("recording") or {}).get("state") == [conv.room, "pause"]:
         room = {"tenant_id": str(conv.tenant_id), "conversation_id": str(conv.id), "room": conv.room}
@@ -591,7 +615,9 @@ def supervisor(db: Connection, conv: Row, a: Row, type_: str, *, announce: bool 
 def _rung(p: dict, reply: dict) -> None:
     """Plivo took the ring: its legs bind, and a transfer from the call's primary holds the caller while its target
     rings and consults, or until the agent resumes if a decline or cancel came first. A call handed over or ended
-    before this reply is not held, nor one the agent resumed after the ring began."""
+    before this reply is not held, nor one whose agent took any member off hold after the ring began. A participant's
+    ring holds the caller and the legs that were on the call when it rang, and its own leg if another participant
+    was added after it: Plivo's replies to two rings may come in either order."""
     g = UUID(p["ring"])
     with tx() as db:
         conv = conversations.lock(db, UUID(p["conversation_id"]))
@@ -606,8 +632,10 @@ def _rung(p: dict, reply: dict) -> None:
         if p.get("from") == str(primary.id):
             hold(db, conv, [(None, True)], primary.agent_id)
         elif p.get("via") == "participant":
-            others = [(m, True) for _, m in members(db, conv) if getattr(m, "ring", None) != g]
-            hold(db, conv, others, primary.agent_id)
+            legs, before = [m for _, m in members(db, conv) if m], set(p.get("before", ()))
+            later = any(m.via == "participant" and m.ring != g and str(m.id) not in before for m in legs)
+            held = [m for m in legs if str(m.id) in before or (m.ring == g and later)]
+            hold(db, conv, [(None, True), *((m, True) for m in held)], primary.agent_id)
 
 
 def _refused(p: dict, _: plivo.Refused) -> None:

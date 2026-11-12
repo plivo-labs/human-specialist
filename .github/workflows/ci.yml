@@ -1,5 +1,5 @@
-# Mirrors `make check` against the same Postgres and OpenSearch stack as local runs. HS_REQUIRE_STACK turns
-# a skipped OpenSearch variant into a failure, so the search tests run on both backends here.
+# `make check` split into two jobs that run side by side: `fast` (lint, format, fast suite) and `acceptance`.
+# HS_REQUIRE_STACK turns a skipped OpenSearch variant into a failure, so search tests run on both backends.
 name: CI
 
 on:
@@ -13,9 +13,9 @@ permissions:
   contents: read
 
 jobs:
-  check:
+  fast:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 15
     env:
       HS_TEST_DATABASE_URL: postgresql://hs:hs@127.0.0.1:56432/hs
       HS_REQUIRE_STACK: "1"
@@ -37,7 +37,22 @@ jobs:
           [ "$rc" -eq 1 ] || { echo "internal reference found or git failed (exit $rc)"; exit 1; }
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends redis-server redis-tools tzdata-legacy
       - run: docker compose -f docker/compose.test.yaml up -d --wait
-      - run: make check
+      - run: make lint test
+
+  acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HS_TEST_DATABASE_URL: postgresql://hs:hs@127.0.0.1:56432/hs
+      HS_REQUIRE_STACK: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: true
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends redis-server redis-tools tzdata-legacy
+      - run: docker compose -f docker/compose.test.yaml up -d --wait
+      - run: make acceptance
 
   # The recipe in docs/plugins.md, as printed: the image, a plugin image derived from it, and both answering.
   plugin-image:
@@ -81,9 +96,9 @@ jobs:
       - run: npm test
       - run: npm run build
 
-  # A reusable workflow, so the image is pushed only after `check` passed on this commit, and only for a release tag.
+  # A reusable workflow, so the image is pushed only after every job passed on this commit, and only for a release tag.
   image:
-    needs: [check, plugin-image, ui]
+    needs: [fast, acceptance, plugin-image, ui]
     if: github.ref_type == 'tag'
     permissions:
       contents: read
@@ -91,7 +106,7 @@ jobs:
     uses: ./.github/workflows/image.yml
 
   release:
-    needs: [check, image]
+    needs: [fast, acceptance, image]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:

@@ -372,14 +372,15 @@ FIRST_AVAILABLE = literal_column(
 
 
 def set_status(db: Connection, tenant_id, agent_id, status_id, reason: str, why: str | None = None) -> bool:
-    """Move the agent to one of its tenant's statuses and announce it; False if it had it already. The status row
-    is held in share mode, so it cannot be deleted under the change."""
+    """Move the agent to one of its tenant's statuses and announce it; False if it had it already. The presence row
+    is locked before the status row, the order every transaction takes them in (docs/architecture.md), and the status
+    row is held in share mode, so it cannot be deleted under the change."""
     C, P = T.config, T.presence
-    status = select(C.c.id, C.c.body).where(C.c.id == status_id, C.c.tenant_id == tenant_id, C.c.kind == "status")
-    to = db.execute(status.with_for_update(read=True)).first()
     held = select(P.c.status_id, C.c.body["name"].astext.label("name")).join(C, C.c.id == P.c.status_id)
     now = db.execute(held.where(P.c.agent_id == agent_id).with_for_update(of=P)).first()
-    if to is None or now is None or now.status_id == to.id:
+    status = select(C.c.id, C.c.body).where(C.c.id == status_id, C.c.tenant_id == tenant_id, C.c.kind == "status")
+    had = now is None or now.status_id == config.as_uuid(status_id)
+    if had or (to := db.execute(status.with_for_update(read=True)).first()) is None:
         return False
     first = {"first_available_at": FIRST_AVAILABLE} if to.body["availability"] else {}
     db.execute(update(P).where(P.c.agent_id == agent_id).values(status_id=to.id, since=func.now(), **first))
@@ -743,8 +744,7 @@ def transfer_targets(channel: Channel = "call", p: Principal = AGENT):
 
 @jobs.handler("agent_offline")
 def _offline(job: Row) -> None:
-    """Rechecked under the presence row lock, so a beat since the sweep keeps the agent on. Only share locks are
-    taken on config rows after it, and nothing that locks a config row exclusively waits for a presence row."""
+    """Rechecked under the presence row lock, so a beat since the sweep keeps the agent on."""
     P, tenant_id, agent_id = T.presence, job.payload["tenant_id"], job.payload["agent_id"]
     with tx() as db:
         held = db.execute(select(P.c.agent_id).where(P.c.agent_id == agent_id).with_for_update()).first()

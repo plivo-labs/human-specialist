@@ -80,6 +80,7 @@ const ENDS_TRANSFER = new Set(["completed", "failed", "cancelled"]);
 const LINE_FLAGS: Record<string, Partial<Line>> = {
   "call.recording_paused": { paused: true },
   "call.recording_resumed": { paused: false },
+  "call.ended": { held: false, muted: false, paused: false },
 };
 
 export const namesMe = (s: State, e: Envelope) => e.agent_id === s.me.id || e.data?.supervisor_id === s.me.id;
@@ -100,7 +101,7 @@ function onEvent(s: State, e: Envelope): State {
     const t = line.transfer;
     const held = (e.type === "call.held" || e.type === "call.resumed") && d.participant_id == null ? e.type === "call.held" : line.held;
     const transfer = e.type === "call.transferred" && t && t.id === d.transfer_id ? (ENDS_TRANSFER.has(d.status) ? null : { ...t, status: String(d.status) }) : t;
-    return { ...line, ...LINE_FLAGS[e.type], held, transfer };
+    return { ...line, held, transfer, ...LINE_FLAGS[e.type] };
   });
   if (e.type === "agent.status_changed" && namesMe(s, e)) me = { ...me, status: d.to_status };
   if (onDial(s, e) && ENDS_DIAL.has(e.type)) dialing = null;

@@ -38,7 +38,7 @@ class DialIn(m.Body):
     ring_timeout_sec: int | None = Field(None, ge=5, le=120)
     context: dict | None = None
     conversation_id: UUID | None = Field(
-        None, description="The agent's live text conversation; the call to `to` joins it."
+        None, description="The agent's live text, task or callback conversation; the call to `to` joins it."
     )
 
 
@@ -61,22 +61,23 @@ def _check(db: Connection, p: Principal, body: DialIn) -> tuple[dict, str]:
 
 def _open(db: Connection, p: Principal, body: DialIn, agent: dict, caller_id: str, address=None, leg=None):
     """The conversation and the agent's stint on it at `address`, else where the agent rings now: offered while its
-    leg rings, active once it has `leg`. The agent's presence row is share-locked first, so a status change in flight
-    is seen, and the stint takes the agent's one call slot, so two dials cannot both take it."""
-    P, t = T.presence, p.tenant_id
+    leg rings, active once it has `leg`. A text conversation it joins is locked first, then the agent's presence row is
+    share-locked, so a status change in flight is seen, and the stint takes the agent's one call slot, so two dials
+    cannot both take it."""
+    P, C, t = T.presence, T.conversation, p.tenant_id
+    conv = body.conversation_id and access.conversation(db, p, body.conversation_id, lock=True)
     status = db.execute(select(P.c.status_id).where(P.c.agent_id == agent["id"]).with_for_update(read=True)).scalar()
     if not (config.get(db, t, "status", status) or {}).get("availability"):
         raise ApiError(409, "agent_unavailable", "the agent is not available")
-    C = T.conversation
     ring = {"lead_ring": body.ring_timeout_sec or LEAD_RING, "lead_from": caller_id, "lead_to": body.to}
-    if body.conversation_id:
-        conv = access.conversation(db, p, body.conversation_id, lock=True)
+    if conv:
         mine = str(getattr(conversations.primary_agent(db, conv.id), "agent_id", None)) == str(agent["id"])
         if conv.channel == "call" or conv.state not in conversations.LIVE or not mine:
             raise ApiError(409, "conversation_not_joinable", "the call joins the agent's live text conversation")
-        if _agent(db, conv):
+        if mpc.dialed(db, conv):
             raise ApiError(409, "agent_on_call", "the agent is on a call")
-        values = {"routing": C.c.routing.concat(ring) - "lead_up", "call_uuid": None, "room": C.c.room + 1}
+        values = {"routing": C.c.routing.concat(ring | {"call_on": True}) - "lead_up", "call_uuid": None}
+        values["room"] = C.c.room + 1
     else:
         parties = {"customer": body.to, "ours": caller_id, "context": body.context, "number": caller_id}
         conv = conversations.open(db, t, channel="call", direction="outbound", agent_id=agent["id"], **parties)
@@ -124,14 +125,6 @@ access.VIEWS[f"POST {PUBLIC}/calls"] = lambda db, p, cid: (
 )
 
 
-def _agent(db: Connection, conv: Row, aid=None) -> Row | None:
-    """The stint of dial `aid`, else the conversation's newest dial. A text conversation outlives each call on it, so
-    there a dial whose call is over reads None."""
-    dials = [a for a in conversations.rows(db, conv.id) if a.via == "outbound"]
-    a = next((d for d in dials if str(d.id) == str(aid)), None) if aid else (dials[-1] if dials else None)
-    return a if conv.channel == "call" or (a and a.state in conversations.ON) else None
-
-
 def _seat(db: Connection, conv: Row, a: Row | None = None) -> Response:
     """The agent's seat in the room. A newly seated agent's `a` also has call.started told and the lead rung into the
     room as its customer."""
@@ -145,7 +138,9 @@ def _seat(db: Connection, conv: Row, a: Row | None = None) -> Response:
         lead |= {"from": ours, "to": to, "ring_timeout": ring, "end_mpc_on_exit": True}
         lead["call_status_callback_url"] = plivo.url(t, "hangup", c=cid, a=a.id)
         adding = {"tenant_id": t, "conversation_id": cid, "room": conv.room, "check": ring + 30}
-        plivo.command(db, "dial", cid, adding | {"path": f"{mpc.room_of(adding)}/Participant/", "params": lead})
+        adding |= {"dial": str(a.id)} if conv.channel != "call" else {}
+        adding |= {"path": f"{mpc.room_of(adding)}/Participant/", "params": lead}
+        plivo.command(db, "dial", _key(adding), adding)
     return plivo.xml(("MultiPartyCall", room | {"role": "Agent", "startMpcOnEnter": True}, name, *hold))
 
 
@@ -157,8 +152,8 @@ def answer(tenant: Row, form: dict, c: UUID | None, aid: UUID | None = None) -> 
     with tx() as db:
         dialed = select(A.c.id, A.c.conversation_id).where(A.c.call_uuid == call_uuid, A.c.via == "outbound")
         if (seen := db.execute(dialed).first()) and (conv := mpc.find_conv(db, tenant, seen.conversation_id)):
-            return _seat(db, conv) if _agent(db, conv, seen.id) else plivo.xml(REJECTED)
-        if c and (conv := mpc.find_conv(db, tenant, c)) and (a := _agent(db, conv, aid)) and a.state == "offered":
+            return _seat(db, conv) if mpc.dialed(db, conv, seen.id) else plivo.xml(REJECTED)
+        if c and (conv := mpc.find_conv(db, tenant, c)) and (a := mpc.dialed(db, conv, aid)) and a.state == "offered":
             return _seat(db, conv, conversations.move(db, a, "answer", call_uuid=call_uuid))
         user = mpc.bare_user(form.get("From", "")).removesuffix(f"_{tenant.plivo_auth_id}")
         found = not c and config.by_key(db, tenant.id, "agent", user)
@@ -178,7 +173,7 @@ def _bind(db: Connection, conv: Row, call_uuid: str) -> Row:
     """The lead's leg, first seen in a status or the add-member reply; one seen once the call is over is hung up."""
     C = T.conversation
     conv = db.execute(update(C).where(C.c.id == conv.id).values(call_uuid=call_uuid).returning(*C.c)).one()
-    if conv.state not in conversations.LIVE or not _agent(db, conv):
+    if conv.state not in conversations.LIVE or not mpc.dialed(db, conv):
         _hang(db, conv, call_uuid)
     return conv
 
@@ -212,7 +207,7 @@ def room(db: Connection, conv: Row, event: str, form: dict) -> bool:
     """A room event of a call that is still `open`, by the status rule: the lead in the room answered (the room
     then takes its exit), and the agent leaving before that cancels the call. True when that ends the event; a call
     joined to a text conversation takes every room event here, since the room never moves its conversation."""
-    leg, a = form.get("ParticipantCallUUID"), _agent(db, conv)
+    leg, a = form.get("ParticipantCallUUID"), mpc.dialed(db, conv)
     if a and leg and leg == conv.call_uuid and event in ("ParticipantJoin", "ParticipantExit"):
         _live(db, conv, a, speak=event == "ParticipantJoin")
     elif a and leg and leg == a.call_uuid and event == "ParticipantExit" and not _up(conv):
@@ -223,7 +218,11 @@ def room(db: Connection, conv: Row, event: str, form: dict) -> bool:
 
 def _failed(db: Connection, conv: Row, a: Row, result: str, hangup: dict, ended: str | None = None) -> None:
     """The call ended before the lead answered: call.failed and call.ended, told to the agent too, and it closes
-    with `result`. The agent's dial `a` is let go without wrap-up, and every leg but the one that `ended` is hung up."""
+    with `result`; on a text or task conversation only the call ends. The agent's dial `a` is let go without wrap-up,
+    and every leg but the one that `ended` is hung up."""
+    if conv.channel != "call":
+        conversations.end_joined(db, a, hangup, result)
+        return
     flow.emit(db, "call.failed", conv, a.agent_id, result=result, hangup_cause_code=hangup["hangup_cause_code"])
     if a.state == "offered":
         conversations.move(db, a, "withdraw", reason="cancelled")
@@ -231,20 +230,9 @@ def _failed(db: Connection, conv: Row, a: Row, result: str, hangup: dict, ended:
         conversations.move(db, a, "end", reason=result)
     for leg in {a.call_uuid, conv.call_uuid} - {ended, None}:
         _hang(db, conv, leg)
-    if conv.channel == "call":
-        C = T.conversation
-        conv = db.execute(update(C).where(C.c.id == conv.id).values(result=result).returning(*C.c)).one()
-    _ended(db, conv, hangup, a, result)
-
-
-def _ended(db: Connection, conv: Row, hangup: dict, a: Row, result: str | None = None) -> None:
-    """The call is over: a call closes its conversation; one joined to a text conversation only tells call.ended, from
-    the number the call was dialed from."""
-    if conv.channel == "call":
-        flow.finish_call(db, conv, hangup, a.agent_id)
-    else:
-        call = (conv.routing.get("lead_from", conv.ours), conv.routing.get("lead_to", conv.customer))
-        conversations.call_ended(db, conv, hangup, a.agent_id, result, call)
+    C = T.conversation
+    conv = db.execute(update(C).where(C.c.id == conv.id).values(result=result).returning(*C.c)).one()
+    flow.finish_call(db, conv, hangup, a.agent_id)
 
 
 def status(tenant: Row, form: dict, c: UUID, aid: UUID | None = None) -> Response:
@@ -253,16 +241,15 @@ def status(tenant: Row, form: dict, c: UUID, aid: UUID | None = None) -> Respons
     that says it answered, makes the call live; its end tells call.ended, or fails a call it never answered."""
     call_uuid, event = form.get("CallUUID", ""), form.get("EventName", "Hangup")
     with tx() as db:
-        if (conv := mpc.find_conv(db, tenant, c)) is None or (a := _agent(db, conv, aid)) is None:
+        if (conv := mpc.find_conv(db, tenant, c)) is None or (a := mpc.dialed(db, conv, aid)) is None:
+            conversations.hang_dial(db, conv, aid, "customer", call_uuid if event != "Hangup" else None)
             return Response()
         if a.state == "offered" or call_uuid == a.call_uuid:
             if not _up(conv) and a.state in ("offered", "active"):  # not once a move has let the agent go
                 by = "system" if a.state == "offered" else "agent"
                 _failed(db, conv, a, "cancelled", flow.hangup_facts(form, by), call_uuid)
             elif conv.channel != "call" and a.state == "active" and event == "Hangup":
-                conversations.move(db, a, "end")
-                _hang(db, conv, conv.call_uuid)
-                _ended(db, conv, flow.hangup_facts(form, "agent"), a)
+                conversations.end_joined(db, a, flow.hangup_facts(form, "agent"))
             return Response()
         if conv.call_uuid is None and call_uuid:
             conv = _bind(db, conv, call_uuid)
@@ -279,8 +266,7 @@ def status(tenant: Row, form: dict, c: UUID, aid: UUID | None = None) -> Respons
             if conv.channel == "call":
                 flow.finish_call(db, conv, flow.hangup_facts(form, by))
             else:
-                conversations.move(db, a, "end")
-                _ended(db, conv, flow.hangup_facts(form, by), a)
+                conversations.end_joined(db, a, flow.hangup_facts(form, by))
     return Response()
 
 
@@ -293,13 +279,17 @@ def _consent(tenant: Row, p: dict) -> dict:
 
 
 def _done(p: dict, reply: dict) -> None:
-    """The agent's dial keeps its Make Call's request id, which cancels it while the agent rings; the lead's leg is
-    bound from the reply unless a status bound it first."""
+    """The agent's dial keeps its Make Call's request id, which cancels it while the agent rings, and cancels it now
+    for a dial that ended first; the lead's leg is bound from the reply unless a status bound it first."""
     with tx() as db:
         conv = conversations.lock(db, UUID(p["conversation_id"]))
         if "assignment_id" in p:
-            conversations.edit(db, UUID(p["assignment_id"]), ring=reply["request_uuid"])
-        elif conv.call_uuid is None and p["room"] == conv.room and (calls := reply.get("calls")):
+            a = conversations.edit(db, UUID(p["assignment_id"]), ring=(ring := reply["request_uuid"]))
+            if a and a.state not in conversations.ON:
+                plivo.command(db, "cancel", str(a.id), {"tenant_id": p["tenant_id"], "request_uuid": ring})
+        elif (calls := reply.get("calls")) and conv.channel != "call" and not mpc.dialed(db, conv, p.get("dial")):
+            conversations.hang_dial(db, conv, p.get("dial"), "customer", calls[0]["call_uuid"])
+        elif conv.call_uuid is None and p["room"] == conv.room and calls:
             _bind(db, conv, calls[0]["call_uuid"])
         _check_later(db, p)
 
@@ -321,7 +311,7 @@ def _lost(p: dict, refused: plivo.Refused | None = None) -> None:
                 access.refused(db, refused, p.get("claim"))
             if ((conv := conversations.lock(db, cid)).call_uuid, conv.room) != (seen.call_uuid, seen.room):
                 continue
-            a = _agent(db, conv, p.get("assignment_id"))
+            a = mpc.dialed(db, conv, p.get("assignment_id"))
             if a is None or p.get("room", conv.room) != conv.room:
                 return
             answered = "assignment_id" in p and a.state != "offered"
@@ -335,9 +325,14 @@ def _unknown(p: dict) -> None:
         _check_later(db, p)
 
 
+def _key(p: dict) -> str:
+    """The agent's dial and its lead's are sent and checked apart. A text or task conversation's later dials share
+    it, so there the lead's are keyed by their dial."""
+    return p.get("assignment_id") or (f"{p['dial']}:customer" if "dial" in p else p["conversation_id"])
+
+
 def _check_later(db: Connection, p: dict) -> None:
-    """The agent's dial and its lead's are checked apart."""
-    jobs.schedule(db, "dial_check", p, delay=p["check"], key=p.get("assignment_id", p["conversation_id"]))
+    jobs.schedule(db, "dial_check", p, delay=p["check"], key=_key(p))
 
 
 jobs.handler("dial_check", lane="plivo")(lambda job: _lost(job.payload))

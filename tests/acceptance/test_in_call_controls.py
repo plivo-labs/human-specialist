@@ -1527,8 +1527,105 @@ def test_a_second_participant_holds_the_caller_and_the_first_participant(world, 
         number, phone = lead(world)
         ok(act(tenant.api, live.id, "participants", {"target": {"type": "number", "number": number}}))
         legs.append(phone.wait_ring().wait_state("in_progress"))
+        world.wait(lambda: live.caller.held, what="the first participant's ring answered before the second is added")
+    world.run_jobs("plivo")
     world.wait(world.plivo.idle, what="the Plivo simulator to go idle")
     assert live.caller.held and legs[0].held and not legs[1].held
+
+
+def first_answer_late(world, tenant, live, *, hidden: bool = False):
+    """Two phone participants join while Plivo's answer to the first one's ring waits, until the second one's ring
+    holds the caller. Returns their participant ids and legs, and the faults to `release`: that answer, then with
+    `hidden` the first leg's own callbacks, so HS learns of the first leg only from the late answer."""
+    (first, one), (second, two) = lead(world), lead(world)
+
+    def about_the_first(r) -> bool:
+        return first[1:] in (r.params.get("To"), r.params.get("ParticipantCallTo"))
+
+    faults = [world.plivo.fault("stall", lambda r: r.params.get("to") == first, account=tenant.auth_id)]
+    if hidden:
+        faults.append(world.plivo.fault("delay", about_the_first, account=tenant.auth_id, times=math.inf))
+    ids, legs = [], []
+    for number, phone in ((first, one), (second, two)):
+        target = {"target": {"type": "number", "number": number}}
+        ids.append(ok(act(tenant.api, live.id, "participants", target))["participant_id"])
+        legs.append(phone.wait_ring().wait_state("in_progress"))
+        world.wait(world.plivo.idle, what="the Plivo simulator to go idle")
+    world.wait(lambda: live.caller.held, what="the second participant's ring holding the caller")
+    return ids, legs, faults
+
+
+def release(world, faults) -> None:
+    """Release each fault in turn, and let HS send what it does about each before the next."""
+    for fault in faults:
+        fault.release()
+        world.run_jobs("plivo")
+    world.wait(world.plivo.idle, what="the Plivo simulator to go idle")
+
+
+@pytest.mark.parametrize("seen", [True, False], ids=["first-leg-seen", "first-leg-unseen"])
+def test_a_first_participants_ring_answered_after_the_seconds_holds_the_first_and_not_the_second(world, tenant, seen):
+    live = connect(tenant)
+    _, legs, faults = first_answer_late(world, tenant, live, hidden=not seen)
+    release(world, faults)
+    assert live.caller.held and legs[0].held and not legs[1].held
+
+
+@pytest.mark.parametrize("leaves", ["hangs_up", "removed"])
+def test_a_participants_ring_answered_after_it_left_holds_only_the_caller(world, tenant, leaves):
+    live = connect(tenant)
+    ids, legs, faults = first_answer_late(world, tenant, live)
+    if leaves == "hangs_up":
+        legs[0].hangup()
+    else:
+        ok(tenant.api.delete(f"/api/v1/calls/{live.id}/participants/{ids[0]}"))
+    live.stream.wait_for("call.participant_removed", participant_id=ids[0])
+    release(world, faults)
+    assert live.caller.held and not legs[1].held
+
+
+def test_a_participants_ring_answered_after_the_agent_switched_to_it_keeps_it_off_hold(world, tenant):
+    live = connect(tenant)
+    ids, legs, faults = first_answer_late(world, tenant, live)
+    world.wait(lambda: legs[0].held, what="the second participant's ring holding the first")
+    ok(act(live.agent.api(), live.id, "switch", {"participant_id": ids[0]}))
+    release(world, faults)
+    assert (live.caller.held, legs[0].held, legs[1].held) == (True, False, True)
+
+
+def test_a_participants_ring_answered_after_a_warm_transfer_completed_leaves_the_caller_off_hold(world, tenant):
+    target = tenant.agent("Target").login()
+    live = connect(tenant)
+    number, phone = lead(world)
+    stalled = world.plivo.fault("stall", lambda r: r.params.get("to") == number, account=tenant.auth_id)
+    ok(act(tenant.api, live.id, "participants", {"target": {"type": "number", "number": number}}))
+    phone.wait_ring().wait_state("in_progress")
+    world.wait(world.plivo.idle, what="the Plivo simulator to go idle")
+    tid = ok(act(live.agent.api(), live.id, "transfers", {"mode": "warm", "target": to_agent(target)}))["transfer_id"]
+    target.phone.wait_ring().wait_state("in_progress")
+    live.stream.wait_for("call.transferred", conversation_id=live.id, status="accepted")
+    ok(act(live.agent.api(), live.id, f"transfers/{tid}/complete"))
+    live.stream.wait_for("call.transferred", conversation_id=live.id, status="completed")
+    world.wait(lambda: not live.caller.held, what="the caller off hold with the transfer's target")
+    release(world, [stalled])
+    assert not live.caller.held
+
+
+def test_a_participants_ring_answered_after_a_warm_consult_began_holds_only_the_caller(world, tenant):
+    target = tenant.agent("Target").login()
+    live = connect(tenant)
+    number, phone = lead(world)
+    stalled = world.plivo.fault("stall", lambda r: r.params.get("to") == number, account=tenant.auth_id)
+    ok(act(tenant.api, live.id, "participants", {"target": {"type": "number", "number": number}}))
+    extra = phone.wait_ring().wait_state("in_progress")
+    ok(act(live.agent.api(), live.id, "transfers", {"mode": "warm", "target": to_agent(target)}))
+    consult = target.phone.wait_ring().wait_state("in_progress")
+    world.wait(world.plivo.idle, what="the Plivo simulator to go idle")
+    world.wait(lambda: live.caller.held, what="the transfer's ring holding the caller")
+    stalled.release()
+    world.run_jobs("plivo")
+    world.wait(world.plivo.idle, what="the Plivo simulator to go idle")
+    assert (live.caller.held, extra.held, consult.held) == (True, False, False)
 
 
 @pytest.mark.parametrize("end", ["cancel", "no_answer", "decline"])

@@ -10,7 +10,7 @@ export type Ring = {
   fromagent?: string;
 };
 
-export type Phone = { answer: (uuid: string) => Promise<void>; reject: (uuid: string) => void; hangup: () => void; mute: (on: boolean) => void; login: (token: string) => void };
+export type Phone = { answer: (uuid: string) => Promise<void>; reject: (uuid: string) => void; mute: (on: boolean) => void; login: (token: string) => void };
 
 type Handlers = {
   state: (state: "ready" | "failed", why?: string) => void;
@@ -80,7 +80,6 @@ export async function startPhone(token: string, on: Handlers): Promise<Phone | n
         client.answer(id, "letring");
       }),
     reject: (id) => client.reject(id),
-    hangup: () => client.hangup(),
     mute: (muted) => (muted ? client.mute() : client.unmute()),
     login: (t) => client.loginWithAccessToken(t),
   };

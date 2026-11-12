@@ -76,7 +76,8 @@ def test_a_desk_stopped_before_a_redis_loss_goes_offline_40_s_after_redis_return
     world.travel_until_rebuilt()
     assert status_name(agent) == "Available", "Redis came back empty, so every desk signed in gets 40 s to beat"
     world.travel(41)
-    world.wait(lambda: status_name(agent) == "Offline", what="Offline once the 40 s after Redis returned ran out")
+    # The sweep runs every 15 s, so Offline can lag the jump by up to 15 s.
+    world.wait(lambda: status_name(agent) == "Offline", 20, "Offline once the 40 s after Redis returned ran out")
 
 
 def test_a_desk_beating_only_on_the_replica_stays_online_while_the_first_sweeps():

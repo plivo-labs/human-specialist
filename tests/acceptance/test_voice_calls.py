@@ -768,6 +768,35 @@ def test_a_call_joined_to_a_text_conversation_ends_without_closing_it(world, ten
     error(tenant.api.post("/api/v1/calls", json=body | {"agent_id": other.id}), 409, "conversation_not_joinable")
 
 
+def test_closing_a_text_conversation_while_its_call_is_on_ends_the_call(world, tenant):
+    agent = tenant.agent().login()
+    cid, stream = live_sms(world, tenant, agent)
+    phone = world.plivo.lead(CUSTOMER)
+    body = {"agent_id": agent.id, "to": CUSTOMER, "from": registered_number(tenant), "conversation_id": cid}
+    ok(tenant.api.post("/api/v1/calls", json=body))
+    leg = phone.wait_ring()
+    stream.wait_for("call.answered", conversation_id=cid)
+    ok(agent.api().post(f"/api/v1/conversations/{cid}/close"))
+    assert stream.wait_for("call.ended", conversation_id=cid)["data"]["ended_by"] == "system"
+    leg.wait_state("completed")
+    agent.phone.legs[-1].wait_state("completed")
+
+
+def test_closing_a_text_conversation_while_its_agents_phone_rings_cancels_the_call(world, tenant):
+    settings(tenant, ring_timeout_sec=120)
+    agent = tenant.agent().login()
+    cid, stream = live_sms(world, tenant, agent)
+    agent.phone.on_ring("ignore")
+    body = {"agent_id": agent.id, "to": CUSTOMER, "from": registered_number(tenant), "conversation_id": cid}
+    ok(tenant.api.post("/api/v1/calls", json=body))
+    ring = agent.phone.wait_ring()
+    world.wait(world.plivo.idle, what="Plivo's answer to the agent's dial to reach HS")
+    ok(agent.api().post(f"/api/v1/conversations/{cid}/close"))
+    assert ring.wait_state("completed").hangup_cause_code == 1000
+    assert stream.wait_for("call.failed", conversation_id=cid)["data"]["result"] == "cancelled"
+    assert stream.wait_for("call.ended", conversation_id=cid)["data"]["ended_by"] == "system"
+
+
 def test_an_agent_already_dialing_cannot_call_from_its_text_conversation(world, tenant):
     agent = tenant.agent().login()
     cid, _ = live_sms(world, tenant, agent)

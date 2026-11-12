@@ -106,6 +106,18 @@ test("a task holds a line from its accept, a callback's call takes the call card
   assert.equal(target.lines[0].consult, true);
 });
 
+test("a callback's line comes back from its call off hold, unmuted and recording", () => {
+  let s = reduce(init(me as any, [], []), { type: "line", cid: "c1", conv: conv("active", "primary", "callback", { via: "outbound" }) });
+  s = reduce(s, { type: "event", e: ev("call.held", { participant_id: null }) });
+  s = reduce(s, { type: "event", e: ev("call.recording_paused", {}) });
+  s = reduce(s, { type: "patch", cid: "c1", patch: { muted: true } });
+  s = reduce(s, { type: "event", e: ev("call.ended", {}) });
+  s = reduce(s, { type: "line", cid: "c1", conv: conv("active", "primary", "callback") });
+  const { held, muted, paused } = s.lines[0];
+  assert.deepEqual({ held, muted, paused }, { held: false, muted: false, paused: false }, "the next call starts clean");
+  assert.equal(stage(s).kind, "idle", "the callback outlives its call without a call card");
+});
+
 test("only a call whose wrap-up event says auto counts down to an auto wrap-up", () => {
   const auto = { ...me, settings: { agent_direct_dial: false, wrap_up: { mode: "auto" } } };
   const wrap = (mode: string | null, channel = "call") => {

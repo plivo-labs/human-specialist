@@ -215,10 +215,10 @@ def write(p: Principal, tenant_id=None) -> Iterator[Connection]:
         # The rest of this transaction reads config from Postgres: it sees its own writes, and nothing it read
         # outlives a rollback.
         db.info["memo"] = None
-        for kind in ("config_changed", "config_rounds"):
-            jobs.schedule(db, kind, {"tenant_id": str(tenant_id)}, key=str(tenant_id))
         after_commit(db, lambda: hot.changed(tenant_id))
         yield db
+        for kind in ("config_changed", "config_rounds"):  # job rows come last, after any presence or config row
+            jobs.schedule(db, kind, {"tenant_id": str(tenant_id)}, key=str(tenant_id))
 
 
 @jobs.handler("config_changed", backoff=(1,), parks=False)
@@ -341,7 +341,8 @@ def crud(
     @router.delete(f"{path}/{{{param}}}", status_code=204, summary=f"Delete {one_name}")
     def remove(rid: Id, p: Principal = ADMIN) -> Response:
         with write(p) as db:
-            row = found(db, p.tenant_id, kind, rid, lock=True)
+            # A status's agents' presence rows come before its own row (_status_deleted); the delete then locks it.
+            row = found(db, p.tenant_id, kind, rid, lock=kind != "status")
             if kind in _USERS:
                 _unused(db, p.tenant_id, kind, row.id)
             if on_delete:
@@ -369,11 +370,8 @@ def _skill_changed(db: Connection, p: Principal, now: m.SkillIn, row: Row) -> No
 def _status_changed(db: Connection, p: Principal, now: m.PresenceStatusIn, row: Row) -> None:
     if row.body.get("default") and now.availability != row.body["availability"]:
         raise ApiError(409, "status_default", "a default status keeps its availability")
-    if (
-        now.availability
-        and not row.body["availability"]
-        and tenant_settings(db, p.tenant_id).idle.status_id == str(row.id)
-    ):
+    turns_available = now.availability and not row.body["availability"]
+    if turns_available and tenant_settings(db, p.tenant_id).idle.status_id == str(row.id):
         raise ApiError(409, "status_in_use", "the idle status must stay unavailable")
 
 
@@ -407,9 +405,13 @@ def _fallback(db: Connection, tenant_id, available: bool) -> Row:
 
 def _status_deleted(db: Connection, p: Principal, row: Row) -> None:
     """A default status stays. Any other goes, and the agents in it, the sign-in and sign-out settings and the RONA
-    status that name it move to a default one."""
+    status that name it move to a default one. Every presence row of the tenant is locked first, in agent order, so
+    no agent moves into the status meanwhile; the status row is locked after them, by its delete, as a status change
+    takes presence before status."""
     if row.body.get("default"):
         raise ApiError(409, "status_default", "a default status cannot be deleted")
+    P = T.presence
+    db.execute(select(P.c.agent_id).where(P.c.tenant_id == p.tenant_id).order_by(P.c.agent_id).with_for_update())
     sid, s = str(row.id), tenant_settings(db, p.tenant_id)
     to = _fallback(db, p.tenant_id, row.body["availability"])
     moved = {k: None for k in ("sign_in", "sign_out") if getattr(s, k) and getattr(s, k).status_id == sid}
@@ -419,12 +421,8 @@ def _status_deleted(db: Connection, p: Principal, row: Row) -> None:
         moved["rona"] = s.rona.model_dump(mode="json") | {"status_id": str(to.id)}
     if moved:
         _store(db, p.tenant_id, **moved)
-    P = T.presence
-    # In agent order, presence before the route jobs, as a ring's end and a routing round take them.
-    moving = select(P.c.agent_id).where(P.c.status_id == row.id).order_by(P.c.agent_id).with_for_update()
-    agent_ids = db.execute(moving).scalars().all()
-    db.execute(update(P).where(P.c.status_id == row.id).values(status_id=to.id, since=func.now()))
-    for agent_id in agent_ids:
+    moving = update(P).where(P.c.status_id == row.id).values(status_id=to.id, since=func.now())
+    for agent_id in sorted(db.execute(moving.returning(P.c.agent_id)).scalars()):
         data = {
             "from_status": {"id": sid, "name": row.body["name"]},
             "to_status": {"id": str(to.id), "name": to.body["name"]},
@@ -664,24 +662,26 @@ def _one_number(db: Connection, p: Principal, number: str) -> Row:
 
 @router.put("/numbers/{number}", response_model=m.EntryPoint)
 def put_number(number: NumberPath, body: m.EntryPointIn, repoint: bool = True, p: Principal = ADMIN):
-    """Checks at Plivo that the number is the Plivo account's, points it at the tenant's application unless `repoint` is
-    false or the tenant has none, stores it. An email address, a sender of the tenant's agent emails, is stored as it
-    is."""
+    """Checks at Plivo that the number is the Plivo account's, stores it, then points it at the tenant's application
+    unless `repoint` is false or the tenant has none. A write that is refused changes nothing at Plivo; if Plivo
+    refuses the repoint, the number stays stored, and putting it again retries. An email address, a sender of the
+    tenant's agent emails, is stored as it is."""
+    digits, phone = number.removeprefix("+"), "@" not in number
     with read() as db:
         check(db, p, body)
         tenant = live_tenant(db, p.tenant_id)
-    if "@" not in number:
-        digits = number.removeprefix("+")
+    if phone:
         plivo.held(tenant, f"Number/{digits}/", "number")
-        if repoint and tenant.plivo_app_id:
-            plivo.rest(tenant, "POST", f"Number/{digits}/", app_id=tenant.plivo_app_id)
     C = T.config
     row = insert(C).values(tenant_id=p.tenant_id, kind="number", key=number, body=body.model_dump(mode="json"))
     keyed = {"index_elements": [C.c.tenant_id, C.c.kind, C.c.key], "index_where": C.c.key.isnot(None)}
     row = row.on_conflict_do_update(**keyed, set_={"body": row.excluded.body, "updated_at": func.now()})
     with write(p) as db:
         check(db, p, body)
-        return _number(db.execute(row.returning(C.c.id, C.c.key, C.c.body)).one())
+        stored = _number(db.execute(row.returning(C.c.id, C.c.key, C.c.body)).one())
+    if phone and repoint and tenant.plivo_app_id:
+        plivo.rest(tenant, "POST", f"Number/{digits}/", app_id=tenant.plivo_app_id)
+    return stored
 
 
 @router.get("/numbers", response_model=Page[m.EntryPoint])

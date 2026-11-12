@@ -1,17 +1,23 @@
+import threading
+import time
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
 import sqlalchemy
-from sqlalchemy import func, select, update
+from fastapi.testclient import TestClient
+from sqlalchemy import func, select, text, update
 
+from hs import access, core, jobs, routing
+from hs import app as service
 from hs import conversations as cv
-from hs import core, jobs, routing
 from hs.config import models as m
 from hs.core import T
 from hs.voice import flow, mpc
 from tests.unit.tenants import Tenant
+from tests.unit.test_config import held, waiter
 
 
 def joined(tenant: Tenant, conv, call_uuid: str, member: str) -> None:
@@ -364,3 +370,103 @@ def test_two_rings_to_one_number_read_its_alias_from_plivo_once(monkeypatch):
     row = SimpleNamespace(id=t.id)
     assert [mpc._number_alias(row, "+14155550100") for _ in range(2)] == ["", ""]
     assert reads == ["Number/14155550100/"]
+
+
+def test_a_failed_ring_of_several_legs_and_the_delete_of_its_rona_status_both_commit():
+    """Agent b moved to the RONA status while its offer rang; agent a meets the strikes when the ring fails. The delete
+    holds the tenant's presence rows while it waits to repoint the RONA setting; the ring's end waits for it."""
+    t, P = Tenant(), T.presence
+    a, b = t.agent(), t.agent()
+    with core.tx() as db:
+        brk = t.doc(db, "status", name="Break", availability=False, default=True)
+        lunch = t.doc(db, "status", name="Lunch", availability=False)
+        free = t.doc(db, "status", name="Ready", availability=True)
+        db.execute(update(P).where(P.c.agent_id == a).values(status_id=free, misses=1))
+        db.execute(update(P).where(P.c.agent_id == b).values(status_id=lunch))
+        rona = T.tenant.c.settings.concat({"rona": {"strikes": 1, "status_id": str(lunch)}})
+        db.execute(update(T.tenant).where(T.tenant.c.id == t.id).values(settings=rona))
+        key = access.new_key(db, t.id, ["admin"])["api_key"]
+    with core.tx() as db:
+        conv = cv.lock(db, t.open().id)
+        for agent in (a, b):
+            cv.offer(db, conv, agent)
+    api = TestClient(service.app, headers={"Authorization": f"Bearer {key}"}, raise_server_exceptions=False)
+
+    def ring_failed() -> None:
+        with core.tx() as db:
+            mpc._ended(db, cv.lock(db, conv.id), cv.rows(db, conv.id, ("offered",)), "miss", reason=mpc.FAILED)
+
+    tenant = select(T.tenant.c.id).where(T.tenant.c.id == t.id).with_for_update(key_share=True)
+    ready, release = Future(), threading.Event()
+    with ThreadPoolExecutor(3) as pool:
+        try:
+            pool.submit(held, tenant, ready, release)
+            deleting = pool.submit(api.delete, f"/api/v1/agent-statuses/{lunch}")
+            deleter = waiter(ready.result(5))
+            assert deleter, "the delete holds the presence rows and waits for the settings"
+            ending = pool.submit(ring_failed)
+            assert waiter(deleter), "the ring's end waits for the delete"
+        finally:
+            release.set()
+    ending.result()
+    assert deleting.result().status_code == 204
+    with core.read() as db:
+        assert db.execute(select(P.c.status_id).where(P.c.agent_id == b)).scalar() == brk
+
+
+def blocked(pid: int) -> bool:
+    """True once backend `pid` waits on a lock; False after 5 s."""
+    deadline, waits = time.monotonic() + 5, text("SELECT cardinality(pg_blocking_pids(:pid)) > 0")
+    with core.read() as db:
+        while time.monotonic() < deadline:
+            if db.execute(waits, {"pid": pid}).scalar():
+                return True
+            time.sleep(0.02)
+    return False
+
+
+def test_a_move_into_a_status_being_deleted_a_failed_ring_and_the_delete_all_commit():
+    """Agent b sorts first and sits in status s. Agent a is moved into s while a failed ring of both holds b's presence
+    and waits for a's, and the delete of s waits to repoint the RONA setting that names it, then for b's presence."""
+    t, P = Tenant(), T.presence
+    b, a = sorted((t.agent(), t.agent()), key=str)
+    with core.tx() as db:
+        brk = t.doc(db, "status", name="Break", availability=False, default=True)
+        lunch = t.doc(db, "status", name="Lunch", availability=False)
+        free = t.doc(db, "status", name="Ready", availability=True)
+        db.execute(update(P).where(P.c.agent_id == a).values(status_id=free))
+        db.execute(update(P).where(P.c.agent_id == b).values(status_id=lunch))
+        rona = T.tenant.c.settings.concat({"rona": {"strikes": 0, "status_id": str(lunch)}})
+        db.execute(update(T.tenant).where(T.tenant.c.id == t.id).values(settings=rona))
+        key = access.new_key(db, t.id, ["admin"])["api_key"]
+    with core.tx() as db:
+        conv = cv.lock(db, t.open().id)
+        for agent in (a, b):
+            cv.offer(db, conv, agent)
+    api = TestClient(service.app, headers={"Authorization": f"Bearer {key}"}, raise_server_exceptions=False)
+    ending_pid = Future()
+
+    def ring_failed() -> None:
+        with core.tx() as db:
+            ending_pid.set_result(db.exec_driver_sql("SELECT pg_backend_pid()").scalar())
+            mpc._ended(db, cv.lock(db, conv.id), cv.rows(db, conv.id, ("offered",)), "miss", reason=mpc.FAILED)
+
+    tenant = select(T.tenant.c.id).where(T.tenant.c.id == t.id).with_for_update(key_share=True)
+    ready, release = Future(), threading.Event()
+    with ThreadPoolExecutor(4) as pool:
+        try:
+            pool.submit(held, tenant, ready, release)
+            deleting = pool.submit(api.delete, f"/api/v1/agent-statuses/{lunch}")
+            deleter = waiter(ready.result(5))
+            assert deleter, "the delete waits for the settings"
+            moving = pool.submit(api.put, f"/api/v1/agents/{a}/status", json={"status_id": str(lunch)})
+            assert waiter(deleter), "the move waits for the delete"
+            ending = pool.submit(ring_failed)
+            assert blocked(ending_pid.result(5)), "the ring's end waits"
+        finally:
+            release.set()
+    ending.result()
+    assert (deleting.result().status_code, moving.result().status_code) == (204, 200)
+    with core.read() as db:
+        now = dict(db.execute(select(P.c.agent_id, P.c.status_id).where(P.c.agent_id.in_([a, b]))).all())
+    assert now == {a: free, b: brk}

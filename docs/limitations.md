@@ -19,7 +19,8 @@ These are out of scope. Where a part is yours to build, the API, the event strea
 - Tested loads at the top of the API's bounds. A queue's capacity up to 10,000, retries up to 10 and a wait up to 86,400 s are what the API accepts, not loads the test suite runs, and Plivo may end a call before a long wait does.
 - Rate limiting of the API. Put a rate limiter at your ingress.
 - Keeping a call alive through a browser refresh.
-- Call controls on a call placed for a callback or a task. Hold, transfer, recording and hangup through the API answer 409 `call_not_live` for such a call; the reference desk ends it through the softphone.
+- A ring that outlives its call. When Plivo does not confirm the cancel of an outbound call's ring, an agent's phone can ring on after the call ended, until its ring timeout. An answer then is refused.
+- Transfers, participants and supervisors on a call placed for a callback, a task or a text conversation. Such a call takes hold, recording and hangup; a transfer, a participant or a monitor answers 409 `call_joined`.
 - SMS and WhatsApp on live Plivo. The text path is tested against a simulated Plivo, not yet with live messages.
 - Calls in the seconds after a Redis loss. Until the sweep rebuilds a tenant's hot state, up to about 15 seconds, a call that arrives answers 503 and Plivo ends it unless the number has a fallback answer URL.
 - Sign-in limits per client behind a proxy you have not named. The limit of failed sign-ins per client address counts the address the service sees. Behind a proxy or load balancer that is the proxy's, so every client shares one limit until you set `FORWARDED_ALLOW_IPS` to the proxy's address, as [API](api.md#auth) describes.
