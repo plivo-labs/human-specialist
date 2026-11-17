@@ -23,7 +23,7 @@ match words:
     case ["projects", "describe", _]:
         sys.stdout.write("123456789012\n")
     case ["redis", "instances", "get-auth-string", _]:
-        sys.stdout.write(state.get("auth", "6d0b4b6e-0f5c-4ab0-9b1e-1f2d3c4b5a69") + "\n")
+        sys.stdout.write(state.get("auth", "stub-auth-string") + "\n")
     case ["secrets", "versions", "access", "1"]:
         sys.stdout.write(state["secrets"][flags["secret"]])
     case ["secrets", "versions", "describe", "1"] if flags["secret"] not in state["secrets"]:

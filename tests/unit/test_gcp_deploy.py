@@ -108,7 +108,7 @@ def test_a_first_run_makes_everything_then_deploys_one_instance_that_migrates_be
     redis = next(c for c in calls if c[:3] == ["redis", "instances", "create"])
     assert "--redis-config=maxmemory-policy=noeviction" in redis and "--enable-auth" in redis
     secrets = now["secrets"]
-    assert secrets["human-specialist-redis-url"] == "redis://:6d0b4b6e-0f5c-4ab0-9b1e-1f2d3c4b5a69@10.0.0.3:6379/0"
+    assert secrets["human-specialist-redis-url"] == "redis://:stub-auth-string@10.0.0.3:6379/0"
     password = now["passwords"]["human-specialist/hs"]
     assert secrets["human-specialist-database-url"] == (
         f"postgresql://hs:{password}@/hs?host=/cloudsql/demo:us-central1:human-specialist"
