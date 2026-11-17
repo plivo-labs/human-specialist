@@ -10,7 +10,11 @@ human-specialist is an open-source contact-center engine for human agents on Pli
 
 [What you need](#what-you-need) · [Deploy](#deploy) · [Quick start](#quick-start) · [What it does](#what-it-does) · [Build your own desk](#build-your-own-desk) · [Docs](#docs)
 
-https://github.com/user-attachments/assets/c624aa17-7604-4e5d-ba02-0f04b19c409e
+<table align="center"><tr><td width="640">
+
+https://github.com/user-attachments/assets/74d0166e-64fd-47e2-a712-2fb09faee028
+
+</td></tr></table>
 
 ## What you need
 
