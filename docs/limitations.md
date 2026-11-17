@@ -9,7 +9,7 @@ These are out of scope. Where a part is yours to build, the API, the event strea
 - Agents on a plain phone number. An agent takes calls on the Plivo Browser SDK or a SIP endpoint.
 - A chat widget or socket, an email provider, or a media store. Your gateway opens a chat or email conversation at `POST /api/v1/queues/{id}/enqueue`, sends its later customer messages to `POST /api/v1/messages`, and agent replies on those channels go out as `message.sent` events for your gateway to deliver.
 - Managing WhatsApp templates. Create, edit and delete them at Plivo; HS lists them and checks a message against them.
-- Bots or AI. The service never calls a bot and stores no bot transcript. A bot hands a call or a contact over with `POST /queues/{id}/enqueue` and its `context`.
+- Bots or AI. The service never calls a bot, never fetches a transcript and opens no conversation for a bot's run. A bot hands a call or a contact over with `POST /queues/{id}/enqueue`, its `context` and its `transcript`, which HS keeps for the agent who takes over, not as a record of the bot's run.
 - Exporting recordings in bulk. List them with `GET /recordings` and fetch each signed `audio_url`.
 - Long-lived file links in the content export. A Plivo-hosted file's link is the signed media URL the message API returns, valid for 5 minutes; read the message again for a fresh one.
 - Transfers recorded before HS kept a record of each one. The content export reads such a transfer from the stints it started: a transfer to a queue, a menu, voicemail or a URL, or one no one took, has no row, and a transfer to a team reads as one to the agent who took it.
@@ -22,6 +22,7 @@ These are out of scope. Where a part is yours to build, the API, the event strea
 - A ring that outlives its call. When Plivo does not confirm the cancel of an outbound call's ring, an agent's phone can ring on after the call ended, until its ring timeout. An answer then is refused.
 - Transfers, participants and supervisors on a call placed for a callback, a task or a text conversation. Such a call takes hold, recording and hangup; a transfer, a participant or a monitor answers 409 `call_joined`.
 - SMS and WhatsApp on live Plivo. The text path is tested against a simulated Plivo, not yet with live messages.
+- Keypad tones on live Plivo. An agent's seat relays its digits to the call's room, which is tested against a simulated Plivo, not yet on a live call to an IVR.
 - Calls in the seconds after a Redis loss. Until the sweep rebuilds a tenant's hot state, up to about 15 seconds, a call that arrives answers 503 and Plivo ends it unless the number has a fallback answer URL.
 - Sign-in limits per client behind a proxy you have not named. The limit of failed sign-ins per client address counts the address the service sees. Behind a proxy or load balancer that is the proxy's, so every client shares one limit until you set `FORWARDED_ALLOW_IPS` to the proxy's address, as [API](api.md#auth) describes.
 - Calls across a session renewal on real telephony. A call still in progress when the desk renews its session, and the next call that rings after it, are tested only against a simulated softphone, not yet with real telephony.

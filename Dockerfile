@@ -8,14 +8,25 @@ COPY LICENSE README.md ./
 COPY src ./src
 RUN uv sync --locked --no-dev --no-editable
 
+# Static files, the same on every platform, so this stage runs natively and never under emulation. A builder
+# without BuildKit sets no BUILDPLATFORM, and an empty --platform fails the build.
+FROM --platform=${BUILDPLATFORM:-linux/amd64} node:26-alpine AS ui
+WORKDIR /ui
+COPY ui/package.json ui/package-lock.json ui/.npmrc ./
+RUN npm ci
+COPY ui ./
+RUN npm run build
+
 FROM python:3.13-slim
 # Debian 13 moved the legacy zone names (Asia/Calcutta, Europe/Kiev) out of tzdata; browsers still offer them.
 RUN apt-get update && apt-get install -y --no-install-recommends tzdata-legacy && rm -rf /var/lib/apt/lists/* \
     && useradd --system --home-dir /app hs
 WORKDIR /app
 COPY --from=build /app/.venv ./.venv
-COPY LICENSE alembic.ini ./
+COPY LICENSE alembic.ini deploy/migrate-and-serve deploy/heroku ./
 COPY alembic ./alembic
+# A derived image that wants no UI deletes /app/ui.
+COPY --from=ui /ui/dist ./ui
 ENV PATH="/app/.venv/bin:$PATH"
 USER hs
 EXPOSE 6004

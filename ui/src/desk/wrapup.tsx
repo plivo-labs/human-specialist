@@ -2,9 +2,9 @@ import { useState } from "react";
 import { asAgent } from "../api";
 import { go } from "../shell";
 import { clock } from "../format";
-import { Button, Field, Select, Textarea, act } from "../ui";
+import { Button, Field, Select, Textarea, Timeline, act } from "../ui";
 import type { Ctx } from "./desk";
-import { type Line, autoWrap } from "./state";
+import { type Line, autoWrap, thread } from "./state";
 
 export function WrapUp({ ctx, line }: { ctx: Ctx; line: Line }) {
   const { s, now, loadLine } = ctx;
@@ -61,6 +61,7 @@ export function WrapUp({ ctx, line }: { ctx: Ctx; line: Line }) {
           </Select>
         </Field>
       )}
+      {!!line.conv.notes?.length && <Timeline rows={thread([], [], () => "", line.conv.notes)} />}
       <Field label={chosen?.note_required ? "Wrap-up notes (required)" : "Wrap-up notes"}>
         <Textarea value={note} onChange={(e) => setNote(e.target.value)} required={chosen?.note_required} placeholder="Key notes about the conversation" />
       </Field>

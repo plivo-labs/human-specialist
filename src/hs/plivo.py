@@ -180,9 +180,9 @@ def rest(tenant: Row, method: str, path: str, *, timeout_sec: float = TIMEOUT, *
     raise Refused(422, "plivo_refused", "Plivo refused the request", details)
 
 
-def listed(tenant, path: str) -> Iterator[dict]:
-    """Every object Plivo lists at `path`, a page of 20 at a time."""
-    for offset in itertools.count(0, 20):
+def listed(tenant, path: str, start: int = 0) -> Iterator[dict]:
+    """Plivo lists at most 20 objects a page."""
+    for offset in itertools.count(start, 20):
         objects = rest(tenant, "GET", path, limit=20, offset=offset).get("objects", [])
         yield from objects
         if len(objects) < 20:

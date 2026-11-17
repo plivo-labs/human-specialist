@@ -21,6 +21,7 @@ from tests.acceptance.conftest import (
     fence,
     fresh_second,
     hang_up_with_the_room_alive,
+    held_until_exit,
     hs_header,
     lead,
     menu,
@@ -1667,6 +1668,33 @@ def test_a_warm_consult_that_ends_without_a_hand_over_leaves_the_caller_held_unt
         leg.hangup()
     leg.wait_state("completed")
     resumed_by_the_agent(world, live)
+
+
+@pytest.mark.parametrize("first", ["lead", "target"])
+def test_a_lead_who_hangs_up_during_a_warm_consult_ends_the_call_for_both_agents(world, tenant, first):
+    target = tenant.agent("Target").login()
+    desk = tenant.stream(token=target.stream_token, after=0)
+    agent, cid, stream, customer = answered_outbound(tenant)
+    ok(act(agent.api(), cid, "transfers", {"mode": "warm", "target": to_agent(target)}))
+    leg = target.phone.wait_ring().wait_state("in_progress")
+    world.wait(lambda: leg.mpc == customer.mpc, what="the consult in the lead's room")
+    world.wait(world.plivo.idle, what="the consult's join answered")
+    if first == "target":
+        held_until_exit(world, tenant, leg)
+    customer.hangup()
+    stream.wait_for("conversation.wrap_up_started", conversation_id=cid, agent_id=agent.id)
+    leg.wait_state("completed")
+    agent.phone.legs[0].wait_state("completed")
+    world.wait(world.plivo.idle, what="every leg's end delivered")
+    fence(tenant)
+    ended = [e for e in tenant.events(type="call.ended") if e["conversation_id"] == cid]
+    assert [(e["agent_id"], e["data"]["ended_by"]) for e in ended] == [(agent.id, "customer")]
+    error(act(target.api(), cid, "hangup"), 409, "call_not_live")
+    desk.wait_for("call.participant_removed", conversation_id=cid, agent_id=target.id)
+    told = [e for e in tenant.events(type="call.participant_removed") if e["conversation_id"] == cid]
+    assert [(e["agent_id"], e["data"]["reason"]) for e in told] == [
+        (target.id, "removed" if first == "lead" else "left")
+    ]
 
 
 @pytest.mark.parametrize("mode", ["cold", "warm"])

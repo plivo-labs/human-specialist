@@ -10,6 +10,7 @@ Environment variables only. With Docker Compose, copy `docker/.env.example` to `
 | `DB_MAX_OVERFLOW` | no | `10` | Extra database connections a replica opens when every pooled one is busy, closed again once returned, at least 0; a negative value, which SQLAlchemy reads as unlimited, stops the start |
 | `PUBLIC_BASE_URL` | yes | | Absolute http or https URL with a host, and optionally a port or a path prefix, that reaches this service on port 6004; Plivo calls it back. Startup refuses anything else |
 | `HS_OPERATOR_KEY` | yes | | Bearer key for the operator routes (`/api/v1/tenants`), 32 bytes or more |
+| `HS_SETUP_PLIVO_AUTH_ID` | no | empty | The Plivo Auth ID that may register the first tenant with no operator key; see [The first registration](#the-first-registration) |
 | `HS_SECRET_KEY` | yes | | Key material for Plivo tokens and webhook secrets at rest and for signed URLs, 32 bytes or more |
 | `SEARCH_URL` | no | empty | Base URL of an OpenSearch node for conversation search. Empty means search reads Postgres |
 | `PLIVO_API_URL` | no | `https://api.plivo.com` | Plivo REST host (the test simulator overrides it) |
@@ -19,7 +20,7 @@ Environment variables only. With Docker Compose, copy `docker/.env.example` to `
 | `WEBHOOK_PRIVATE_HOSTS` | no | empty | Hosts whose webhooks may use http or a private address (local receivers) |
 | `METRICS_PORT` | no | `9100` | Prometheus metrics port; `0` turns it off. `docker/compose.yaml` does not publish it; uncomment its line there to scrape it |
 | `LOG_LEVEL` | no | `INFO` | Log level |
-| `PORT` | no | `6004` | Host port `docker/compose.yaml` publishes the service on; the service itself always listens on 6004 |
+| `PORT` | no | `6004` | Host port `docker/compose.yaml` publishes the service on. The service listens on 6004, or on `PORT` when `/app/migrate-and-serve` or `/app/heroku web` starts it |
 
 Both keys must be at least 32 bytes, or the start fails. Generate them with `openssl rand -base64 32`, and keep a copy of `HS_SECRET_KEY`. Without it, the stored Plivo tokens and webhook secrets cannot be decrypted.
 
@@ -30,6 +31,16 @@ Plivo must be able to reach the service, so `PUBLIC_BASE_URL` has to be a public
 HS calls Plivo's REST API from its own host. A Plivo account can limit API access to the IP addresses it lists. Plivo then answers 403 to any other host, and HS reports `plivo_refused` with Plivo's reason.
 
 The service keeps its tables in the Postgres schema `hs`, and its hot state in Redis.
+
+`DATABASE_URL` may leave the password out. libpq then reads it from `PGPASSWORD`, which a platform can fill from its secret store. The image runs uvicorn, which also reads its options from `UVICORN_` variables. Behind a load balancer, set `UVICORN_TIMEOUT_KEEP_ALIVE` to more seconds than the balancer's idle timeout; at uvicorn's default of 5, the balancer can send a request on a connection uvicorn just closed, and answer 502.
+
+## The first registration
+
+`POST /api/v1/tenants` takes the operator key. An install whose deploy names its owner's Plivo account sets `HS_SETUP_PLIVO_AUTH_ID` to that account's Auth ID, so the owner needs no key. While the setting is set and no tenant was ever registered, a deleted one included, the route also takes a request with no credential, for that Auth ID only. Any other Auth ID answers 401, the same answer as a request with no credential when the setting is empty. HS then checks the Auth Token with Plivo, as for every registration, so only the holder of that account's token can register it. Two such requests at once register one tenant, and the other answers 409 `tenant_exists`. One client address, an IPv6 one by its /64, gets 10 such tries in 15 minutes; after that it answers 429 `too_many_attempts`, before HS asks Plivo, until the window ends. The operator key is not limited. Setup ends at the first tenant row, and a request that passed the check before that row committed may still complete, beside a tenant the operator registered. Once a tenant exists, the setting has no effect: another tenant, a new key for a tenant and re-applying Plivo URLs take the operator key.
+
+While setup lasts, `GET /status` answers `"setup": true` beside `"db": true`, so a console knows before the person submits whether to ask for the operator key; otherwise the field is absent. It tells anyone who asks that the install has no tenant yet and takes a registration with no key. A request with no credential already tells that much, since during setup an invalid body answers 422 instead of 401. It names no Auth ID, and a registration still needs that account's Auth Token.
+
+`name` is optional in every registration. Without it the tenant takes the name Plivo's reply gives the account when HS checks the credentials, or the Auth ID when Plivo gives none. `PATCH /api/v1/tenants/{id}` renames it.
 
 ## Size the database connections
 
@@ -63,9 +74,11 @@ One benchmark run held 200 concurrent calls across 10 tenants and 280 agents. Tw
 | HS CPU per replica, p95 | 35% of its vCPU |
 | Errors | no 5xx, no retries, no deadlocks |
 
-This is a single-machine run against a simulator, with no real carrier latency. Treat it as evidence that the design holds at that load, and size your own deployment for your traffic: replicas, `DB_POOL_SIZE` and Postgres `max_connections` (see above).
+In that run the agents' desks only listened to the event stream. In a second run every desk also read its conversation again on each event, as the reference console does: about 30,000 more reads over the run. Answer took 167 ms and accept 174 ms at p99, HS CPU reached 54% of a replica's vCPU at p95, and there was no 5xx, retry or deadlock. Count that load in if your agents use the reference console.
 
-Two limits sit outside that run, which spreads its arrivals:
+Both runs were on a single machine against a simulator, with no real carrier latency. Treat them as evidence that the design holds at that load, and size your own deployment for your traffic: replicas, `DB_POOL_SIZE` and Postgres `max_connections` (see above).
+
+Two limits sit outside those runs, which spread their arrivals:
 
 - Enqueues into one queue take that queue's lock in turn, each through its first offer round. About 50 calls arriving into one queue at the same instant wait 1 to 2 s on that machine. An enqueue that waits past Postgres's 3 s `lock_timeout` answers 503, and Plivo retries the answer URL a second later.
 - Conversation reports aggregate one stored row per conversation. Over 90 days of a tenant at 200 concurrent calls, about 2 million conversations, the bucketed reports took a median of 1.4 to 2.5 s, single runs up to 4 s, and under heavy database load they can reach the 5 s statement timeout. That test data carried no dispositions or handle times, so reports that group by them may take longer on real data. Narrow the window or add filters.

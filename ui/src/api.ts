@@ -37,7 +37,7 @@ export async function api<T = unknown>(method: string, path: string, body?: unkn
   if (res.status === 401 && bearer && bearer === held().key) {
     const why = "This organization key no longer works. Sign in with a current one.";
     hold({ key: null, signedOut: why });
-    if (!held().session) location.hash = "/signin";
+    if (!held().session) location.assign("/signin");
     throw new ApiError(401, data?.error?.code ?? "unauthorized", why);
   }
   if (res.status === 401 && bearer === held().session?.agent_token) reloadToSignIn();
@@ -78,8 +78,7 @@ export const hold = (c: { key?: string | null; session?: Session | null; signedO
 const ENDED = "Your session ended, so calls no longer ring here. Sign in again.";
 export function reloadToSignIn(why: string | null = ENDED) {
   hold({ session: null, signedOut: why });
-  location.hash = "/signin";
-  location.reload();
+  location.assign("/signin");
 }
 
 export async function signOut() {

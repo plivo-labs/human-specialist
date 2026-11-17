@@ -123,6 +123,38 @@ def test_a_silent_desk_is_swept_offline_and_a_beating_one_stays_on():
     assert beat(silent.tokens.agent_token) == 204 and silent.presence().status_id == silent.offline
 
 
+def silent_on_break(desk: Desk, db) -> uuid.UUID:
+    """The desk signs in, falls silent, and its agent goes on Break, in `db`."""
+    hot.rebuilt(desk.tenant)
+    assert [beat(desk.tokens.agent_token) for _ in range(2)] == [204, 204]
+    core.redis.delete(hot.HB % (desk.tenant, desk.agent))
+    on_break = desk.doc(db, "status", {"name": "Break", "availability": False})
+    db.execute(update(T.presence).where(T.presence.c.agent_id == desk.agent).values(status_id=on_break))
+    return on_break
+
+
+def test_a_sweep_schedules_no_sign_out_for_a_silent_desk_on_break():
+    desk = Desk()
+    with core.tx() as db:
+        silent_on_break(desk, db)
+        jobs.schedule(db, "sweep", {}, key="sweep")
+    jobs.run_now("sweep", "sweep", wait=True)
+    J = T.jobs
+    with core.read() as db:
+        assert db.execute(select(J.c.id).where(J.c.kind == "agent_offline", J.c.key == str(desk.agent))).first() is None
+
+
+def test_a_sign_out_scheduled_before_its_agent_went_on_break_leaves_break_and_the_beat_count():
+    desk = Desk()
+    with core.tx() as db:
+        jobs.schedule(
+            db, "agent_offline", {"tenant_id": str(desk.tenant), "agent_id": str(desk.agent)}, key=str(desk.agent)
+        )
+        on_break = silent_on_break(desk, db)
+    jobs.run_now("agent_offline", str(desk.agent), wait=True)
+    assert desk.presence().status_id == on_break and core.redis.exists(hot.BEATS % (desk.tenant, desk.agent))
+
+
 def test_a_process_killed_between_the_sign_in_beat_and_its_commit_leaves_the_next_beat_to_sign_in():
     desk = Desk()
     mine = {"Authorization": f"Bearer {desk.tokens.agent_token}"}

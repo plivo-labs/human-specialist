@@ -15,7 +15,10 @@ from sqlalchemy import event, func, insert, select, text, update
 
 from hs import access, config, core, hot, jobs, plivo
 from hs import app as service
+from hs import conversations as cv
+from hs.config import models as m
 from hs.core import T
+from hs.voice import flow
 
 
 def admin() -> tuple[uuid.UUID, TestClient]:
@@ -24,6 +27,14 @@ def admin() -> tuple[uuid.UUID, TestClient]:
         tenant_id = db.execute(tenant.returning(T.tenant.c.id)).scalar()
         key = access.new_key(db, tenant_id, ["admin"])["api_key"]
     return tenant_id, TestClient(service.app, headers={"Authorization": f"Bearer {key}"})
+
+
+def test_an_address_longer_than_any_real_one_is_refused_before_its_pattern_runs(monkeypatch):
+    assert m.address("email", "a" * 308 + "@example.com") == "a" * 308 + "@example.com"
+    monkeypatch.setattr(m.re, "fullmatch", lambda *a: pytest.fail("the pattern ran on an overlong address"))
+    for long in ("a" * 309 + "@example.com", "a@" + "a." * 16000 + "."):
+        with pytest.raises(ValueError, match="not an address of email"):
+            m.address("email", long)
 
 
 def test_deleting_a_team_or_skill_takes_it_off_every_queue_and_agent_that_names_it():
@@ -127,6 +138,84 @@ def test_a_write_naming_a_team_that_is_being_deleted_waits_for_the_delete_and_is
         naming = text("SELECT count(*) FROM config WHERE tenant_id = :t AND body->'teams' ? :team")
         assert db.execute(naming, {"t": tenant_id, "team": team}).scalar() == 0
     assert calls == ([] if kind == "queues" else [("POST", "Endpoint/"), ("DELETE", "Endpoint/e1/")])
+
+
+def test_a_call_overflowing_into_a_queue_whose_id_sorts_first_and_the_delete_of_a_team_both_name_both_commit():
+    """Queue a is disabled and overflows into queue b, whose id sorts first; both name team t. The call pauses right
+    after it locks a, the delete of t then waits for a, and the call goes on into b."""
+    tenant_id, api = admin()
+    hot.rebuilt(tenant_id)
+    b, a = sorted((uuid.uuid4(), uuid.uuid4()), key=str)
+    with core.tx() as db:
+        db.execute(update(T.tenant).where(T.tenant.c.id == tenant_id).values(settings={"rona": {"status_id": str(b)}}))
+    with core.tx() as db:
+        team = config.add(db, tenant_id, "team", {"name": "T"}).id
+        over = {"enabled": False, "overflow_action": {"type": "queue", "queue_id": str(b)}}
+        for q, more in ((b, {}), (a, over)):
+            config.add(db, tenant_id, "queue", m.QueueIn(name="Q", teams=[team], **more).model_dump(mode="json"), id=q)
+        parties = {"direction": "inbound", "customer": "+15550001", "ours": "+15550002"}
+        cid = cv.open(db, tenant_id, channel="call", call_uuid=uuid.uuid4().hex, **parties).id
+    paused, release, caller = Future(), threading.Event(), []
+
+    def pause(conn, cursor, statement, *_) -> None:
+        if (
+            threading.get_ident() in caller
+            and "hs.config" in statement
+            and "FOR UPDATE" in statement
+            and not paused.done()
+        ):
+            paused.set_result(cursor.connection.get_backend_pid())
+            release.wait(10)
+
+    def call() -> list:
+        caller.append(threading.get_ident())
+        with core.tx() as db:
+            return flow.run(db, cv.lock(db, cid), {"type": "queue", "queue_id": str(a)}, True)
+
+    event.listen(core.engine, "after_cursor_execute", pause)
+    try:
+        with ThreadPoolExecutor(2) as pool:
+            try:
+                calling = pool.submit(call)
+                pid = paused.result(5)
+                deleting = pool.submit(api.delete, f"/api/v1/teams/{team}")
+                assert waiter(pid), "the delete waits for the queue the call holds"
+            finally:
+                release.set()
+    finally:
+        event.remove(core.engine, "after_cursor_execute", pause)
+    assert calling.result()[0][2].startswith(f"hs-{cid}-") and deleting.result().status_code == 204
+    E = T.events
+    with core.read() as db:
+        conv = db.execute(select(T.conversation).where(T.conversation.c.id == cid)).one()
+        told = select(E.c.type, E.c.data["queue_id"].astext).where(E.c.conversation_id == str(cid)).order_by(E.c.id)
+        told = [t for t in db.execute(told).all() if t[0] != "conversation.started"]
+    assert (conv.state, conv.queue_id) == ("queued", b)
+    assert told == [("conversation.overflowed", str(a)), ("conversation.queued", str(b))]
+
+
+def test_two_queue_writes_that_close_a_ring_together_take_turns_and_the_second_is_refused():
+    """Each write is loop-free alone. Holding a's row pauses the write to a under the tenant's config lock, so the
+    write to b waits for that lock and then reads a's overflow."""
+    _, api = admin()
+    a, b = (api.post("/api/v1/queues", json={"name": n}).json()["id"] for n in "AB")
+
+    def overflow(q: str, to: str):
+        return api.patch(f"/api/v1/queues/{q}", json={"overflow_action": {"type": "queue", "queue_id": to}})
+
+    ready, release = Future(), threading.Event()
+    with ThreadPoolExecutor(3) as pool:
+        pool.submit(held, select(T.config.c.id).where(T.config.c.id == a).with_for_update(), ready, release)
+        try:
+            holder = ready.result(5)
+            first = pool.submit(overflow, a, b)
+            writer = waiter(holder)
+            second = pool.submit(overflow, b, a)
+            assert writer and waiter(writer)
+        finally:
+            release.set()
+    assert first.result().status_code == 200
+    assert second.result().json()["error"]["code"] == "overflow_loop"
 
 
 def test_holders_of_a_tenants_config_share_it_and_a_config_write_waits_for_them():

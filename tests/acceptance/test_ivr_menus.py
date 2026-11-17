@@ -318,7 +318,7 @@ def test_a_voicemail_mailbox_queue_blocks_its_delete(tenant):
 def test_a_menu_or_queue_only_its_own_action_names_can_be_deleted(tenant):
     m, q = menu(tenant, {"1": hangup_action()}), tenant.queue(name="Loop")
     ok(tenant.api.patch(f"/api/v1/menus/{m['id']}", json={"options": {"1": {"type": "menu", "menu_id": m["id"]}}}))
-    ok(tenant.api.patch(f"/api/v1/queues/{q['id']}", json={"overflow_action": queue_action(q)}))
+    ok(tenant.api.patch(f"/api/v1/queues/{q['id']}", json={"dtmf_actions": {"1": queue_action(q)}}))
     assert tenant.api.delete(f"/api/v1/menus/{m['id']}").status_code == 204
     assert tenant.api.delete(f"/api/v1/queues/{q['id']}").status_code == 204
 

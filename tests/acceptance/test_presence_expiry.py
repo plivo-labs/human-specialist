@@ -3,7 +3,7 @@ expired session does not touch a call in progress. Liveness holds across a Redis
 
 import contextlib
 
-from tests.acceptance.conftest import activity, connect, error, ok
+from tests.acceptance.conftest import activity, connect, error, ok, set_status, settings
 from tests.harness import World
 
 
@@ -24,6 +24,60 @@ def test_a_swept_agent_needs_two_quick_pings_to_come_back(tenant):
     assert status_name(agent) == "Offline"
     agent.heartbeat()
     tenant.world.wait(lambda: status_name(agent) == "Available", what="Available after the second ping")
+
+
+def changes(tenant, agent) -> list[str]:
+    return [
+        e["data"]["to_status"]["name"] for e in tenant.events(type="agent.status_changed") if e["agent_id"] == agent.id
+    ]
+
+
+def test_an_agent_on_break_keeps_it_when_its_desk_comes_back_after_a_silence(tenant):
+    agent = tenant.agent().login()
+    agent.set_status("Break")
+    before = changes(tenant, agent)
+    agent.stop_pinging()
+    for _ in range(3):
+        agent.heartbeat()
+    assert status_name(agent) == "Break"
+    assert changes(tenant, agent) == before, "neither the silence nor the return changes the status"
+
+
+def test_a_silent_desk_on_break_that_is_set_available_is_signed_out_by_the_next_sweep(world, tenant):
+    agent = tenant.agent().login()
+    agent.set_status("Break")
+    agent.stop_pinging()
+    ok(set_status(tenant, agent, "Available"))
+    world.travel(15)
+    world.wait(lambda: status_name(agent) == "Offline", 20, "Offline once a sweep finds the silent desk available")
+
+
+def test_with_another_sign_out_status_only_break_survives_a_silence_and_offline_signs_in_as_before(world):
+    tenant = world.new_tenant("Elsewhere")
+    out = ok(tenant.api.post("/api/v1/agent-statuses", json={"name": "Signed out", "availability": False}))
+    settings(tenant, sign_out={"status_id": out["id"]})
+    desks = {name: tenant.agent(name=name).login() for name in ("Break", "Signed out", "Offline")}
+    for name, agent in desks.items():
+        agent.set_status(name)
+        agent.stop_pinging()
+        agent.heartbeat()
+        agent.heartbeat()
+    assert {name: status_name(agent) for name, agent in desks.items()} == {
+        "Break": "Break",
+        "Signed out": "Available",
+        "Offline": "Available",
+    }
+
+
+def test_a_new_session_signs_in_an_agent_on_break_whose_desk_fell_silent(tenant):
+    agent = tenant.agent().login()
+    agent.set_status("Break")
+    agent.stop_pinging()
+    agent.login(available=False)
+    agent.heartbeat()
+    assert status_name(agent) == "Break"
+    agent.heartbeat()
+    assert status_name(agent) == "Available"
 
 
 def test_a_desk_that_beats_too_slowly_is_reset_before_each_second_ping_and_never_recovers(tenant):

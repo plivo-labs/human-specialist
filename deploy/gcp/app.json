@@ -1,0 +1,16 @@
+{
+  "name": "human-specialist",
+  "env": {
+    "HS_SETUP_PLIVO_AUTH_ID": {
+      "description": "Auth ID of the Plivo account that registers the first organization"
+    }
+  },
+  "options": {
+    "port": 6004
+  },
+  "hooks": {
+    "precreate": {
+      "commands": ["./precreate.sh"]
+    }
+  }
+}

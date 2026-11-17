@@ -1417,6 +1417,18 @@
             ],
             "title": "Disposition Id"
           },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What the agent wrote at wrap-up.",
+            "title": "Note"
+          },
           "skipped": {
             "title": "Skipped",
             "type": "boolean"
@@ -1700,6 +1712,21 @@
             ],
             "title": "State",
             "type": "string"
+          },
+          "transcript": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/Turn"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The bot's turns before the handoff, as sent.",
+            "title": "Transcript"
           },
           "unread_count": {
             "default": 0,
@@ -11018,6 +11045,34 @@
         "title": "Page[Named]",
         "type": "object"
       },
+      "Page_PlivoNumber_": {
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/PlivoNumber"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "data",
+          "next_cursor"
+        ],
+        "title": "Page[PlivoNumber]",
+        "type": "object"
+      },
       "Page_PresenceStatus_": {
         "properties": {
           "data": {
@@ -11577,6 +11632,25 @@
           "expires_at"
         ],
         "title": "PlivoLogin",
+        "type": "object"
+      },
+      "PlivoNumber": {
+        "properties": {
+          "number": {
+            "title": "Number",
+            "type": "string"
+          },
+          "routed": {
+            "description": "Whether the tenant routes it: PUT /numbers/{number} stored its entry point.",
+            "title": "Routed",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "number",
+          "routed"
+        ],
+        "title": "PlivoNumber",
         "type": "object"
       },
       "PresenceStatus": {
@@ -16214,10 +16288,18 @@
             "title": "Fallback Answer Url"
           },
           "name": {
-            "maxLength": 200,
-            "minLength": 1,
-            "title": "Name",
-            "type": "string"
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Left out, the name Plivo gives the account, else its Auth ID.",
+            "title": "Name"
           },
           "plivo_app": {
             "default": true,
@@ -16237,7 +16319,6 @@
           }
         },
         "required": [
-          "name",
           "plivo_auth_id",
           "plivo_auth_token"
         ],
@@ -16851,6 +16932,44 @@
           "status"
         ],
         "title": "Transferred",
+        "type": "object"
+      },
+      "Turn": {
+        "additionalProperties": false,
+        "description": "One turn of the conversation a bot had with the customer before it handed over.",
+        "properties": {
+          "at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "At"
+          },
+          "role": {
+            "enum": [
+              "customer",
+              "bot"
+            ],
+            "title": "Role",
+            "type": "string"
+          },
+          "text": {
+            "maxLength": 4000,
+            "minLength": 1,
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "role",
+          "text"
+        ],
+        "title": "Turn",
         "type": "object"
       },
       "ValidationError": {
@@ -18040,7 +18159,7 @@
   },
   "info": {
     "title": "human-specialist",
-    "version": "0.2.0"
+    "version": "1.0.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -19234,7 +19353,7 @@
     },
     "/api/v1/calls/{cid}/hangup": {
       "post": {
-        "description": "The agent leaves the call, as when its phone hangs up; a tenant key leaves as the primary. An agent with a\nstint of its own that is not the primary's ends only its own leg. The primary's connected warm consult takes\nthe caller. Otherwise the call is torn down: the primary's leg ends first, so an outage there leaves the call as\nit was, then every other leg, and call.ended reads ended_by agent. A retry, or HS on its own, finishes a teardown\nan outage or a refusal cut short, whoever is on the call by then, and sends again each leg Plivo has not confirmed\ngone. A call that is over, or that the teardown handed back, is 409 until a queue takes it again. A call joined to\na text or task conversation ends as when its agent's phone hangs up, whoever sends it: its agent's leg is hung\nup, and a dial still ringing its agent, or still being placed, is cancelled now.",
+        "description": "The agent leaves the call, as when its phone hangs up; a tenant key leaves as the primary. An agent with a\nstint of its own that is not the primary's ends only its own leg. The primary's connected warm consult takes\nthe caller. Otherwise the call is torn down: the primary's leg ends first, so an outage there leaves the call as\nit was, then every other leg, and call.ended reads ended_by agent. A retry, or HS on its own, finishes a teardown\nan outage or a refusal cut short, whoever is on the call by then, and sends again each leg Plivo has not confirmed\ngone. A call that is over, or that the teardown handed back, is 409 until a queue takes it again. A dial whose\nagent's phone has not answered, still ringing or still being placed, ends now when its own agent or a caller\nwho controls the call sends it: the call fails as cancelled and the agent is free. A call joined to a text or\ntask conversation ends as when its agent's phone hangs up: its agent's leg is hung up.",
         "operationId": "post_calls_cid_hangup",
         "parameters": [
           {
@@ -21404,6 +21523,7 @@
     },
     "/api/v1/conversations/{conversation_id}/timeline": {
       "get": {
+        "description": "A key and a supervisor read every event of the conversation. An agent reads it once it took the conversation\nas primary, or while it is on it, and gets what its stream sends it, by the same rules. A page may hold fewer\nevents than `limit`, or none, and still carry a `next_cursor`: follow it until it is null.",
         "operationId": "get_conversations_conversation_id_timeline",
         "parameters": [
           {
@@ -22479,7 +22599,7 @@
     },
     "/api/v1/me/heartbeat": {
       "post": {
-        "description": "Presence: the second beat of a session applies the sign-in status; 40 s without one sets Offline. An HS\nagent token is checked by the beat itself; a plugin's credential is resolved first.",
+        "description": "Presence: the second beat of a session applies the sign-in status, and 40 s without one applies the sign-out\nstatus to an available agent, each unless the tenant's settings switch it off; the second beat after the desk\ncomes back signs in again. An agent on Break keeps it, and the same session coming back within the 2 h HS keeps\nits count is no sign-in. An HS agent token is checked by the beat itself; a plugin's credential is resolved\nfirst.",
         "operationId": "post_me_heartbeat",
         "requestBody": {
           "content": {
@@ -23166,6 +23286,70 @@
         "summary": "List Numbers"
       }
     },
+    "/api/v1/numbers/available": {
+      "get": {
+        "description": "The phone numbers on the tenant's Plivo account, in Plivo's order, each with whether the tenant routes it.\nRouting one is a choice the caller makes with PUT /numbers/{number}.",
+        "operationId": "get_numbers_available",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_PlivoNumber_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Default Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Available Numbers"
+      }
+    },
     "/api/v1/numbers/{number}": {
       "delete": {
         "operationId": "delete_numbers_number",
@@ -23704,6 +23888,20 @@
                         "minLength": 1,
                         "title": "To",
                         "type": "string"
+                      },
+                      "transcript": {
+                        "anyOf": [
+                          {
+                            "items": {
+                              "$ref": "#/components/schemas/Turn"
+                            },
+                            "type": "array"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Transcript"
                       }
                     },
                     "required": [
@@ -23849,6 +24047,20 @@
                         "pattern": "^\\+[1-9]\\d{6,14}$",
                         "title": "To",
                         "type": "string"
+                      },
+                      "transcript": {
+                        "anyOf": [
+                          {
+                            "items": {
+                              "$ref": "#/components/schemas/Turn"
+                            },
+                            "type": "array"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Transcript"
                       }
                     },
                     "required": [
@@ -26347,7 +26559,7 @@
         "summary": "List Tenants"
       },
       "post": {
-        "description": "Registers a Plivo account, or a sub-account, by its Auth ID and Auth Token. Checks the credentials with Plivo,\npoints a new Plivo application at HS unless `plivo_app` is false, and seeds the tenant.",
+        "description": "Registers a Plivo account, or a sub-account, by its Auth ID and Auth Token. Checks the credentials with Plivo,\nwhose reply names the tenant when the body does not, points a new Plivo application at HS unless `plivo_app` is\nfalse, and seeds the tenant. Without the operator key while setup lasts, only the Plivo account\nHS_SETUP_PLIVO_AUTH_ID names, 10 tries from one client in 15 minutes.",
         "operationId": "post_tenants",
         "requestBody": {
           "content": {
@@ -27971,7 +28183,7 @@
     },
     "/plivo/{tenant_id}/actions/queue-exit": {
       "post": {
-        "description": "The caller left room `r` on Plivo's side. Plivo retries an exit whose answer it never got, and the exit has\nmoved the caller on by then, so the first answer is kept per call and room and a retry gets it again.",
+        "description": "The caller left room `r` on Plivo's side. Plivo retries an exit whose answer it never got, and the exit has\nmoved the caller on by then, so the first answer is kept per call and room and a retry gets it again. Plivo\nnames the call ParticipantCallUUID here, and sends no CallUUID.",
         "operationId": "post_plivo_tenant_id_actions_queue_exit",
         "parameters": [
           {
@@ -28133,7 +28345,7 @@
     },
     "/plivo/{tenant_id}/call-status": {
       "post": {
-        "description": "A ringing leg's progress binds it to its offer; its end before a join declines or misses the offer by Plivo's\ncause code, kept on the offer. A joined leg's end is its leave, whether or not the room's exit event comes.",
+        "description": "A ringing leg's progress binds it to its offer; its end before a join declines or misses the offer by Plivo's\ncause code, kept on the offer. A joined leg's end is its leave, whether or not the room's exit event comes. A\nmissed offer's leg ending frees its slot.",
         "operationId": "post_plivo_tenant_id_call_status",
         "parameters": [
           {
@@ -28473,7 +28685,7 @@
     },
     "/status": {
       "get": {
-        "description": "Liveness for load balancers: only booleans, never exception text or hosts.",
+        "description": "Liveness for load balancers: only booleans, never exception text or hosts. `setup` is true while a registration\nneeds no operator key, so a console knows before it asks for one.",
         "operationId": "get_status",
         "responses": {
           "200": {

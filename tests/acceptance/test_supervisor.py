@@ -11,6 +11,7 @@ from tests.acceptance.conftest import (
     fence,
     fresh_second,
     hang_up_with_the_room_alive,
+    held_until_exit,
     hs_header,
     lead,
     ok,
@@ -328,6 +329,23 @@ def test_the_agents_api_hangup_takes_a_listening_supervisor_off_and_the_after_ag
         x.wait_state("completed")
     world.wait(lambda: "Please rate your call" in live.caller.said, what="the after-agent action")
     assert live.stream.wait_for("supervisor.left", conversation_id=live.id)["agent_id"] == sup.id
+
+
+@pytest.mark.parametrize("first", ["caller", "supervisor"])
+def test_a_listening_supervisor_is_told_it_left_once_when_the_caller_hangs_up(world, tenant, first):
+    live, sup = floor(tenant)
+    desk = tenant.stream(token=sup.stream_token, after=0)
+    ok(monitor(sup.api(), live, mode="listen"))
+    leg = joined_leg(sup, live)
+    world.wait(world.plivo.idle, what="the supervisor's join answered")
+    if first == "supervisor":
+        held_until_exit(world, tenant, leg)
+    live.caller.hangup()
+    live.stream.wait_for("conversation.wrap_up_started", conversation_id=live.id)
+    world.wait(world.plivo.idle, what="every leg's end delivered")
+    fence(tenant)
+    assert desk.wait_for("supervisor.left", conversation_id=live.id)["data"]["supervisor_id"] == sup.id
+    assert [e["agent_id"] for e in tenant.events(type="supervisor.left") if e["conversation_id"] == live.id] == [sup.id]
 
 
 def test_the_agents_api_hangup_hands_the_caller_back_when_the_rooms_end_reaches_hs_before_its_exit(

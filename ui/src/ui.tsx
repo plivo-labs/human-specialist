@@ -8,16 +8,21 @@ import {
   type InputHTMLAttributes,
   type ReactNode,
   type SelectHTMLAttributes,
+  type SyntheticEvent,
   type TextareaHTMLAttributes,
+  cloneElement,
   createContext,
+  isValidElement,
   useContext,
   useEffect,
+  useId,
   useRef,
   useState,
   useSyncExternalStore,
 } from "react";
 import { type Page as Paged, reason } from "./api";
-import { cap, time } from "./format";
+import { cap, dialable, time } from "./format";
+import type { Turn } from "./types";
 
 export const cls = (...c: (string | false | null | undefined)[]) => c.filter(Boolean).join(" ");
 
@@ -73,6 +78,10 @@ const control = "w-full rounded-sm border bg-background px-3 py-1 text-p-400 tra
 
 export const Input = ({ className, ...p }: InputHTMLAttributes<HTMLInputElement>) => <input {...p} className={cls(control, "h-9", className)} />;
 
+export const PhoneInput = ({ className, onChange, ...p }: InputHTMLAttributes<HTMLInputElement>) => (
+  <Input inputMode="tel" placeholder="+14155550100" pattern="\+\d{6,15}" title="A plus sign, then the country code and number" {...p} className={cls("font-mono", className)} onChange={(e) => ((e.target.value = dialable(e.target.value)), onChange?.(e))} />
+);
+
 function SearchBox({ value, onChange, icon, placeholder = "Search by name..." }: { value: string; onChange: (v: string) => void; icon?: boolean; placeholder?: string }) {
   return (
     <span className="relative w-64">
@@ -93,20 +102,30 @@ export const Textarea = ({ className, ...p }: TextareaHTMLAttributes<HTMLTextAre
   <textarea rows={3} {...p} className={cls(control, "min-h-20 py-2", className)} />
 );
 
+// A browser draws an open select's list inside the page: Radix's scroll lock cancels wheel events over it,
+// and its Escape handler closes the whole dialog.
+const ownScroll = (e: SyntheticEvent) => e.stopPropagation();
+export const keepSheetOnEscape = (e: KeyboardEvent) => e.key === "Escape" && e.target instanceof HTMLOptionElement && e.stopPropagation();
+
 export const Select = ({ className, ...p }: SelectHTMLAttributes<HTMLSelectElement>) => (
   <span className={cls("relative block", className)}>
-    <select {...p} className={cls(control, "h-9 appearance-none pr-8")} />
+    <select {...p} onWheel={ownScroll} onTouchMove={ownScroll} className={cls(control, "h-9 appearance-none pr-8")} />
     <ChevronDown className="pointer-events-none absolute right-3 top-2.5 size-4 opacity-50" aria-hidden />
   </span>
 );
 
-export const Field = ({ label, hint, children }: { label: string; hint?: ReactNode; children: ReactNode }) => (
-  <label className="grid gap-1.5">
-    <span className="text-s-500 text-secondary">{label}</span>
-    {children}
-    {hint && <span className="text-s-400 text-muted-foreground">{hint}</span>}
-  </label>
-);
+export function Field({ label, hint, children }: { label: string; hint?: ReactNode; children: ReactNode }) {
+  const id = useId();
+  return (
+    <div className="grid gap-1.5">
+      <label className="grid gap-1.5">
+        <span className="text-s-500 text-secondary">{label}</span>
+        {hint && isValidElement<{ "aria-describedby"?: string }>(children) ? cloneElement(children, { "aria-describedby": id }) : children}
+      </label>
+      {hint && <span id={id} className="text-s-400 text-muted-foreground">{hint}</span>}
+    </div>
+  );
+}
 
 export const Badge = ({ warn, children }: { warn?: boolean; children: ReactNode }) => (
   <span className={cls("inline-flex shrink-0 items-center rounded-sm px-2 py-0.5 font-mono text-xs-400", warn ? "bg-warning text-warning-foreground" : "bg-muted text-foreground")}>{children}</span>
@@ -240,14 +259,17 @@ export function Listed<T>({
   return load.data.length ? children(load.data) : empty;
 }
 
-type Row = { id: string; at: string; text: string; side?: "inbound" | "outbound"; note?: string };
-const BUBBLE = { inbound: "justify-self-start border", outbound: "justify-self-end bg-muted" };
+type Row = { id: string; at: string; text: string; side?: "inbound" | "outbound" | "note"; note?: string };
+const BUBBLE = { inbound: "justify-self-start border", outbound: "justify-self-end bg-muted", note: "justify-self-center border border-dashed" };
+const SAID = { inbound: "Customer: ", outbound: "Agent: ", note: "Note: " };
+const bubble = "max-w-[80%] whitespace-pre-wrap break-words rounded-sm px-3 py-2 text-p-400";
+const marker = "rounded-sm bg-muted p-2 font-mono text-xs-400 text-secondary";
 export const Timeline = ({ rows, start }: { rows: Row[]; start?: boolean }) => (
   <ol className={cls("grid justify-items-center py-4", rows.some((r) => r.side) ? "gap-3" : "gap-10")}>
-    {start && <li className="rounded-sm bg-muted p-2 font-mono text-xs-400 text-secondary">Start of the conversation</li>}
+    {start && <li className={marker}>Start of the conversation</li>}
     {rows.map((r) => (
-      <li key={r.id} className={r.side ? cls("max-w-[80%] whitespace-pre-wrap break-words rounded-sm px-3 py-2 text-p-400", BUBBLE[r.side]) : "text-center text-xs-400 text-secondary"}>
-        {r.side && <span className="sr-only">{r.side === "inbound" ? "Customer: " : "Agent: "}</span>}
+      <li key={r.id} className={r.side ? cls(bubble, BUBBLE[r.side]) : "text-center text-xs-400 text-secondary"}>
+        {r.side && <span className="sr-only">{SAID[r.side]}</span>}
         {r.text}
         <span className={cls(r.side && "block text-xs-400 text-tertiary")}>
           {!r.side && <span aria-hidden> • </span>}
@@ -259,15 +281,29 @@ export const Timeline = ({ rows, start }: { rows: Row[]; start?: boolean }) => (
   </ol>
 );
 
+export const Handoff = ({ turns }: { turns?: Turn[] | null }) =>
+  turns?.length ? (
+    <ol aria-label="Before the handoff" className="grid justify-items-center gap-3 border-b border-dashed py-4">
+      <li className={marker}>Before the handoff</li>
+      {turns.map((t, i) => (
+        <li key={i} className={cls(bubble, BUBBLE[t.role === "bot" ? "outbound" : "inbound"])}>
+          <span className="block text-xs-400 text-secondary">{t.role === "bot" ? "Bot" : "Customer"}</span>
+          {t.text}
+          {t.at && <time dateTime={t.at} className="block text-xs-400 text-tertiary">{time(t.at)}</time>}
+        </li>
+      ))}
+    </ol>
+  ) : null;
+
 export function Tile({ title, when, icon, line, active, href, children }: { title: string; when?: string; icon: ReactNode; line: string; active?: boolean; href?: string; children?: ReactNode }) {
   const Tag = href ? "a" : "div";
   return (
-    <Tag href={href} aria-current={active || undefined} className={cls("group relative grid gap-1 rounded-sm p-2 hover:bg-hv1", active && "bg-muted hover:bg-muted")}>
-      <span className="flex items-center justify-between gap-2">
+    <Tag href={href} aria-current={active || undefined} className={cls("group relative grid min-w-0 gap-1 rounded-sm p-2 hover:bg-hv1", active && "bg-muted hover:bg-muted")}>
+      <span className="flex min-w-0 items-center justify-between gap-2">
         <span className="truncate text-p-400">{title}</span>
         {when && <span className="shrink-0 text-xs-400 text-tertiary">{when}</span>}
       </span>
-      <span className="flex items-center gap-1 text-xs-400 text-tertiary [&_svg]:size-4 [&_svg]:shrink-0 [&_svg]:text-brand">
+      <span className="flex min-w-0 items-center gap-1 text-xs-400 text-tertiary [&_svg]:size-4 [&_svg]:shrink-0 [&_svg]:text-brand">
         {icon}
         <span className={cls("truncate", active && "text-primary")}>{line}</span>
       </span>
@@ -568,11 +604,11 @@ export function EditForm<B>({ what, row, body, save, remove, warn, left, reload,
     <Form
       changes
       className={className}
-      onSubmit={async (f) => {
+      onSubmit={async (f, form) => {
         const b = body(f);
         const w = warn?.(b);
         if (w && w[0] !== armed?.[0]) return setArmed(w);
-        done(await act(row ? `Saving the ${what}` : `Adding the ${what}`, () => save(b), `${cap(what)} ${row ? "saved" : "added"}`));
+        done(await act(row ? `Saving the ${what}` : `Adding the ${what}`, () => save(b).catch((e) => onField(form, e)), `${cap(what)} ${row ? "saved" : "added"}`));
       }}
     >
       <div className="grid content-start gap-5">
@@ -590,9 +626,26 @@ export function EditForm<B>({ what, row, body, save, remove, warn, left, reload,
   );
 }
 
+const fieldOf = (e: unknown) => (e as { field?: string } | null)?.field;
+
+// A field `name=value` is the control of that name holding that value now: repeated rows share their names.
+function onField(form: HTMLFormElement, e: unknown): never {
+  const name = fieldOf(e);
+  const [n, value] = name?.split("=") ?? [];
+  const field = value === undefined ? n && form.elements.namedItem(n) : [...form.elements].find((x) => (x as HTMLInputElement).name === n && (x as HTMLInputElement).value === value);
+  if (field instanceof HTMLInputElement || field instanceof HTMLSelectElement) {
+    field.setCustomValidity((e as Error).message);
+    field.reportValidity();
+  } else if (name) delete (e as { field?: string }).field;
+  throw e;
+}
+
 export function Rows<T>({ label, items, blank, add, children }: { label: string; items: T[]; blank: T; add: string; children: (item: T) => ReactNode }) {
   const [rows, setRows] = useState(() => items.map((item, key) => ({ key, item })));
   const next = useRef(items.length);
+  const { shift } = useContext(Pending);
+  const moved = rows.length !== items.length || rows.some((r, i) => r.key !== i);
+  useEffect(() => (moved ? (shift(1), () => shift(-1)) : undefined), [moved]);
   return (
     <fieldset className="grid gap-2">
       <legend className="pb-1.5 text-s-500 text-secondary">{label}</legend>
@@ -621,28 +674,29 @@ export const Toggle = ({ label, ...p }: InputHTMLAttributes<HTMLInputElement> & 
 
 export const Tabs = (p: ComponentProps<typeof RTabs.Root>) => <RTabs.Root {...p} onValueChange={(v) => (clearErrors(), p.onValueChange?.(v))} />;
 export const TabPanel = RTabs.Content;
-export const TabList = ({ children, label }: { children: ReactNode; label: string }) => (
-  <RTabs.List aria-label={label} className="flex w-full items-center gap-4 border-b">
+export const TabList = ({ children, label, fill }: { children: ReactNode; label: string; fill?: boolean }) => (
+  <RTabs.List aria-label={label} className={cls("flex w-full items-center border-b", fill ? "[&>*]:flex-1" : "gap-6")}>
     {children}
   </RTabs.List>
 );
 export const Tab = ({ value, children }: { value: string; children: ReactNode }) => (
   <RTabs.Trigger
     value={value}
-    className="-mb-px border-b-2 border-transparent p-2 text-s-500 text-muted-foreground transition-colors hover:text-foreground data-[state=active]:border-primary data-[state=active]:text-foreground"
+    className="-mb-px border-b-2 border-transparent py-2 text-s-500 text-muted-foreground transition-colors hover:text-foreground data-[state=active]:border-primary data-[state=active]:text-foreground"
   >
     {children}
   </RTabs.Trigger>
 );
 
-const Pending = createContext({ busy: false, idle: false });
+const Pending = createContext({ busy: false, idle: false, shift: (_: number) => {} });
 export function Form({ onSubmit, children, className, changes }: { onSubmit: (data: FormData, form: HTMLFormElement) => Promise<unknown>; children: ReactNode; className?: string; changes?: boolean }) {
   const [busy, setBusy] = useState(false);
   const [dirty, setDirty] = useState(false);
+  const [moved, setMoved] = useState(0);
   return (
     <form
       className={cls("grid gap-5", className)}
-      onChange={() => setDirty(true)}
+      onChange={(e) => (setDirty(true), (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) && e.target.setCustomValidity(""))}
       onSubmit={(e: FormEvent<HTMLFormElement>) => {
         e.preventDefault();
         const form = e.currentTarget;
@@ -650,7 +704,7 @@ export function Form({ onSubmit, children, className, changes }: { onSubmit: (da
         onSubmit(new FormData(form), form).finally(() => setBusy(false));
       }}
     >
-      <Pending.Provider value={{ busy, idle: !!changes && !dirty }}>{children}</Pending.Provider>
+      <Pending.Provider value={{ busy, idle: !!changes && !dirty && !moved, shift: (n) => setMoved((m) => m + n) }}>{children}</Pending.Provider>
     </form>
   );
 }
@@ -681,7 +735,7 @@ export async function act<T>(label: string, run: () => Promise<T>, done: string 
     setTimeout(() => drop(id), 4000);
     return r ?? (true as T);
   } catch (e) {
-    publish(toasts.map((t) => (t.id === id ? { id, kind: "error", text: `${label} failed. ${reason(e)}` } : t)));
+    publish(fieldOf(e) ? toasts.filter((t) => t.id !== id) : toasts.map((t) => (t.id === id ? { id, kind: "error", text: `${label} failed. ${reason(e)}` } : t)));
     return undefined;
   }
 }

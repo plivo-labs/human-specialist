@@ -9,11 +9,11 @@ import threading
 import time
 from collections.abc import Callable
 from datetime import datetime, timedelta
-from functools import cache
+from functools import cache, partial
 
 from prometheus_client import Counter
-from sqlalchemy import Interval, and_, bindparam, case, delete, func, literal_column, or_, select, text, update
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import Interval, and_, bindparam, case, column, delete, func, literal_column, or_, select, text, update
+from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.engine import Connection, Row
 
 from hs.core import CONTROL_LANE, CONTROL_RESERVE, ApiError, T, read, settings, tx
@@ -83,12 +83,32 @@ def schedule(
     db.execute(_scheduling(key is not None, at is not None, rev is not None), params)
 
 
+def schedule_last(db: Connection, kind: str, payload: dict, *, key: str) -> None:
+    """`schedule` at COMMIT, in one statement that upserts the rows in key order, before the Redis writes, so these
+    job rows are locked after the transaction's other locks and none waits on them while holding them. The last
+    payload for a kind and key wins. Never call it from a before-commit hook: a call after the flush is lost. A
+    savepoint's rollback does not withdraw it: the row is still written."""
+    if not (last := db.info["tx"].setdefault("last", {})):
+        db.info["before_commit"].insert(0, partial(_schedule_all, db, last))
+    last[kind, key] = payload
+
+
+def _schedule_all(db: Connection, last: dict) -> None:
+    rows = [{"kind": k, "lane": _lanes[k], "key": x, "payload": p} for (k, x), p in sorted(last.items())]
+    db.execute(_scheduling(True, False, False, True), {"j_rows": rows, "j_delay": timedelta()})
+
+
 # The statements a call runs most are built once: SQLAlchemy keeps a built statement's cache key.
 @cache
-def _scheduling(keyed: bool, at: bool, fenced: bool):
-    J = T.jobs
+def _scheduling(keyed: bool, at: bool, fenced: bool, many: bool = False):
+    J, cols = T.jobs, ("kind", "lane", "key", "payload")
     when = bindparam("j_at", type_=J.c.run_at.type) if at else func.now() + bindparam("j_delay", type_=Interval)
-    row = insert(J).values(**{c: bindparam(f"j_{c}") for c in ("kind", "lane", "key", "payload")}, run_at=when)
+    row = insert(J).values(**{c: bindparam(f"j_{c}") for c in cols}, run_at=when)
+    if many:  # the elements of one JSON array, in its order: psycopg2 would send an executemany upsert row by row
+        rows = func.jsonb_array_elements(bindparam("j_rows", type_=JSONB))
+        v = rows.table_valued(column("value", JSONB), with_ordinality="i").render_derived()
+        values = [v.c.value[c] if c == "payload" else v.c.value[c].astext for c in cols]
+        row = insert(J).from_select([*cols, "run_at"], select(*values, when).order_by(v.c.i))
     if not keyed:
         return row
     claimed = case((J.c.payload.has_key("refused"), 0), else_=func.least(J.c.attempts, 1))

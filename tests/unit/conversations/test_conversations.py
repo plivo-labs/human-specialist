@@ -343,7 +343,7 @@ def test_a_customer_gone_with_no_agent_closes_now_with_the_mapped_system_disposi
     assert withdrawn.data["offer_id"] == str(a.id) and withdrawn.data["reason"] == "caller_left"
     [closed] = world.events("conversation.closed")
     system = {"agent_id": None, "disposition_id": str(world.dropped), "sub_disposition_id": None, "system": True}
-    system |= {"disposition": "Dropped", "sub_disposition": None, "skipped": False}
+    system |= {"disposition": "Dropped", "sub_disposition": None, "skipped": False, "note": None}
     assert closed.data["result"] == "abandoned" and closed.data["dispositions"] == [system]
     outbound = world.open(direction="outbound", queued=False)
     with core.tx() as db:

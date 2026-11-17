@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# usage: docker/up.sh [--no-ui] [public-url]. Starts the stack with the UI, or without it; run it again to upgrade or to change the public URL.
+# usage: docker/start.sh [--no-ui] [public-url]. Starts the stack with the UI, or without it; run it again to upgrade or to change the public URL.
 set -euo pipefail
 export LC_ALL=C
 umask 077
@@ -31,12 +31,12 @@ ok "Docker is running, Compose $v"
 
 [ -f "$env" ] || { cp docker/.env.example "$env" && ok "created $env"; }
 if [ -n "$arg" ]; then
-  [[ $arg =~ ^https?://[^/?#[:space:]]+ ]] || die "'$arg' is not a public URL: docker/up.sh https://<tunnel or domain>"
+  [[ $arg =~ ^https?://[^/?#[:space:]]+ ]] || die "'$arg' is not a public URL: docker/start.sh https://<tunnel or domain>"
   put PUBLIC_BASE_URL "${arg%/}"
 fi
 url=$(get PUBLIC_BASE_URL)
 case "$url" in
-  "" | *//hs.example.com*) die "give the public URL Plivo calls back: docker/up.sh https://<tunnel or domain>" ;;
+  "" | *//hs.example.com*) die "give the public URL Plivo calls back: docker/start.sh https://<tunnel or domain>" ;;
   http://* | https://*) ok "PUBLIC_BASE_URL $url" ;;
   *) die "PUBLIC_BASE_URL must start with https:// (it is $url)" ;;
 esac
@@ -84,7 +84,7 @@ cat <<EOF
   ${b}Open${n}      $open
   ${b}Plivo${n}     $url   ${d}(calls and messages come back here)${n}
   ${b}API${n}       http://localhost:${port:-6004}/api/v1
-  ${b}Operator${n}  grep HS_OPERATOR_KEY $env | cut -d= -f2-   ${d}paste it under Register an organization${n}
+  ${b}Operator${n}  grep HS_OPERATOR_KEY $env | cut -d= -f2-   ${d}paste it under Register${n}
 
   Logs  ${compose[*]} logs -f hs
   Stop  ${compose[*]} down

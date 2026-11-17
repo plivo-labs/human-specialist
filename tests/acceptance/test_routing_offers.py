@@ -1213,17 +1213,6 @@ def test_an_agent_on_break_keeps_break_when_it_signs_out(world, tenant):
     assert status_name(tenant, agent) == "Break"
 
 
-def test_an_agent_on_break_keeps_break_when_its_desk_disconnects_and_signs_in_when_it_reconnects(world, tenant):
-    agent = tenant.agent().login()
-    agent.set_status("Break")
-    agent.stop_pinging()
-    assert status_name(tenant, agent) == "Break"
-    agent.heartbeat()
-    assert status_name(tenant, agent) == "Break"
-    agent.heartbeat()
-    world.wait(lambda: status_name(tenant, agent) == "Available", what="the sign-in status after the second ping")
-
-
 def test_with_no_sign_in_or_sign_out_status_the_agent_keeps_its_status(world, tenant):
     settings(tenant, sign_in={"status_id": None}, sign_out={"status_id": None})
     agent = tenant.agent().login(available=False)

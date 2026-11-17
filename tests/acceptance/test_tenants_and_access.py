@@ -1,5 +1,6 @@
 """Tenants, credentials, scopes, isolation, and the conventions every public route shares."""
 
+import base64
 import contextlib
 import json
 import uuid
@@ -164,6 +165,20 @@ def test_another_tenants_number_cannot_be_taken(world, tenant):
     number, _ = tenant.inbound_line(tenant.agent())
     refused(world.new_tenant("Other").api.put(f"/api/v1/numbers/{number}", json={"open_action": {"type": "hangup"}}))
     ok(tenant.api.get(f"/api/v1/numbers/{number}"))
+
+
+def test_available_numbers_page_through_the_plivo_account_and_mark_the_routed_ones(world):
+    picker, available = world.new_tenant("Picker"), "/api/v1/numbers/available"
+    bought = [picker.number() for _ in range(22)]
+    picker.route_number(bought[1], {"type": "hangup"})
+    first = ok(picker.api.get(available, params={"limit": 21}))
+    assert [n["number"] for n in first["data"]] == bought[:21]
+    assert [n["number"] for n in first["data"] if n["routed"]] == [bought[1]]
+    rest = ok(picker.api.get(available, params={"limit": 21, "cursor": first["next_cursor"]}))
+    assert rest == {"data": [{"number": bought[21], "routed": False}], "next_cursor": None}
+    for cursor in (b"x", b"9" * 5000):
+        foreign = {"cursor": base64.urlsafe_b64encode(cursor).decode()}
+        error(picker.api.get(available, params=foreign), 422, "invalid_cursor")
 
 
 def test_another_tenants_conversation_and_call_ids_are_404(world, tenant):

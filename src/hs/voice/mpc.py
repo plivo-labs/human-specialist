@@ -16,7 +16,7 @@ from urllib.parse import unquote
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Response
-from sqlalchemy import func, or_, select, text, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.engine import Connection, Row
 
 from hs import agents, config, conversations, hot, jobs, plivo, routing
@@ -87,8 +87,9 @@ def ring(
 ) -> str:
     """Dial every offer in one add-member request; each leg's SIP headers name its offer and conversation. `extra`
     sets add-member parameters of its own, as a supervisor's role, mode flags and ring timeout, or the `call_uuid` of
-    a live leg that moves in instead of a dial. `every` is the conversation's rows if the caller read them. Returns the
-    ring's command key, for a caller who `wait`s on it."""
+    a live leg that moves in instead of a dial. An add of agents relays the digits their legs press to the room, so a
+    keypad reaches the caller; a supervisor's and a dialed number's do not. `every` is the conversation's rows if the
+    caller read them. Returns the ring's command key, for a caller who `wait`s on it."""
     t, g = str(conv.tenant_id), uuid4()
     queue = conversations.queue_of(db, conv)
     auto = queue and queue["auto_accept"]
@@ -112,6 +113,7 @@ def ring(
     dialed = {"from": shown[0], "caller_name": shown[1], "to": "<".join(to), "sip_headers": "<".join(headers)}
     params |= {"role": "Agent", "ring_timeout": config.tenant_settings(db, t).ring_timeout_sec}
     params |= ({} if "call_uuid" in extra else dialed) | extra
+    params["relay_dtmf_inputs"] = params["role"] == "Agent" and all(a.agent_id for a in offers)
     params["call_status_callback_url"] = plivo.url(t, "call-status", c=conv.id, g=g)
     payload = {"tenant_id": t, "conversation_id": str(conv.id), "room": conv.room, "ring": str(g), "params": params}
     came = next((str(a.from_assignment) for a in offers if a.from_assignment), None)
@@ -134,7 +136,7 @@ def members(db: Connection, conv: Row) -> list[tuple[str | None, Row | None]]:
 
 def hold(db: Connection, conv: Row, want: list, agent_id, by=None, request=None, wait=False) -> list[str]:
     """A member's commands share its key, so a later one replaces one not sent yet and Plivo ends with the latest."""
-    room, keys = {"tenant_id": str(conv.tenant_id), "conversation_id": str(conv.id), "room": conv.room}, []
+    room, keys = _room_of(conv), []
     for a, on in want:
         p = room | {"call_uuid": (a or conv).call_uuid, "participant_id": a and str(a.transfer_id or a.id)}
         p |= {"args": {"hold": on}, "by": by, "agent_id": str(agent_id), "request": request}
@@ -149,7 +151,8 @@ def _check_later(db: Connection, p: dict) -> None:
     jobs.schedule(db, "missed_mpc_event", room, delay=delay, key=f"{p['conversation_id']}:{p['room']}")
 
 
-routing.CHANNELS["call"] = routing.Channel(None, ring)  # a call opens on Plivo's answer URL, not through the API
+# A call opens on Plivo's answer URL, not through the API.
+routing.CHANNELS["call"] = routing.Channel(None, ring, lambda *ended: flow.DIALED["away"](*ended))
 
 
 def find_conv(db: Connection, tenant: Row, cid: UUID) -> Row | None:
@@ -222,8 +225,7 @@ def _hang_up_over(db: Connection, conv: Row, a: Row) -> None:
 
 
 def _ended(db: Connection, conv: Row, offers: list[Row], event: str, **cols) -> None:
-    """The offers end with `event` and routing moves on. Their agents' presence rows are locked first and their
-    route_agent jobs after, both in agent order, as a routing round and a closure take them."""
+    """Ends the offers with `event`, locking their agents' presence rows in agent order as a routing round does."""
     P, offers = T.presence, sorted(offers, key=lambda a: str(a.agent_id))
     if agents := [a.agent_id for a in offers if a.agent_id]:
         db.execute(select(P.c.agent_id).where(P.c.agent_id.in_(agents)).order_by(P.c.agent_id).with_for_update())
@@ -235,14 +237,14 @@ def _ended(db: Connection, conv: Row, offers: list[Row], event: str, **cols) -> 
 
 
 def _kick(db: Connection, conv: Row, subject, member: str) -> None:
-    payload = {"tenant_id": str(conv.tenant_id), "conversation_id": str(conv.id), "room": conv.room}
-    plivo.command(db, "kick", str(subject), payload | {"member_id": member})
+    plivo.command(db, "kick", str(subject), _room_of(conv) | {"member_id": member})
 
 
 @callbacks.post("/call-status")
 def call_status(c: UUID, g: UUID, tenant: Row = flow.TENANT, form: dict = flow.FORM) -> Response:
     """A ringing leg's progress binds it to its offer; its end before a join declines or misses the offer by Plivo's
-    cause code, kept on the offer. A joined leg's end is its leave, whether or not the room's exit event comes."""
+    cause code, kept on the offer. A joined leg's end is its leave, whether or not the room's exit event comes. A
+    missed offer's leg ending frees its slot."""
     call_uuid, code, event = form.get("CallUUID", ""), form.get("PlivoHangupCauseCode"), form.get("EventName")
     with tx() as db:
         if (conv := find_conv(db, tenant, c)) is None:
@@ -257,6 +259,9 @@ def call_status(c: UUID, g: UUID, tenant: Row = flow.TENANT, form: dict = flow.F
             _left(db, conv, a)
         elif a and a.state == "missed" and event == "Hangup":
             conversations.leg_ended(db, a)
+        elif a is None and event == "Hangup":
+            for o in [o for o in hot.offers(conv.tenant_id, conv.id).values() if o["call_uuid"] == call_uuid]:
+                conversations.leg_ended(db, conversations.offer_row(o))
     return Response()
 
 
@@ -330,16 +335,6 @@ def _handed_back(db: Connection, conv: Row) -> bool:
     its hangup URL."""
     queue = conv.state == "live" and conv.queue_id and config.get(db, str(conv.tenant_id), "queue", conv.queue_id)
     return bool(queue and queue["after_agent_action"])
-
-
-def _waited_out(db: Connection, conv: Row) -> bool:
-    """A queued caller whose stint's wait timeout is due, so its room may have ended as Plivo took it to its queue
-    exit. The stint's timer holds the wait its room was seated with, whatever its queue says now; one already
-    claimed was due, though a failed run moved it on. HS queues a caller before Plivo seats it, so a room that
-    ended sooner ended with the caller's hangup."""
-    J = T.jobs
-    due = (J.c.kind == "queue_timeout", J.c.key == str(conv.id), or_(J.c.run_at <= func.now(), J.c.attempts > 0))
-    return conv.state == "queued" and db.execute(select(J.c.id).where(*due)).first() is not None
 
 
 def _caller(db: Connection, conv: Row, event: str, form: dict) -> None:
@@ -518,7 +513,8 @@ def _moved(db: Connection, a) -> None:
 def _left(db: Connection, conv: Row, a: Row) -> None:
     """A member left. A primary's warm consult, or the target a complete hangs the primary up for, takes the call
     over, and a consult that leaves while its primary is on fails its transfer. The last leg besides supervisors to
-    leave the caller takes them with it, so the room ends around the caller and its exit route runs as with none on."""
+    leave the caller takes them with it, so the room ends around the caller and its exit route runs as with none on.
+    A participant or a consulted agent is told it left."""
     rows = [r for r in conversations.rows(db, conv.id, conversations.ON) if r.id != a.id]
     targets = [r for r in rows if r.from_assignment == a.id]
     target = any(r.mode == "warm" for r in targets) and completing(db, a)
@@ -534,7 +530,7 @@ def _left(db: Connection, conv: Row, a: Row) -> None:
         conversations.move_out(db, r, "left")
         if r.id != a.id:
             conversations.kick_agent(db, conv, r)
-    if a.via == "participant":
+    if a.via == "participant" or (a.via, a.role) == ("transfer", "secondary"):
         conversations.participant(db, a, "call.participant_removed", reason="left")
     if a.role == "primary" and not alone:
         hold(db, conv, [(m, False) for _, m in members(db, conv)], a.agent_id)
@@ -573,8 +569,7 @@ def hand_over(db: Connection, conv: Row, t: Row, every: list | None = None) -> b
     db.execute(update(C).where(C.c.id == conv.id).values(routing=C.c.routing.concat(fenced)))
     hold(db, conv, [(None, False), *([(t, False)] if consulted else [])], t.agent_id or came.agent_id)
     if (conv.routing.get("recording") or {}).get("state") == [conv.room, "pause"]:
-        room = {"tenant_id": str(conv.tenant_id), "conversation_id": str(conv.id), "room": conv.room}
-        plivo.command(db, "recording", f"{conv.id}:{conv.room}", room | {"action": "resume", "by": None})
+        plivo.command(db, "recording", f"{conv.id}:{conv.room}", _room_of(conv) | {"action": "resume", "by": None})
     conversations.transferred(db, t, "completed")
     return True
 
@@ -600,16 +595,12 @@ def _completed(p: dict, _: dict) -> None:
 
 
 def supervisor(db: Connection, conv: Row, a: Row, type_: str, *, announce: bool = False) -> None:
-    """Tell the call's agent what supervisor `a` does. `visible` is false only for a listener that has not revealed
-    itself. supervisor.left and supervisor.failed carry the supervisor's own id. `announce` speaks the tenant's barge
-    notice to everyone."""
-    primary = conversations.primary_agent(db, conv.id)
-    agent = a if type_ in ("supervisor.left", "supervisor.failed") else primary
-    seen = a.mode != "listen" or conv.routing.get("revealed") == str(a.id)
-    flow.emit(db, type_, conv, agent and str(agent.agent_id), supervisor_id=str(a.agent_id), mode=a.mode, visible=seen)
+    """Tell the call's agent what supervisor `a` does; supervisor.left and supervisor.failed carry the supervisor's own
+    id. `announce` speaks the tenant's barge notice to everyone."""
+    agent = a if type_ in ("supervisor.left", "supervisor.failed") else conversations.primary_agent(db, conv.id)
+    conversations.supervised(db, conv, a, type_, agent and agent.agent_id)
     if announce and (notice := config.tenant_settings(db, str(conv.tenant_id)).monitor.barge_notice):
-        payload = {"tenant_id": str(conv.tenant_id), "conversation_id": str(conv.id), "room": conv.room}
-        plivo.command(db, "speak", str(a.id), payload | {"member_id": "all", "text": notice})
+        plivo.command(db, "speak", str(a.id), _room_of(conv) | {"member_id": "all", "text": notice})
 
 
 def _rung(p: dict, reply: dict) -> None:
@@ -651,19 +642,30 @@ def _unknown(p: dict) -> None:
         _check_later(db, p)
 
 
+def _over(tenant: Row, p: dict) -> bool:
+    """Room `p` is not on. Plivo reads a room by name only while it is ongoing, so one it does not know has ended, or
+    has not started yet."""
+    try:
+        return plivo.rest(tenant, "GET", f"{room_of(p)}/").get("status") == "Ended"
+    except plivo.Refused as e:
+        if e.details.get("status") != 404:
+            raise
+        return True
+
+
 @jobs.handler("missed_mpc_event", lane="plivo")
 def _check(job: Row) -> None:
-    """Plivo's view of a room whose callbacks HS may have missed: once it ended, its caller is gone unless its queue
-    exit says how it left (a caller its queue hands back, or one whose wait may have run out), and a member no offer
-    or stint holds is kicked."""
+    """Plivo's view of a room whose callbacks HS may have missed: once it is not on, its caller is gone if Plivo has
+    no live call for it, as one its queue hands back is, unless its wait may have run out (its queue timer then ends
+    it), and a member no offer or stint holds is kicked."""
     p, tenant = job.payload, plivo.account(job.payload["tenant_id"])
-    status = plivo.rest(tenant, "GET", f"{room_of(p)}/").get("status")
-    members = plivo.rest(tenant, "GET", f"{room_of(p)}/Participant/").get("objects", [])
+    over = _over(tenant, p)
+    members = [] if over else plivo.rest(tenant, "GET", f"{room_of(p)}/Participant/").get("objects", [])
     with tx() as db:
         conv = conversations.lock(db, UUID(p["conversation_id"]))
-        ended = status == "Ended" and conv.room == p["room"] and conv.state in conversations.LIVE
-        if ended and not _handed_back(db, conv) and not _waited_out(db, conv):
-            conversations.gone(db, conv)
+        ended = over and conv.call_uuid and conv.room == p["room"] and conv.state in conversations.LIVE
+        if ended and not routing.waited_out(db, conv):
+            plivo.command(db, "live", conv.call_uuid, p | {"call_uuid": conv.call_uuid})
         known = {conv.call_uuid, *(a.call_uuid for a in conversations.rows(db, conv.id, conversations.ON))}
         for m in members:
             if not m.get("exit_cause") and m["call_uuid"] not in known:
@@ -706,7 +708,7 @@ def speak_to(tenant: Row, p: dict) -> dict:
 def _add(tenant: Row, p: dict) -> dict:
     """A supervisor rings only into a room Plivo has not ended, since the add would start a new room by its name."""
     params = p["params"]
-    if params["role"] == "Supervisor" and plivo.rest(tenant, "GET", f"{room_of(p)}/").get("status") == "Ended":
+    if params["role"] == "Supervisor" and _over(tenant, p):
         raise plivo.Refused(409, "call_not_live", "the call is not live")
     if p.get("number") and (alias := _number_alias(tenant, p["number"])):
         tagged = (f"{h},HsAlias={sip_header(alias)}" for h in params["sip_headers"].split("<"))
@@ -743,14 +745,20 @@ def _drop(tenant: Row, p: dict) -> dict:
 def _redirected(p: dict, _: dict) -> None:
     if x := p.get("transfer"):
         with tx() as db:
+            conversations.lock(db, UUID(p["conversation_id"]))
             a = conversations.offer_row(x | {k: p[k] for k in ("tenant_id", "conversation_id")})
             conversations.transferred(db, a, "initiated", target=p["action"])
 
 
+def _gone(p: dict, e: plivo.Refused) -> None:
+    """A move or a live read of a call that Plivo refuses with 404 found no such call, as a hangup's gone reply does."""
+    _hung_up(p, {"gone": e.details.get("status") == 404})
+
+
 plivo.OPS["drop"] = plivo.Op(False, _drop)
-# A move Plivo refuses with 404 found no such call, as a hangup's gone reply does.
-plivo.OPS["redirect"] = plivo.Op(
-    False, flow.redirect_call, _redirected, lambda p, e: _hung_up(p, {"gone": e.details.get("status") == 404})
+plivo.OPS["redirect"] = plivo.Op(False, flow.redirect_call, _redirected, _gone)
+plivo.OPS["live"] = plivo.Op(
+    False, lambda t, p: plivo.rest(t, "GET", f"Call/{p['call_uuid']}/", status="live"), failed=_gone
 )
 plivo.OPS["speak"] = plivo.Op(create=True, send=speak_to)
 

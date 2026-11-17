@@ -105,6 +105,7 @@ REDUE = (
     " AND (locked_until IS NULL OR locked_until <= now())"
 )
 PARKED = "SELECT 1 FROM hs.jobs WHERE kind = %s AND key = %s AND locked_until = 'infinity'"
+HOLD = "UPDATE hs.jobs SET locked_until = 'infinity' WHERE kind = %s AND id > %s"
 ROUTE_JOB = (
     "SELECT run_at - now(), locked_until - now(), attempts, last_error FROM hs.jobs"
     " WHERE kind = 'route_agent' AND key = %s"
@@ -146,7 +147,8 @@ class World:
     HS env: PUBLIC_BASE_URL=base_url, PLIVO_API_URL=plivo.url, WEBHOOK_PRIVATE_HOSTS=127.0.0.1,localhost,
     a fresh copy of a database migrated with `alembic upgrade head`, REDIS_URL of a redis-server this world starts,
     and SEARCH_URL only when `search_url` is given (search reads Postgres without it; with it, HS reaches the index
-    through a gate `search_down` can close, and the world deletes its tenants' indices when it ends).
+    through a gate `search_down` can close, and the world deletes its tenants' indices when it ends). `env` adds to or
+    overrides HS's env, and such a world always boots HS in a process of its own.
     """
 
     base_url: str
@@ -154,8 +156,8 @@ class World:
     plivo: PlivoSim
     cors_origin = "https://desk.example.test"  # the one origin in HS's CORS_ALLOWED_ORIGINS
 
-    def __init__(self, search_url: str | None = None) -> None:
-        self.search_url = search_url
+    def __init__(self, search_url: str | None = None, env: dict[str, str] | None = None) -> None:
+        self.search_url, self._extra = search_url, env
         self._stack = contextlib.ExitStack()
         self._until_test_ends = contextlib.ExitStack()
         self._jobs_after = 0
@@ -200,6 +202,7 @@ class World:
             self._gate = _SearchGate(self.search_url)
             self._stack.callback(self._gate.close)
             self._env["SEARCH_URL"] = self._gate.url
+        self._env |= self._extra or {}
         before = dict(os.environ)
         self._stack.callback(lambda: (os.environ.clear(), os.environ.update(before)))
         os.environ.pop("SEARCH_URL", None)
@@ -220,9 +223,10 @@ class World:
         if self.search_url:
             self._stack.callback(self._drop_indices)
         self._app = os.environ.get("HS_TEST_APP", "hs.app:app")
-        # A process that already imported HS has frozen settings, so HS boots in its own process. A search World always
-        # does: this process's one HS stays the plain World's, and specs read its log through caplog.
-        if self.search_url or "hs.core" in sys.modules:
+        # A process that already imported HS has frozen settings, so HS boots in its own process. A search World, or one
+        # with its own env, always does: this process's one HS stays the plain World's, and specs read its log through
+        # caplog.
+        if self.search_url or self._extra is not None or "hs.core" in sys.modules:
             self._spawn(sock, dict(os.environ), self._stack)
         else:
             module, _, attr = self._app.partition(":")
@@ -458,6 +462,12 @@ class World:
         with self._db.cursor() as cur:
             cur.execute(PARKED, (kind, key))
             return cur.fetchone() is not None
+
+    def hold(self, kind: str) -> None:
+        """This test's pending jobs of `kind` wait unclaimed until it ends, as for a job runner that has not reached
+        them: travel moves their run_at like any stored time and never stops at them."""
+        with self._db.cursor() as cur:
+            cur.execute(HOLD, (kind, self._jobs_after))
 
     def run_jobs(self, kind: str | None = None) -> int:
         """Make this test's pending jobs (optionally of one kind) due now, wait until the runner has processed
@@ -896,19 +906,16 @@ class Agent:
 
     def stop_pinging(self) -> None:
         """This desk stops beating and 55 s pass: HS's 40 s limit and one 15 s sweep. A stop in the jump may run the
-        sweep before the 40 s are up, so only then has a sweep surely seen the desk silent. Returns once the API
-        shows an Available agent Offline (any other status stays) and the disconnect has cleared the session's
-        beat count in Redis, which only a handled disconnect does."""
+        sweep before the 40 s are up, so only then has a sweep surely seen the desk silent. Returns once the sign-out
+        that sweep scheduled has run and the API shows an Available agent Offline (any other status stays)."""
         world, beats = self.tenant.world, f"hs:{{{self.tenant.id}}}:beats:{self.id}"
         world._desks.discard(self)
         was = self._status()
         want = "Offline" if was == "Available" else was
         assert world.redis("EXISTS", beats) == "1", f"desk {self.id} must have beaten before it stops pinging"
         world.travel(55)
-        world.wait(
-            lambda: self._status() == want and world.redis("EXISTS", beats) == "0",
-            what=f"agent {self.id} to go {want} with its beat count cleared",
-        )
+        world.run_jobs("agent_offline")
+        world.wait(lambda: self._status() == want, what=f"agent {self.id} to go {want}")
 
     def _status(self) -> str:
         return _ok(self.tenant.api.get(f"/api/v1/agents/{self.id}/status"))["status"]["name"]

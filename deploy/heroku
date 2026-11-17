@@ -1,0 +1,16 @@
+#!/bin/sh
+# Heroku's add-on URLs as HS's drivers take them: SQLAlchemy refuses postgres://, and Key-Value Store's TLS
+# certificate is self-signed.
+set -e
+case "$DATABASE_URL" in postgres://*) DATABASE_URL="postgresql://${DATABASE_URL#postgres://}" ;; esac
+case "$REDIS_URL" in
+  rediss://*\?ssl_cert_reqs=* | rediss://*\&ssl_cert_reqs=*) ;;
+  rediss://*\?*) REDIS_URL="$REDIS_URL&ssl_cert_reqs=none" ;;
+  rediss://*) REDIS_URL="$REDIS_URL?ssl_cert_reqs=none" ;;
+esac
+export DATABASE_URL REDIS_URL
+case "$1" in
+  release) exec alembic upgrade head ;;
+  web) exec uvicorn hs.app:app --host 0.0.0.0 --port "$PORT" ;;
+  *) echo "usage: /app/heroku release|web" >&2; exit 2 ;;
+esac

@@ -495,12 +495,13 @@ class PlivoSim:
             ("POST", r"Application/(?P<rid>\d+)", self._app_update),
             ("POST", r"Endpoint", self._endpoint_create),
             ("POST", r"Endpoint/(?P<rid>\d+)", self._endpoint_update),
-            ("GET", r"(?P<kind>Application|Endpoint)", self._resource_list),
+            ("GET", r"(?P<kind>Application|Endpoint|Number)", self._resource_list),
             ("GET", r"(?P<kind>Application|Endpoint)/(?P<rid>\d+)", self._resource_get),
             ("DELETE", r"(?P<kind>Application|Endpoint)/(?P<rid>\d+)", self._resource_delete),
             ("GET", r"Number/(?P<rid>\d+)", self._number_get),
             ("POST", r"Number/(?P<rid>\d+)", self._number_update),
             ("POST", r"Call", self._call_create),
+            ("GET", r"Call/(?P<uid>[^/]+)", self._call_live),
             ("POST", r"Call/(?P<uid>[^/]+)", self._call_transfer),
             ("POST", r"Call/(?P<uid>[^/]+)/Feedback", self._call_feedback),
             ("DELETE", r"Call/(?P<uid>[^/]+)", self._call_hangup),
@@ -546,9 +547,10 @@ class PlivoSim:
 
     # ---- harness API -------------------------------------------------------------------------------
 
-    def subaccount(self, name: str) -> _Account:
-        """A new sub-account of the main account (`.auth_id`, `.auth_token`)."""
+    def subaccount(self, name: str, auth_id: str | None = None) -> _Account:
+        """A new sub-account of the main account (`.auth_id`, `.auth_token`), under `auth_id` when given."""
         acc = _new_account("SA", name, self.main)
+        acc.auth_id = auth_id or acc.auth_id
         self.accounts[acc.auth_id] = acc
         return acc
 
@@ -994,6 +996,14 @@ class PlivoSim:
         self._queue(self._make_call, acc, p, request_uuid)
         return 201, {"message": "call fired", "request_uuid": request_uuid}
 
+    def _call_live(self, acc, p, uid):
+        """Plivo's read of a live call, `?status=live`, the only call read HS makes. One not live reads 404, as its
+        transfer and hangup do."""
+        call = self._live(acc, uid) if p.get("status") == "live" else None
+        if call is None:
+            return 404, {"error": "call not found"}
+        return 200, {"call_uuid": uid, "call_status": call.state.replace("_", "-")}
+
     def _call_transfer(self, acc, p, uid):
         call = self._live(acc, uid)
         if call is None or call.state != "in_progress":
@@ -1362,9 +1372,10 @@ class PlivoSim:
             p.update(RequestUUID=call._request_uuid, ALegUUID=call.call_uuid, ALegRequestUUID=call._request_uuid)
         return {**p, **call.headers}
 
-    def _fetch(self, call: SimCall, url: str, method: str, extra: dict | None = None, code=7012, fallback=""):
-        """HS's XML document for the call, or None once the call ended as Plivo ends it on a bad reply."""
-        cb = self._send(call._account, url, {**self._std(call), **(extra or {})}, method or "POST")
+    def _fetch(self, call: SimCall, url: str, method: str, extra: dict | None = None, code=7012, fallback="", std=True):
+        """HS's XML document for the call, or None once the call ended as Plivo ends it on a bad reply. Without
+        `std` it sends `extra` alone."""
+        cb = self._send(call._account, url, {**(self._std(call) if std else {}), **(extra or {})}, method or "POST")
         if not 200 <= cb.status < 300:
             if fallback:
                 return self._fetch(call, fallback, "POST", extra, code)
@@ -1850,10 +1861,12 @@ class PlivoSim:
             return self._end(call, 4030 if m.exit_cause == EXIT_KICKED else 4020, "Plivo")
         doc, call._resume = call._resume, None
         if url := m.opts.get("on_exit_action_url"):
+            # Plivo's documented exit fields only: a live exit came with no CallUUID. Its cause comes on the member's
+            # ParticipantExit event.
             extra = {"MPCUUID": m.mpc.uuid, "MPCFriendlyName": m.mpc.name, "MemberID": m.member_id}
-            extra.update(ParticipantCallUUID=call.call_uuid, ParticipantRole=m.role, ParticipantExitCause=m.exit_cause)
+            extra.update(ParticipantCallUUID=call.call_uuid, ParticipantRole=m.role)
             extra.update(ParticipantJoinTime=_fmt(m.join_time), ParticipantEndTime=_fmt(m.exit_time))
-            doc = self._fetch(call, url, m.opts.get("on_exit_action_method", "POST"), extra)
+            doc = self._fetch(call, url, m.opts.get("on_exit_action_method", "POST"), extra, std=False)
         if doc is not None:
             self._execute(call, doc)
 

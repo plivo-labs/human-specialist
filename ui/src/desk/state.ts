@@ -1,4 +1,4 @@
-import type { Assignment, Conversation, Disposition, Envelope, Me, Message, PresenceStatus, Status } from "../types";
+import type { Assignment, Conversation, ConversationSummary, Disposition, Envelope, Me, Message, Note, PresenceStatus, Status } from "../types";
 import type { Ring } from "./phone";
 
 export type Offer = { id: string; cid: string; channel: string; from: string | null; to: string | null; queueId: string | null; via: string; ringFor: number | null; at: number };
@@ -43,6 +43,7 @@ export type Action =
   | { type: "reachable"; ok: boolean }
   | { type: "renewed"; me: Me }
   | { type: "event"; e: Envelope }
+  | { type: "history"; events: Envelope[] }
   | { type: "ring"; ring: Ring }
   | { type: "ring-gone"; uuid: string }
   | { type: "line"; cid: string; conv: Conversation | null }
@@ -86,6 +87,7 @@ const LINE_FLAGS: Record<string, Partial<Line>> = {
 export const namesMe = (s: State, e: Envelope) => e.agent_id === s.me.id || e.data?.supervisor_id === s.me.id;
 export const onLine = (s: State, e: Envelope) => s.lines.some((l) => l.cid === e.conversation_id);
 export const onDial = (s: State, e: Envelope) => !!e.conversation_id && e.conversation_id === s.dialing?.cid;
+const activity = (e: Envelope) => !/^(message|note)\./.test(e.type);
 
 function onEvent(s: State, e: Envelope): State {
   const d = e.data ?? {};
@@ -105,7 +107,7 @@ function onEvent(s: State, e: Envelope): State {
   });
   if (e.type === "agent.status_changed" && namesMe(s, e)) me = { ...me, status: d.to_status };
   if (onDial(s, e) && ENDS_DIAL.has(e.type)) dialing = null;
-  const feed = namesMe(s, e) || onLine(s, e) || onDial(s, e) ? [e, ...s.feed.slice(0, 99)] : s.feed;
+  const feed = (namesMe(s, e) || onLine(s, e) || onDial(s, e)) && !s.feed.some((x) => x.id === e.id) ? [e, ...s.feed.slice(0, 99)] : s.feed;
   return { ...s, offers, lines, me, dialing, feed, notices };
 }
 
@@ -145,6 +147,10 @@ export function reduce(s: State, a: Action): State {
       return { ...s, me: a.me };
     case "event":
       return onEvent(s, a.e);
+    case "history": {
+      const had = new Set(s.feed.map((e) => e.id));
+      return { ...s, feed: [...s.feed, ...a.events.filter((e) => activity(e) && !had.has(e.id))].sort((x, y) => +y.id - +x.id).slice(0, 100) };
+    }
     case "ring":
       return { ...s, rings: [...s.rings, a.ring] };
     case "ring-gone":
@@ -176,9 +182,19 @@ export function reduce(s: State, a: Action): State {
   }
 }
 
+export async function history(read: (after: string) => Promise<{ data: Envelope[]; next_cursor: string | null }>, held = () => true, pages = 10) {
+  const out: Envelope[] = [];
+  for (let after: string | null = "0", n = 0; after !== null && n < pages && (n === 0 || held()); n++) {
+    const got = await read(after);
+    out.push(...got.data);
+    after = got.next_cursor;
+  }
+  return out;
+}
+
 export const autoWrap = (s: State, line: Line) => {
   const started = s.feed.find((e) => e.type === "conversation.wrap_up_started" && e.conversation_id === line.cid);
-  // Only the event knows the mode: HS makes some wrap-ups manual whatever the setting, and a reload loses the event.
+  // Only the event knows the mode: HS makes some wrap-ups manual whatever the setting.
   return line.conv.channel === "call" && started?.data.mode === "auto";
 };
 
@@ -199,6 +215,16 @@ export function frames(text: string) {
 export const voice = (s: State) => s.lines.find((l) => (l.conv.channel === "call" || l.via === "outbound") && l.phase === "live");
 
 export const sdkFree = (s: State) => !s.rings.length && !s.offers.some((o) => o.channel === "call") && !s.dialing && !voice(s);
+
+export async function endCall(post: () => Promise<unknown>, phone: { hangup: () => void } | null, clear: () => void) {
+  try {
+    await post();
+  } catch (e) {
+    if ((e as { code?: string }).code !== "call_not_live") throw e;
+    phone?.hangup();
+    clear();
+  }
+}
 
 export const autoAnswer = (r: Ring) => r.kind === "outbound" || r.kind === "monitor" || r.autoanswer != null;
 
@@ -222,11 +248,37 @@ export function stage(s: State): Stage {
   return s.dialing ? { kind: "dialing", dial: s.dialing } : { kind: "idle" };
 }
 
-export const thread = (msgs: Message[], feed: Envelope[], say: (e: Envelope) => string) =>
+export const thread = (msgs: Message[], feed: Envelope[], say: (e: Envelope) => string, notes: Note[] = []) =>
   [
-    ...feed.filter((e) => !e.type.startsWith("message.")).map((e) => ({ id: e.id, at: e.created_at, text: say(e) })),
+    ...feed.filter(activity).map((e) => ({ id: e.id, at: e.created_at, text: say(e) })),
     ...msgs.map((m) => ({ id: m.id, at: m.created_at, text: m.text ?? m.attachments.map((f) => f.name ?? "A file").join(", "), side: m.direction, note: m.direction === "outbound" ? m.status : undefined })),
+    ...notes.map((n) => ({ id: n.id, at: n.created_at, text: n.text, side: "note" as const, note: "note" })),
   ].sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+
+type Ask<T> = (method: string, path: string, body?: unknown) => Promise<T>;
+export const note = (ask: Ask<unknown>, cid: string, text: string) => ask("POST", `/api/v1/conversations/${cid}/notes`, { text });
+// A task conversation's tasks read with ?conversation_id= include those raised from it.
+export const own = <T extends { conversation_id: string }>(tasks: T[], cid: string) => tasks.find((t) => t.conversation_id === cid);
+export const KINDS = ["follow_up", "internal", "others", "callback", "task"] as const;
+export type Kind = (typeof KINDS)[number];
+// The fields a kind takes beyond the common ones, true when required, as the API's TaskIn validator reads them. A
+// follow-up is due at its schedule.
+export const asks = (kind: Kind, raised: boolean) => ({
+  ...(kind === "follow_up" ? { channel: true, scheduled_at: true } : { due_at: false }),
+  ...(kind === "callback" && { customer: !raised }),
+});
+export function createTask(ask: Ask<unknown>, f: Record<string, string>, cid?: string) {
+  const [type, id] = f.target.split(":");
+  const take = (k: string) => (k in asks(f.type as Kind, !!cid) && f[k] ? (k.endsWith("_at") ? new Date(f[k]).toISOString() : f[k]) : undefined);
+  const body = { type: f.type, title: f.title, description: f.description || undefined, priority: f.priority, target: { type, [`${type}_id`]: id }, conversation_id: cid };
+  return ask("POST", `/api/v1/tasks`, { ...body, customer: take("customer"), channel: take("channel"), scheduled_at: take("scheduled_at"), due_at: take("due_at") ?? take("scheduled_at") });
+}
+export const recentCalls = (ask: Ask<{ data: ConversationSummary[] }>, agentId: string) => ask("GET", `/api/v1/conversations?agent_id=${agentId}&direction=outbound&channel=call&limit=20`);
+export const recent = (calls: ConversationSummary[], contacts: { name: string | null; number: string | null }[]) =>
+  calls
+    .filter((c, i) => c.number && calls.findIndex((x) => x.number === c.number) === i)
+    .slice(0, 5)
+    .map((c) => ({ ...c, name: contacts.find((d) => d.number === c.number)?.name }));
 
 export const windowShut = (channel: string, msgs: Message[], now: number) =>
   channel === "whatsapp" && !msgs.some((m) => m.direction === "inbound" && now - Date.parse(m.created_at) < 24 * 3600e3);

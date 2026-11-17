@@ -1,20 +1,21 @@
-import { Headphones, Mic, MicOff, Pause, Phone, PhoneForwarded, PhoneIncoming, PhoneOutgoing, UserRoundPlus, Users } from "lucide-react";
-import { type ReactNode, useState } from "react";
+import { Grid3x3, Headphones, Mic, MicOff, Pause, Phone, PhoneForwarded, PhoneIncoming, PhoneOutgoing, UserRoundPlus, Users } from "lucide-react";
+import { type ReactNode, useEffect, useState } from "react";
 import { asAgent } from "../api";
 import { kindIcon, kindWord } from "../conversations";
 import { clock, phone } from "../format";
 import type { Conversation } from "../types";
-import { Badge, Button, act, cls, useLoad } from "../ui";
+import { Badge, Button, act, cls, failed, useLoad } from "../ui";
 import type { Ctx } from "./desk";
+import { KEYS, key } from "./phone";
 import { left, titled } from "./side";
-import { type Line, type Pending, pending, stage } from "./state";
+import { type Line, type Pending, endCall, pending, stage } from "./state";
 import { Transfer, TransferBar } from "./transfer";
 
 export const hangUp = <Phone className="rotate-[135deg] fill-destructive stroke-none" aria-hidden />;
 
 function Card({ ring, children }: { ring?: { left: number | null; of: number | null }; children: ReactNode }) {
   return (
-    <section className="w-full overflow-hidden rounded-sm border bg-background px-4 pb-3 pt-3 shadow-lg sm:w-80">
+    <section className="w-full overflow-hidden rounded-sm border bg-background px-4 pb-3 pt-3 shadow-lg sm:max-w-80">
       {ring && (
         <div aria-hidden className="-mx-4 -mt-3 mb-3 h-[3px] bg-muted">
           {ring.left != null && <div className="h-full bg-available transition-[width] duration-1000 ease-linear" style={{ width: `${(ring.left / ring.of!) * 100}%` }} />}
@@ -93,7 +94,7 @@ export function CallWidget({ ctx }: { ctx: Ctx }) {
           <Who number={st.dial.to} sub="Connecting..." />
         </Card>
       )}
-      {st.kind === "live" && <LiveCall ctx={ctx} line={st.line} />}
+      {st.kind === "live" && <LiveCall key={st.line.cid} ctx={ctx} line={st.line} />}
       {st.kind === "monitor" && <Monitor ctx={ctx} line={st.line} />}
     </div>
   );
@@ -158,6 +159,7 @@ const tool = (label: string, pressed?: boolean) => ({ variant: "tertiary" as con
 function LiveCall({ ctx, line }: { ctx: Ctx; line: Line }) {
   const { s, dispatch, now, phone: sdk } = ctx;
   const [transferring, setTransferring] = useState(false);
+  const [keypad, setKeypad] = useState(false);
   const c = line.conv;
   const cid = line.cid;
   const out = c.direction === "outbound";
@@ -166,6 +168,7 @@ function LiveCall({ ctx, line }: { ctx: Ctx; line: Line }) {
   const rec = s.me.settings.recording;
   const from = s.names[c.assignments.find((a) => a.role === "primary" && a.agent_id !== s.me.id)?.agent_id ?? ""] ?? "a colleague";
   const patch = (p: Partial<Line>) => dispatch({ type: "patch", cid, patch: p });
+  const carried = s.phone.state === "ready" && !!sdk.current?.carries(cid);
   return (
     <Card>
       <div className="flex items-center justify-between gap-2 text-xs-400 text-tertiary">
@@ -189,7 +192,7 @@ function LiveCall({ ctx, line }: { ctx: Ctx; line: Line }) {
       </Title>
       <Who number={c.number} held={line.held} sub={ringing ? "Ringing…" : clock((now - line.started) / 1000)} />
       <div className="ml-5 flex items-center gap-2">
-        {s.phone.state === "ready" && sdk.current && (
+        {carried && (
           <Button
             {...tool(line.muted ? "Unmute" : "Mute", line.muted)}
             onClick={() =>
@@ -213,6 +216,11 @@ function LiveCall({ ctx, line }: { ctx: Ctx; line: Line }) {
             >
               <Pause aria-hidden />
             </Button>
+            {carried && (
+              <Button {...tool("Keypad", keypad)} onClick={() => setKeypad(!keypad)}>
+                <Grid3x3 aria-hidden />
+              </Button>
+            )}
             {!joined && (
               <Button {...tool("Transfer", transferring)} disabled={!!line.transfer} onClick={() => setTransferring(!transferring)}>
                 <UserRoundPlus aria-hidden />
@@ -225,14 +233,48 @@ function LiveCall({ ctx, line }: { ctx: Ctx; line: Line }) {
           size="icon"
           aria-label={ringing ? "Cancel the call" : "End call"}
           title="End call"
-          onClick={() => act("Hanging up", () => asAgent("POST", `/api/v1/calls/${cid}/hangup`), ringing ? "Call cancelled" : joined ? "Call ended" : "Call ended. Wrap-up is open.")}
+          onClick={() => act("Hanging up", () => endCall(() => asAgent("POST", `/api/v1/calls/${cid}/hangup`), sdk.current, () => dispatch({ type: "line", cid, conv: null })), ringing ? "Call cancelled" : joined ? "Call ended" : "Call ended. Wrap-up is open.")}
         >
           {hangUp}
         </Button>
       </div>
+      {keypad && carried && <Keypad phone={sdk} cid={cid} />}
       {line.transfer && <TransferBar ctx={ctx} line={line} />}
       {transferring && !line.transfer && <Transfer ctx={ctx} line={line} onDone={() => setTransferring(false)} />}
     </Card>
+  );
+}
+
+const SAID: Record<string, string> = { "*": "Star", "#": "Pound" };
+
+function Keypad({ phone, cid }: { phone: Ctx["phone"]; cid: string }) {
+  const [pressed, setPressed] = useState("");
+  const press = (d: string) => {
+    const why = phone.current?.dtmf(cid, d) ?? "This browser no longer holds this call.";
+    if (why) failed(`Sending ${SAID[d] ?? d}`, new Error(why));
+    else setPressed((was) => (was + d).slice(-10));
+  };
+  useEffect(() => {
+    const typed = (e: KeyboardEvent) => {
+      const d = key(e.key);
+      if (d && !e.repeat && !(e.target instanceof Element && e.target.closest("input, textarea, select"))) press(d);
+    };
+    window.addEventListener("keydown", typed);
+    return () => window.removeEventListener("keydown", typed);
+  }, [cid]);
+  return (
+    <div className="ml-5 grid gap-2">
+      <output aria-label="Keys pressed" className="h-6 truncate font-mono text-p-400">
+        {pressed && `Pressed ${[...pressed].join(" ")}`}
+      </output>
+      <div className="grid grid-cols-3 gap-1">
+        {[...KEYS].map((d) => (
+          <Button key={d} size="md" aria-label={SAID[d] ?? d} className="font-mono text-p-500" onClick={() => press(d)}>
+            {d}
+          </Button>
+        ))}
+      </div>
+    </div>
   );
 }
 

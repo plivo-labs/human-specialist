@@ -5,9 +5,14 @@ import { type ReactNode, useState, useSyncExternalStore } from "react";
 import { signOut } from "./api";
 import { Avatar, cls } from "./ui";
 
-const onHash = (l: () => void) => (addEventListener("hashchange", l), () => removeEventListener("hashchange", l));
-export const useRoute = () => useSyncExternalStore(onHash, () => location.hash.replace(/^#/, "") || "/");
-export const go = (route: string) => (location.hash = route);
+const onRoute = (l: () => void) => (addEventListener("popstate", l), () => removeEventListener("popstate", l));
+export const useRoute = () => useSyncExternalStore(onRoute, () => location.pathname + location.search);
+export const go = (route: string) => (history.pushState(null, "", route), dispatchEvent(new PopStateEvent("popstate")));
+// A page load would drop the softphone and its call, so a link inside the console only changes the route.
+export const follow = (e: MouseEvent) => {
+  const a = e.target instanceof Element && e.target.closest("a[href^='/']:not([target])");
+  if (a && !e.defaultPrevented && !e.button && !(e.metaKey || e.ctrlKey || e.shiftKey || e.altKey)) (e.preventDefault(), go(a.getAttribute("href")!));
+};
 
 const dark = () => document.documentElement.classList.contains("dark");
 export function initTheme() {
@@ -30,7 +35,7 @@ function Nav({ items, route, onPick }: { items: NavItem[]; route: string; onPick
               .map(({ route: r, label, icon: Icon }) => (
                 <a
                   key={r}
-                  href={`#${r}`}
+                  href={r}
                   onClick={onPick}
                   aria-current={route === r || route.startsWith(`${r}/`) ? "page" : undefined}
                   className="flex h-8 items-center gap-2 rounded-sm p-2 text-s-400 text-nav hover:bg-muted aria-[current=page]:bg-muted aria-[current=page]:font-medium aria-[current=page]:text-nav-active"
@@ -117,7 +122,7 @@ export function Dropdown({ trigger, children, label, className, onOpen }: { trig
   );
 }
 
-export function UserMenu({ name, sub, onPassword }: { name: string; sub: string; onPassword?: () => void }) {
+export function UserMenu({ name, email, sub, onPassword }: { name: string; email?: string | null; sub: string; onPassword?: () => void }) {
   return (
     <Dropdown
       label="Account"
@@ -129,6 +134,7 @@ export function UserMenu({ name, sub, onPassword }: { name: string; sub: string;
     >
       <div className="px-2 py-1.5">
         <p className="text-s-600">{name}</p>
+        {email && <p className="text-xs-400">{email}</p>}
         <p className="text-xs-400 text-secondary">{sub}</p>
       </div>
       <Menu.Separator className="my-1 h-px bg-border" />

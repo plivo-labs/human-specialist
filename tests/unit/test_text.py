@@ -7,14 +7,16 @@ import hashlib
 import threading
 import time
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import insert, select, text, update
+from sqlalchemy import event, insert, select, text, update
 
-from hs import access, core, plivo
+from hs import access, core, jobs, plivo
 from hs import app as service
 from hs import conversations as cv
 from hs import text as messages
@@ -23,7 +25,8 @@ from hs.config import models as m
 from hs.core import ApiError, T
 from hs.hot import rebuilt
 from tests.unit.test_agents import Desk
-from tests.unit.test_routing import Floor, while_held
+from tests.unit.test_config import waiter
+from tests.unit.test_routing import Floor, deleting_status_meets, lunch, while_held
 
 TOKEN = "text-auth-token-0123456789"
 client = TestClient(service.app)
@@ -71,6 +74,43 @@ def test_a_status_moves_only_forward_and_fails_only_before_delivery():
     told = select(E.c.data["status"].astext).where(E.c.type == "message.status_changed", E.c.tenant_id.in_(tenants))
     with core.read() as db:
         assert sorted(db.execute(told).scalars()) == ["delivered", "delivered", "failed"]
+
+
+def test_a_delivery_report_and_the_check_after_an_uncertain_send_both_commit():
+    """The report pauses right after it moves the message's status. The send's check then locks the conversation and
+    reads the message, and the report goes on to mark the customer's turn on that conversation."""
+    tenant, eid = outbound()
+    with core.read() as db:
+        cid = db.execute(select(T.entry.c.conversation_id).where(T.entry.c.id == eid)).scalar()
+    with core.tx() as db:
+        cv.set_state(db, cv.lock(db, cid), "live")
+    paused, release, reporter = Future(), threading.Event(), []
+
+    def pause(conn, cursor, statement, *_) -> None:
+        if threading.get_ident() in reporter and "UPDATE entry SET status" in statement and not paused.done():
+            paused.set_result(cursor.connection.get_backend_pid())
+            release.wait(10)
+
+    def report() -> None:
+        reporter.append(threading.get_ident())
+        with core.tx() as db:
+            messages.status(db, tenant, eid, "delivered")
+
+    check = {"tenant_id": str(tenant), "conversation_id": str(cid), "entry_id": str(eid), "first": False}
+    event.listen(core.engine, "after_cursor_execute", pause)
+    try:
+        with ThreadPoolExecutor(2) as pool:
+            try:
+                reporting = pool.submit(report)
+                pid = paused.result(5)
+                checking = pool.submit(jobs._handlers["send_check"][0], SimpleNamespace(payload=check))
+                assert waiter(pid), "the check waits for the report"
+            finally:
+                release.set()
+    finally:
+        event.remove(core.engine, "after_cursor_execute", pause)
+    reporting.result(), checking.result()
+    assert status_of(eid) == "delivered"
 
 
 def test_a_status_time_out_of_the_window_reads_as_the_time_hs_heard_it():
@@ -122,6 +162,21 @@ def test_two_transfers_racing_for_an_agents_last_slot_offer_it_once(monkeypatch)
 
     assert while_held(hold, then, waits=False) == "agent_at_capacity", "the first transfer's offer took the slot"
     assert (floor.offers(first.id), floor.offers(second.id)) == ([target], [])
+
+
+def test_a_transfer_to_a_queue_and_the_delete_of_its_agents_status_both_commit(monkeypatch):
+    """With wrap-up not blocking routing, agent a's transfer of its SMS to a queue frees a, then its round waits on
+    b's presence row, which the delete of a's status holds."""
+    floor = Floor(monkeypatch)
+    floor.settings(acw_blocks_routing=False)
+    a, b = floor.agent(), floor.agent()
+    q, conv = floor.queue(agents=[b]), floor.open("sms")
+    with core.tx() as db:
+        cv.offer(db, conv, a, via="direct")
+    status, to = lunch(floor, a), messages.TextTransferIn(target={"type": "queue", "queue_id": str(q)})
+    moved = lambda: messages.transfer(conv.id, to, Principal(str(floor.tenant), "key"))  # noqa: E731
+    assert deleting_status_meets(floor, status, moved)[0] == 204
+    assert floor.offers(conv.id) == [b] and floor.offers(conv.id, "wrap_up") == [a]
 
 
 def replied(floor: Floor, agent, cid, **body) -> str:

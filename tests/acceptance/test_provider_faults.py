@@ -4,6 +4,8 @@ stale callback changes nothing it should not, and a conversation outlives the ro
 import math
 from urllib.parse import quote, urlsplit
 
+import pytest
+
 from tests.acceptance.channels import messages, plivo_sent, reply, take, text_line
 from tests.acceptance.conftest import (
     activity,
@@ -141,7 +143,12 @@ def caller_end(r) -> bool:
     return r.path.endswith("/hangup") or r.params.get("EventName") in ("ParticipantExit", "MPCEnd")
 
 
-def test_a_queued_caller_whose_end_was_lost_is_abandoned_at_its_rings_room_check(world, tenant):
+def by_name(r) -> bool:
+    return r.method == "GET" and "/MultiPartyCall/name_" in r.path
+
+
+@pytest.mark.parametrize("plivo", ["reads_it_ended", "names_no_ended_room"])
+def test_a_queued_caller_whose_end_was_lost_is_abandoned_at_its_rings_room_check(world, tenant, plivo):
     agent = tenant.agent().login()
     agent.phone.unregister()
     number, _ = tenant.inbound_line(agent, wait_timeout_sec=600)
@@ -151,8 +158,22 @@ def test_a_queued_caller_whose_end_was_lost_is_abandoned_at_its_rings_room_check
     cid = stream.wait_for("offer.missed", agent_id=agent.id)["conversation_id"]
     caller.hangup()
     caller.wait_state("completed")
+    if plivo == "names_no_ended_room":
+        world.plivo.fault("reject", by_name, account=tenant.auth_id, times=math.inf, status=404)
     world.run_jobs("missed_mpc_event")
     assert stream.wait_for("conversation.closed", conversation_id=cid)["data"]["result"] == "abandoned"
+    assert lost.hits and not world.parked("missed_mpc_event", f"{cid}:0")
+
+
+def test_an_answered_callers_end_that_was_lost_is_found_by_the_room_check_where_its_queue_hands_it_back(world, tenant):
+    live = connect(
+        tenant, after_agent_action={"type": "redirect", "url": world.plivo.app("<Response><Hangup/></Response>")}
+    )
+    lost = world.plivo.fault("drop", lambda r: True, account=tenant.auth_id, times=math.inf)
+    live.caller.hangup()
+    live.caller.wait_state("completed")
+    world.run_jobs("missed_mpc_event")
+    live.stream.wait_for("conversation.wrap_up_started", conversation_id=live.id)
     assert lost.hits
 
 

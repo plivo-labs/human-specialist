@@ -36,6 +36,7 @@ from tests.acceptance.conftest import (
     unavailable,
 )
 from tests.acceptance.test_export import closed, content
+from tests.acceptance.test_provider_faults import by_name
 
 CUSTOMER = "+14155550601"
 TRACK_GRACE_SEC = 30
@@ -183,7 +184,7 @@ def test_a_warm_target_that_hangs_up_during_the_consult_reports_failed(tenant):
     assert live.leg.state == live.caller.state == "in_progress"
 
 
-def test_a_warm_target_answering_tells_the_transferring_agent(tenant):
+def test_a_warm_target_answering_tells_the_transferring_agent(world, tenant):
     target = tenant.agent("Target").login()
     live = connect(tenant)
     tid = ok(act(live.agent.api(), live.id, "transfers", {"mode": "warm", "target": to_agent(target)}))["transfer_id"]
@@ -191,6 +192,7 @@ def test_a_warm_target_answering_tells_the_transferring_agent(tenant):
     took = live.stream.wait_for("call.transferred", conversation_id=live.id, status="accepted")
     assert (took["data"]["transfer_id"], took["agent_id"]) == (tid, live.agent.id)
     assert took["data"]["target"] == {"type": "agent", "agent_id": target.id}
+    assert [str(p["relay_dtmf_inputs"]) for p in rings_to(world, target.endpoint_username)] == ["True"]
 
 
 def test_a_transfer_start_is_announced_with_its_target(tenant):
@@ -1067,16 +1069,20 @@ def test_a_participants_phone_rings_for_45_seconds_whatever_the_agents_ring_time
     phone.wait_ring()
     who = (live.agent.endpoint_username, helper.endpoint_username, number)
     assert [int(rings_to(world, w)[0]["ring_timeout"]) for w in who] == [20, 45, 45]
+    assert [str(rings_to(world, w)[0]["relay_dtmf_inputs"]) for w in who] == ["True", "True", "False"]
     offer = live.stream.wait_for("offer.created", conversation_id=live.id, agent_id=helper.id)
     assert offer["data"]["ring_timeout_sec"] == 45
 
 
-def test_a_supervisor_cannot_join_a_room_that_ended_unheard(world, tenant):
+@pytest.mark.parametrize("plivo", ["reads_it_ended", "names_no_ended_room"])
+def test_a_supervisor_cannot_join_a_room_that_ended_unheard(world, tenant, plivo):
     live, sup = floor(tenant)
     world.plivo.fault("drop", lambda r: "/plivo/" in r.path, account=tenant.auth_id, times=math.inf)
     live.caller.hangup()
     live.caller.wait_state("completed")
     world.wait(world.plivo.idle, what="the Plivo simulator to go idle")
+    if plivo == "names_no_ended_room":
+        world.plivo.fault("reject", by_name, account=tenant.auth_id, times=math.inf, status=404)
     error(monitor(sup.api(), live, mode="listen"), 409, "call_not_live")
     assert sup.phone.legs == []
 

@@ -90,23 +90,23 @@ def silent(tenant_id, agent_id) -> bool:
 def sweep(
     db, desks: list[tuple], held: list = (), rebuild: set = frozenset(), tried: Iterable[list] = ()
 ) -> tuple[list[tuple], list[tuple]]:
-    """The (tenant, agent, signed in) desks to sign out, which counted beats and then went 40 s without one, and
-    the (tenant, agent) desks signed in on a tenant it rebuilt. A tenant of `rebuild` gets its `cap` and `full` keys
-    rebuilt from `held`, rows as `audit` takes them, and its waiting conversations' `route` and `tried` keys from
-    `tried`, pages of rows of tenant, id, channel, stint, the agents tried mapped to their offers, and the ms a call
-    keeps them. Once `db` commits, one still without its epoch gives each agent signed in 40 s to beat and a count
-    raised past sign-in, so none is silent, and sets its epoch again; a rebuild that fails before then is the next
-    sweep's to run again."""
-    tenants = list({t for t, _, _ in desks})
+    """The rows of `desks` (tenant, agent, signed in, then any fields of the caller's) that counted beats and then went
+    40 s without one, and the (tenant, agent) desks signed in on a tenant it rebuilt. A tenant of `rebuild` gets its
+    `cap` and `full` keys rebuilt from `held`, rows as `audit` takes them, and its waiting conversations' `route` and
+    `tried` keys from `tried`, pages of rows of tenant, id, channel, stint, the agents tried mapped to their offers,
+    and the ms a call keeps them. Once `db` commits, one still without its epoch gives each agent signed in 40 s to
+    beat and a count raised past sign-in, so none is silent, and sets its epoch again; a rebuild that fails before
+    then is the next sweep's to run again."""
+    tenants = list({t for t, *_ in desks})
     with redis.pipeline(transaction=False) as p:
         for t in tenants:
             p.exists(EPOCH % t)
-        for t, a, _ in desks:
+        for t, a, *_ in desks:
             p.exists(HB % (t, a)).exists(BEATS % (t, a))
         found = p.execute()
     whole, keys = dict(zip(tenants, found, strict=False)), found[len(tenants) :]
     lost, rebuilt = {t: [EPOCH % t] for t in rebuild}, []
-    for t, a, signed_in in desks:
+    for t, a, signed_in, *_ in desks:
         if signed_in and t in lost:
             lost[t] += [HB % (t, a), BEATS % (t, a)]
             rebuilt.append((str(t), str(a)))
@@ -210,7 +210,7 @@ def audit(desks: list[tuple], held: list, channels: list[str]) -> tuple[list[tup
     to settle under the conversation's lock, and the (tenant, channel, agent) `full` names with fewer conversations
     than their cap, as after a cap was raised, for `settle` to take out of `full`."""
     stints, caps = _held(held)
-    seats = [(str(t), ch, str(a)) for t, a, _ in desks for ch in channels]
+    seats = [(str(t), ch, str(a)) for t, a, *_ in desks for ch in channels]
     with redis.pipeline(transaction=False) as p:
         for t, ch, a in seats:
             p.hgetall(CAP % (t, ch, a)).sismember(FULL % (t, ch), a)

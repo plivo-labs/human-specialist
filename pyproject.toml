@@ -1,6 +1,6 @@
 [project]
 name = "human-specialist"
-version = "0.2.0"
+version = "1.0.0"
 description = "Contact center engine for human agents on Plivo: voice, chat, SMS, WhatsApp, email, callbacks and tasks."
 readme = "README.md"
 license = "Apache-2.0"
@@ -32,7 +32,7 @@ packages = ["src/hs"]
 dev = [
     # Test-only: the simulator's reference for V3 signatures and AccessToken JWTs.
     "plivo==4.63.0",
-    "pytest==8.4.2",
+    "pytest==9.0.3",
     "pytest-xdist==3.8.0",
     # Pinned exactly: ruff's formatting shifts between releases.
     "ruff==0.16.3",
@@ -43,12 +43,16 @@ name = "cz_conventional_commits"
 tag_format = "v$version"
 version_scheme = "semver2"
 version_provider = "uv"
-major_version_zero = true
+major_version_zero = false
 update_changelog_on_bump = false
 annotated_tag = true
 version_files = [
     "src/hs/app.py:^    version=",
     "tests/contract/openapi.json:^    \"version\": ",
+    "deploy/gcp/Dockerfile:^FROM ",
+    "README.md:deploy.cloud.run",
+    "docs/deploy.md:deploy.cloud.run",
+    "deploy/aws/template.yaml:ghcr.io/plivo-labs/human-specialist:",
 ]
 
 [tool.pytest.ini_options]

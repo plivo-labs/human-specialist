@@ -1,6 +1,9 @@
+import type { PresenceStatus } from "./types";
+
 export const operatorKey = (v: FormDataEntryValue | null) => String(v).trim().replace(/^HS_OPERATOR_KEY=/, "");
 export const phone = (n?: string | null) =>
   /^\+1\d{10}$/.test(n ?? "") ? `+1 ${n!.slice(2, 5)} ${n!.slice(5, 8)} ${n!.slice(8)}` : n || "Unknown number";
+export const dialable = (typed: string) => typed.replace(/[\s().-]/g, "");
 
 export function clock(seconds: number) {
   const s = Math.max(0, Math.floor(seconds));
@@ -33,6 +36,9 @@ export function ago(iso: string) {
   const [unit, size] = UNITS.find(([, n]) => Math.abs(sec) >= n) ?? ["second", 1];
   return new Intl.RelativeTimeFormat([], { numeric: "auto" }).format(Math.round(sec / size), unit);
 }
+
+export const COLORS: Record<string, string> = { "#27AE7D": "Green", "#EB5757": "Red", "#EBA000": "Amber", "#9B9FAA": "Gray" };
+export const hue = (s?: PresenceStatus) => s?.color?.toUpperCase() ?? "#9B9FAA";
 
 export const plain = (code: unknown) => String(code ?? "").replaceAll("_", " ");
 

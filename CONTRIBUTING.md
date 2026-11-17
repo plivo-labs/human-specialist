@@ -23,10 +23,14 @@ tests/           unit, contract and acceptance tests
 tests/harness/   the black-box World and the Plivo simulator
 tests/migration/ the shared-database migration tests
 tests/fuzz/      the seeded random walk
-docker/          the image, the self-hosted stack and the test stack
+docker/          the Docker Compose stack, its start script and UI image, and the test stack
+deploy/          AWS, Google Cloud, and the image's start commands for hosted platforms
+examples/plugin/ a working plugin, built in CI
 ui/              the optional reference UI: a React app (Vite, TypeScript, Tailwind)
 docs/            architecture and reference pages
 ```
+
+`Dockerfile`, `render.yaml`, `app.json` and `heroku.yml` stay at the root, where the platforms read them; [docs/deploy.md](docs/deploy.md#where-the-deploy-files-live) says which platform reads each deploy file.
 
 Each domain in `src/hs/` owns its routes, logic and storage. [docs/architecture.md](docs/architecture.md#modules) lists what each module owns and the one-way order of imports, and its glossary explains the names the code uses (assignment, entry, round, room, ring).
 

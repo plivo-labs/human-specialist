@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 from redis import Redis, RedisError, ResponseError
 from redis import TimeoutError as RedisTimeout
 from redis.client import Pipeline
-from sqlalchemy import func, insert, select, text, update
+from sqlalchemy import event, func, insert, select, text, update
 from sqlalchemy.exc import OperationalError
 
 from hs import access, agents, config, core, jobs, routing
@@ -24,8 +24,10 @@ from hs import app as service
 from hs import conversations as cv
 from hs.config import models as m
 from hs.core import T
-from hs.voice import mpc
+from hs.voice import flow, mpc
 from tests.harness import AGE
+from tests.unit.test_config import held, waiter
+from tests.unit.test_mpc import blocked
 
 client = TestClient(service.app)
 ADMITS = {"": {4, 5, 6}, "=": {5}, "!=": {4, 6}, "<>": {4, 6}, "<": {4}, "<=": {4, 5}, ">": {6}, ">=": {5, 6}}
@@ -672,6 +674,25 @@ def test_a_call_miss_at_the_strike_limit_moves_the_agent_to_break(floor, channel
         assert (moved.agent_id, moved.data["reason"]) == (str(missing), "rona")
     else:
         assert (presence.status_id, presence.misses) == (floor.available, 1), "text offers carry no strikes"
+
+
+def test_a_ring_whose_leg_ends_as_its_miss_commits_frees_the_agent_for_the_next_call(floor, monkeypatch):
+    agent, leg = floor.agent(), uuid.uuid4().hex
+    q = floor.queue(agents=[agent], agents_at_once=1, retries=1)
+    first = floor.enqueue(q)
+    with core.tx() as db:
+        cv.edit(db, next(iter(cv.rows(db, cv.lock(db, first).id, ("offered",)))), call_uuid=leg)
+    second = floor.enqueue(q)
+    form = {"CallUUID": leg, "EventName": "Hangup", "PlivoHangupCauseCode": "6010"}
+    hangup, answered = partial(mpc.call_status, first, uuid.uuid4(), SimpleNamespace(id=floor.tenant), form), []
+
+    def ended(db, conv, a) -> None:
+        db.info["after_commit"].insert(0, lambda: answered.append(hangup().status_code))
+
+    monkeypatch.setitem(routing.CHANNELS, "call", routing.Channel(None, routing.CHANNELS["call"].ring, ended))
+    jobs.run_now("offer_timeout", str(floor.offer_of(first, agent).id), wait=True)
+    floor.route_agent(agent)
+    assert answered == [200] and floor.offers(first, "missed") == [agent] and floor.offers(second) == [agent]
 
 
 def test_an_agent_who_turns_unavailable_loses_its_offers_and_the_next_agent_gets_them(floor):
@@ -1868,6 +1889,179 @@ def admin(floor) -> TestClient:
 def bearer(floor, agent) -> dict:
     with core.tx() as db:
         return {"Authorization": f"Bearer {access.mint(db, floor.tenant, agent).agent_token}"}
+
+
+def lunch(floor, agent) -> uuid.UUID:
+    """A status the agent sits in and the RONA setting names, with a default to fall back to once it is deleted."""
+    with core.tx() as db:
+        floor.doc(db, "status", {"name": "Rest", "availability": False, "default": True})
+        status = floor.doc(db, "status", {"name": "Lunch", "availability": False})
+    floor.status(agent, status)
+    floor.settings(rona=m.Stored(rona={"status_id": str(status)}).rona.model_dump(mode="json"))
+    return status
+
+
+class Sent:
+    """A DBAPI cursor that counts the statements Postgres receives: psycopg2 sends an executemany row by row, and an
+    execute_values batch page by page."""
+
+    def __init__(self, cursor, sent: list):
+        self.cursor, self.sent = cursor, sent
+
+    def __getattr__(self, name: str):
+        return getattr(self.cursor, name)
+
+    def execute(self, *args):
+        self.sent.append(1)
+        return self.cursor.execute(*args)
+
+    def executemany(self, statement, rows):
+        self.sent.extend(1 for _ in rows)
+        return self.cursor.executemany(statement, rows)
+
+
+def test_a_status_delete_tells_and_wakes_each_of_its_agents_in_as_many_statements_for_three_as_for_one(
+    floor, monkeypatch
+):
+    """The delete holds every presence row of the tenant while it writes, so the statements Postgres receives do not
+    grow with its agents."""
+    with core.tx() as db:
+        floor.doc(db, "status", {"name": "Rest", "availability": False, "default": True})
+    api, sent, many = admin(floor), [], core.engine.dialect.do_executemany
+    monkeypatch.setattr(core.engine.dialect, "do_executemany", lambda c, *a, **k: many(Sent(c, sent), *a, **k))
+
+    def count(conn, cursor, statement, params, context, executemany) -> None:
+        if not executemany:
+            sent.append(1)
+
+    def deleted(n: int) -> tuple[int, list]:
+        with core.tx() as db:
+            status = floor.doc(db, "status", {"name": f"Lunch {n}", "availability": False})
+        moved = [floor.agent() for _ in range(n)]
+        with core.tx() as db:
+            db.execute(update(T.presence).where(T.presence.c.agent_id.in_(moved)).values(status_id=status))
+        sent.clear()
+        event.listen(core.engine, "before_cursor_execute", count)
+        try:
+            assert api.delete(f"/api/v1/agent-statuses/{status}").status_code == 204
+        finally:
+            event.remove(core.engine, "before_cursor_execute", count)
+        return len(sent), moved
+
+    (one, _), (three, moved) = deleted(1), deleted(3)
+    told = {e.agent_id for e in floor.events("agent.status_changed") if e.data["reason"] == "admin"}
+    assert one == three and set(map(str, moved)) <= told and all(job("route_agent", a) for a in moved)
+
+
+def deleting_status_meets(floor, status, then) -> tuple[int, object]:
+    """Run `then` while the delete of `status` holds every presence row of the tenant and waits to repoint the RONA
+    setting, until `then` waits on the delete; returns the delete's status code and what `then` returned."""
+    api, ready, release = admin(floor), Future(), threading.Event()
+    tenant = select(T.tenant.c.id).where(T.tenant.c.id == floor.tenant).with_for_update(key_share=True)
+    with ThreadPoolExecutor(3) as pool:
+        try:
+            pool.submit(held, tenant, ready, release)
+            deleting = pool.submit(api.delete, f"/api/v1/agent-statuses/{status}")
+            assert (deleter := waiter(ready.result(5))), "the delete holds the presence rows and waits for the settings"
+            running = pool.submit(then)
+            assert waiter(deleter), "it waits for the delete"
+        finally:
+            release.set()
+    return deleting.result().status_code, running.result()
+
+
+def transfer_ringing(floor, queue, target) -> uuid.UUID:
+    """A call `queue` holds whose transfer to `target` still rings."""
+    cid = floor.open().id
+    with core.tx() as db:
+        conv = cv.set_state(db, cv.lock(db, cid), "queued", queue_id=queue, queued_at=func.now())
+        cv.offer(db, conv, target, via="transfer", transfer_id=uuid.uuid4())
+    return cid
+
+
+def ring_meets(floor, status, cid, then=None) -> tuple:
+    """The caller's room ends around `cid`'s ringing transfer. Its re-ring pauses once it holds its targets' presence
+    rows; the delete of `status` then waits for them, holding every lower agent's, and `then` runs until it waits too.
+    Returns the re-ring's XML, the delete's status code and what `then` returned."""
+    api, paused, release, ringing, pid = admin(floor), Future(), threading.Event(), [], Future()
+
+    def pause(conn, cursor, statement, *_) -> None:
+        if threading.get_ident() in ringing and "FOR SHARE OF p" in statement and not paused.done():
+            paused.set_result(cursor.connection.get_backend_pid())
+            release.wait(10)
+
+    def ring() -> list:
+        ringing.append(threading.get_ident())
+        with core.tx() as db:
+            return flow._ringing(db, cv.lock(db, cid))
+
+    def run() -> object:
+        with core.tx() as db:
+            pid.set_result(db.exec_driver_sql("SELECT pg_backend_pid()").scalar())
+            return then(db)
+
+    event.listen(core.engine, "after_cursor_execute", pause)
+    try:
+        with ThreadPoolExecutor(3) as pool:
+            try:
+                rung, ringer = pool.submit(ring), paused.result(5)
+                deleting = pool.submit(api.delete, f"/api/v1/agent-statuses/{status}")
+                assert waiter(ringer), "the delete waits for the targets' presence"
+                running = then and pool.submit(run)
+                assert not then or blocked(pid.result(5)), "it waits"
+            finally:
+                release.set()
+            return rung.result(), deleting.result().status_code, running and running.result()
+    finally:
+        event.remove(core.engine, "after_cursor_execute", pause)
+
+
+def test_a_re_ring_that_overflows_a_status_delete_and_an_enqueue_into_the_overflow_queue_all_commit(floor):
+    """Agent a sorts before b. The re-ring of the transfer to b holds b's presence; the delete of a status holds a's
+    and waits for b's; an enqueue into q1 holds q1 and waits for a's. The re-ring then overflows from its disabled
+    queue q0 into q1."""
+    a, b = sorted((floor.agent(), floor.agent()), key=str)
+    status, q1 = lunch(floor, b), floor.queue(agents=[a])
+    q0 = floor.queue(enabled=False, overflow_action={"type": "queue", "queue_id": str(q1)})
+    cid, other = transfer_ringing(floor, q0, b), floor.open().id
+
+    def enqueue(db) -> list:
+        return flow.run(db, cv.lock(db, other), {"type": "queue", "queue_id": str(q1)}, True)
+
+    rung, deleted, enqueued = ring_meets(floor, status, cid, enqueue)
+    assert rung and enqueued and deleted == 204
+    assert (floor.conv(cid).queue_id, floor.conv(other).queue_id) == (q1, q1)
+
+
+def test_a_re_ring_whose_target_has_no_slot_left_and_the_delete_of_a_status_both_commit(floor):
+    """Agent a sorts before b, whose call slot another call took meanwhile. The re-ring holds b's presence while the
+    delete of a status holds a's and waits for b's; with b not rung again, the queue's round offers the call to a."""
+    a, b = sorted((floor.agent(), floor.agent()), key=str)
+    status, q0 = lunch(floor, b), floor.queue(agents=[a])
+    cid = transfer_ringing(floor, q0, b)
+    cap = CAP % (floor.tenant, "call", b)
+    core.redis.delete(cap)
+    core.redis.hset(cap, "elsewhere", str(uuid.uuid4()))
+    assert ring_meets(floor, status, cid)[1] == 204
+    assert floor.offers(cid) == [a]
+
+
+def test_a_round_that_retires_a_lost_offer_and_the_delete_of_its_agents_status_both_commit(floor):
+    """Redis lost agent a's offer while its timer survived, as a rebuild leaves it. The round that retires the offer
+    frees a, then waits on b's presence row, which the delete of a's status holds."""
+    a, b = floor.agent(), floor.agent()
+    status, q = lunch(floor, a), floor.queue(agents=[a, b])
+    cid = floor.open("sms").id
+    with core.tx() as db:
+        cv.offer(db, cv.set_state(db, cv.lock(db, cid), "queued", queue_id=q, queued_at=func.now()), a)
+    core.redis.delete(routing.hot.OFFERS % (floor.tenant, cid))
+
+    def round_() -> list:
+        with core.tx() as db:
+            return [o.agent_id for o in routing.route(db, cv.lock(db, cid))]
+
+    assert deleting_status_meets(floor, status, round_) == (204, [b])
+    assert floor.offers(cid) == [b] and floor.status_of(a).status_id != status
 
 
 def test_an_agent_answers_only_its_own_open_text_offer_through_the_api(floor):

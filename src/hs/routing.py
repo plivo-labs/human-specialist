@@ -14,12 +14,11 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import islice
-from operator import itemgetter
 from typing import Any
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Response
-from sqlalchemy import func, select, text, update
+from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.engine import Connection, Row
 
 from hs import access, agents, config, conversations, events, hot, jobs
@@ -426,7 +425,9 @@ def _sweep(job: Row) -> None:
     with tx() as db:
         for cid in sorted(strays):
             jobs.schedule(db, "next_round", {"conversation_id": cid}, key=cid)
-        for tenant_id, agent_id, _ in silent:
+        for tenant_id, agent_id, _, on_break in silent:
+            if on_break:  # its beat count stays, so the same session coming back is no sign-in
+                continue
             payload = {"tenant_id": str(tenant_id), "agent_id": str(agent_id)}
             jobs.schedule(db, "agent_offline", payload, key=str(agent_id))
         _wake(db, hot.freed(odd, held, room))
@@ -435,8 +436,8 @@ def _sweep(job: Row) -> None:
 
 
 def _wake(db: Connection, agents) -> None:
-    for tenant_id, agent_id in conversations.by_agent(agents, itemgetter(1)):
-        jobs.schedule(db, "route_agent", {"tenant_id": tenant_id, "agent_id": agent_id}, key=agent_id)
+    for tenant_id, agent_id in agents:
+        jobs.schedule_last(db, "route_agent", {"tenant_id": tenant_id, "agent_id": agent_id}, key=agent_id)
 
 
 @jobs.handler("sticky_rebuild", lane="slow")
@@ -489,6 +490,16 @@ def _offer_timeout(job: Row) -> None:
                 reoffer(db, conv, a)
         elif conversations.retire_lost(db, conv, lost):
             jobs.schedule(db, "next_round", {"conversation_id": str(conv.id)}, key=str(conv.id))
+
+
+def waited_out(db: Connection, conv: Row) -> bool:
+    """A queued caller whose stint's wait timeout is due, so Plivo may have taken it out of its room by the wait time.
+    The stint's timer holds the wait its room was seated with, whatever its queue says now; one already claimed was
+    due, though a failed run moved it on. HS starts the timer before Plivo seats the caller, so Plivo's wait time
+    never runs out sooner, and a caller that left its room before then left it some other way."""
+    J = T.jobs
+    due = (J.c.kind == "queue_timeout", J.c.key == str(conv.id), or_(J.c.run_at <= func.now(), J.c.attempts > 0))
+    return conv.state == "queued" and db.execute(select(J.c.id).where(*due)).first() is not None
 
 
 @jobs.handler("queue_timeout")

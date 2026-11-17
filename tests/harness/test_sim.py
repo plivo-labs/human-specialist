@@ -286,10 +286,10 @@ def test_wait_timeout_exits_the_member_to_its_exit_action(sim, fake, line):
     )
     customer = sim.call(line.number).wait_state("completed", timeout=4)
     exit_action = fake.wait("/exit").params
-    assert (
-        exit_action["ParticipantExitCause"] == "Member Wait Timeout Triggered"
-        and exit_action["MPCFriendlyName"] == "mpc_q1"
-    )
+    assert (exit_action["MPCFriendlyName"], exit_action["ParticipantCallUUID"]) == ("mpc_q1", customer.call_uuid)
+    assert "CallUUID" not in exit_action and "ParticipantExitCause" not in exit_action
+    left = fake.wait("/mpc", EventName="ParticipantExit").params
+    assert left["ParticipantExitCause"] == "Member Wait Timeout Triggered"
     assert customer.said == ["Sorry"]
     fake.wait("/mpc", EventName="MPCEnd")
     trail = fake.trail()
@@ -302,7 +302,9 @@ def test_a_member_waits_out_its_wait_time_on_demand(sim, fake, line):
     customer = sim.call(line.number)
     customer.wait_out()
     customer.wait_state("completed")
-    assert fake.wait("/exit").params["ParticipantExitCause"] == "Member Wait Timeout Triggered"
+    fake.wait("/exit")
+    left = fake.wait("/mpc", EventName="ParticipantExit").params
+    assert left["ParticipantExitCause"] == "Member Wait Timeout Triggered"
 
 
 def test_dtmf_in_the_mpc_and_a_transfer_out_of_it(sim, fake, line):
@@ -347,7 +349,9 @@ def test_stay_alone_off_exits_the_last_member_to_its_exit_action(sim, fake, line
     customer = _agent_in_queue(sim, fake, line, phone)
     phone.wait_ring().wait_state("in_progress").hangup()
     customer.wait_state("completed")
-    assert fake.wait("/exit").params["ParticipantExitCause"] == "sim:alone"
+    fake.wait("/exit")
+    left = fake.wait("/mpc", EventName="ParticipantExit", ParticipantCallUUID=customer.call_uuid).params
+    assert left["ParticipantExitCause"] == "sim:alone"
     end = fake.wait("/mpc", EventName="MPCEnd").params
     assert end["MPCTerminationCause"] == "sim:alone"
     mpc = line.api.get("MultiPartyCall/name_mpc_q1/").json()
@@ -369,6 +373,17 @@ def test_a_leg_answering_after_mpc_end_starts_a_fresh_mpc(sim, fake, line):
     joined = fake.wait("/mpc", EventName="ParticipantJoin", ParticipantRole="Agent").params
     assert joined["MPCUUID"] != first and joined["MemberAddress"] == _sip(phone).removeprefix("sip:")
     assert line.api.delete(f"Call/{leg.call_uuid}/").status_code == 204
+
+
+def test_a_call_reads_live_until_it_ends(sim, fake, line):
+    fake.replies["/answer"] = _queue_xml(fake)
+    caller = sim.call(line.number)
+    fake.wait("/mpc", EventName="ParticipantJoin")
+    live = line.api.get(f"Call/{caller.call_uuid}/", params={"status": "live"})
+    assert (live.status_code, live.json()["call_status"]) == (200, "in-progress")
+    caller.hangup()
+    caller.wait_state("completed")
+    assert line.api.get(f"Call/{caller.call_uuid}/", params={"status": "live"}).status_code == 404
 
 
 def test_add_participant_validates_like_plivo_and_moves_a_live_leg(sim, fake, line):

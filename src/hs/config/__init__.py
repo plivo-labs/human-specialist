@@ -11,12 +11,13 @@ from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from functools import partial
+from itertools import islice
 from types import SimpleNamespace
 from typing import Annotated
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, Path, Response
+from fastapi import APIRouter, Depends, Path, Request, Response
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ValidationError, create_model
 from redis import RedisError
@@ -32,9 +33,10 @@ from hs.core import PUBLIC, ApiError, Page, Paging, T, after_commit, page, pagin
 
 router = APIRouter()
 OP, ADMIN, ADMIN_AGENT = (access.require(*g) for g in (("op",), ("key:admin", "admin"), ("key:admin", "agent")))
-# name -> availability; the first two are the sign-in and sign-out statuses.
-STATUSES = {"Available": True, "Offline": False, "Idle": False, "Busy": False, "After Contact Work": False}
-STATUSES |= {"Away": False, "Break": False}
+OP_OR_SETUP = access.require("op", "setup")
+# The built-in statuses, name -> color: the first two are the sign-in and sign-out ones, only the first is available.
+STATUSES = {"Available": "#27AE7D", "Offline": "#9B9FAA", "Idle": "#EBA000", "Busy": "#EBA000"}
+STATUSES |= {"After Contact Work": "#EBA000", "Away": "#EBA000", "Break": "#EBA000"}
 # Body fields that name another document, and its kind.
 REFS = {"agents": "agent", "agent_id": "agent", "teams": "team", "skill_id": "skill", "queue_id": "queue"}
 REFS |= {"menu_id": "menu", "business_hours_id": "hours", "parent_disposition_id": "disposition", "status_id": "status"}
@@ -42,13 +44,15 @@ REFS |= {"holiday_group_id": "holiday_group"}
 SOFT_DELETED_KINDS = ("queue",)
 _SERIAL = text("SELECT pg_advisory_xact_lock(hashtext(:key))")
 _SHARED = text("SELECT pg_advisory_xact_lock_shared(hashtext(:key))")
-# Takes a deleted team or skill off every agent and queue that names it, locking those rows in id order.
+# Takes a deleted team or skill off every queue and agent that names it, locking the queues first, in `:order` and
+# then id order, and the agents after them.
 _STRIP = text(
     "UPDATE config c SET updated_at = now(), body = jsonb_set(c.body, ARRAY[:field], coalesce((SELECT jsonb_agg(e)"
     " FROM jsonb_array_elements(c.body->:field) e WHERE coalesce(e->>'skill_id', e #>> '{}') <> :id), '[]'))"
     " FROM (SELECT id FROM config WHERE tenant_id = :tenant AND kind IN ('agent', 'queue') AND EXISTS (SELECT 1"
     "  FROM jsonb_array_elements(body->:field) e WHERE coalesce(e->>'skill_id', e #>> '{}') = :id)"
-    "  ORDER BY id FOR UPDATE) hit WHERE c.id = hit.id"
+    "  ORDER BY kind = 'agent', array_position(CAST(:order AS uuid[]), id), id FOR UPDATE) hit"
+    " WHERE c.id = hit.id"
 )
 _OUTSIDE = text(
     "SELECT 1 FROM config c, jsonb_array_elements(c.body->'skills') e WHERE c.tenant_id = :tenant AND c.kind = 'agent'"
@@ -179,8 +183,9 @@ def owned(db: Connection, p: Principal, kind: str, ids: Iterable) -> None:
     access.owned(db, p, kind, parsed)
 
 
-def check(db: Connection, p: Principal, body: BaseModel, stored: BaseModel | None = None) -> None:
-    """422 foreign_id unless every id the body names, at any depth, is a document of the caller's tenant."""
+def check(db: Connection, p: Principal, body: BaseModel, stored: BaseModel | None = None, row_id=None) -> None:
+    """422 foreign_id unless every id the body names, at any depth, is a document of the caller's tenant. A queue's
+    overflow may not lead back to it: a call would circle the ring with no queue to seat it."""
     wanted: dict[str, set] = {}
     kept = set(_refs(stored))
     for path, kind, value in _refs(body):
@@ -199,6 +204,12 @@ def check(db: Connection, p: Principal, body: BaseModel, stored: BaseModel | Non
         dates = {h["date"] for h in get(db, p.tenant_id, "holiday_group", body.holiday_group_id)["holidays"]}
         if {d.isoformat() for d in body.selected_holidays} - dates:
             raise ApiError(422, "invalid_holiday", "a selected holiday is not in the holiday group")
+    if row_id and isinstance(body, m.QueueIn) and isinstance(to := body.overflow_action, m.QueueAction):
+        nexts, ring = _overflows(db, p.tenant_id) | {str(row_id): str(to.queue_id)}, [str(row_id)]
+        while (q := nexts.get(ring[-1])) and q not in ring:
+            ring.append(q)
+        if q == ring[0]:
+            raise ApiError(422, "overflow_loop", "the queue's overflow leads back to it", {"queues": ring})
 
 
 # One config writer per tenant at a time; take per-document row locks if admin write rates ever matter.
@@ -333,7 +344,7 @@ def crud(
         with write(p) as db:
             row = found(db, p.tenant_id, kind, rid, lock=True)
             merged = validate_model(stored or model, row.body | body.model_dump(mode="json", exclude_unset=True))
-            check(db, p, merged)
+            check(db, p, merged, row_id=row.id)
             if on_patch:
                 on_patch(db, p, merged, row)
             return show(p, save(db, row.id, merged.model_dump(mode="json")))
@@ -351,8 +362,22 @@ def crud(
         return Response(status_code=204)
 
 
+def _overflows(db: Connection, tenant_id) -> dict[str, str]:
+    acts = ((str(q.id), q.body.get("overflow_action") or {}) for q in db.execute(docs(tenant_id, "queue")))
+    return {q: a["queue_id"] for q, a in acts if a.get("type") == "queue"}
+
+
 def _strip(field: str, db: Connection, p: Principal, row: Row) -> None:
-    db.execute(_STRIP, {"tenant": p.tenant_id, "field": field, "id": str(row.id)})
+    """An enqueue into a full queue holds its row while it enqueues into the queue it overflows to, so each queue is
+    locked before every queue its overflow leads to. Writes refuse overflow loops, so the order is total; a loop
+    stored behind the API gets a best-effort order."""
+    nexts = _overflows(db, p.tenant_id)
+
+    def hops(q: str, seen: frozenset = frozenset()) -> int:
+        return 0 if q not in nexts or q in seen else 1 + hops(nexts[q], seen | {q})
+
+    order = sorted(nexts, key=hops, reverse=True)
+    db.execute(_STRIP, {"tenant": p.tenant_id, "field": field, "id": str(row.id), "order": order})
 
 
 def _skill_changed(db: Connection, p: Principal, now: m.SkillIn, row: Row) -> None:
@@ -422,14 +447,12 @@ def _status_deleted(db: Connection, p: Principal, row: Row) -> None:
     if moved:
         _store(db, p.tenant_id, **moved)
     moving = update(P).where(P.c.status_id == row.id).values(status_id=to.id, since=func.now())
-    for agent_id in sorted(db.execute(moving.returning(P.c.agent_id)).scalars()):
-        data = {
-            "from_status": {"id": sid, "name": row.body["name"]},
-            "to_status": {"id": str(to.id), "name": to.body["name"]},
-            "available": to.body["availability"],
-        }
-        events.emit(db, "agent.status_changed", str(p.tenant_id), data | {"reason": "admin"}, agent_id=str(agent_id))
-        jobs.schedule(db, "route_agent", {"tenant_id": str(p.tenant_id), "agent_id": str(agent_id)}, key=str(agent_id))
+    data = {"from_status": {"id": sid, "name": row.body["name"]}, "reason": "admin"}
+    data |= {"to_status": {"id": str(to.id), "name": to.body["name"]}, "available": to.body["availability"]}
+    if agents := sorted(map(str, db.execute(moving.returning(P.c.agent_id)).scalars())):
+        events.emit(db, "agent.status_changed", str(p.tenant_id), data, agents=agents)
+    for agent_id in agents:
+        jobs.schedule_last(db, "route_agent", {"tenant_id": str(p.tenant_id), "agent_id": agent_id}, key=agent_id)
 
 
 def _name_free(kind: str, db: Connection, p: Principal, body: m.NameIn, row: Row | None = None) -> None:
@@ -551,9 +574,9 @@ def patch_settings(body: dict, p: Principal = ADMIN):
 
 def _seed(db: Connection, tenant_id: UUID, app_id: str | None) -> None:
     statuses = {name: uuid.uuid4() for name in STATUSES}
-    for (name, available), key in zip(STATUSES.items(), ("online", "offline", *[None] * 5), strict=True):
-        doc = {"name": name, "availability": available, "sequence": list(STATUSES).index(name), "default": True}
-        add(db, tenant_id, "status", doc, key, statuses[name])
+    for (name, color), key in zip(STATUSES.items(), ("online", "offline", *[None] * 5), strict=True):
+        doc = {"name": name, "availability": key == "online", "sequence": list(STATUSES).index(name), "default": True}
+        add(db, tenant_id, "status", doc | {"color": color}, key, statuses[name])
     system = {name: uuid.uuid4() for name in m.SYSTEM_DISPOSITIONS}
     for n, name in enumerate(m.SYSTEM_DISPOSITIONS, 1):
         doc = {"name": name, "parent_id": None, "note_required": False, "system": True, "sequence": n}
@@ -575,22 +598,27 @@ def _exists(tenant_id) -> ApiError:
 
 
 @router.post("/tenants", status_code=201, response_model=m.Registered)
-def register(body: m.TenantIn, _: Principal = OP):
+def register(body: m.TenantIn, request: Request, p: Principal = OP_OR_SETUP):
     """Registers a Plivo account, or a sub-account, by its Auth ID and Auth Token. Checks the credentials with Plivo,
-    points a new Plivo application at HS unless `plivo_app` is false, and seeds the tenant."""
+    whose reply names the tenant when the body does not, points a new Plivo application at HS unless `plivo_app` is
+    false, and seeds the tenant. Without the operator key while setup lasts, only the Plivo account
+    HS_SETUP_PLIVO_AUTH_ID names, 10 tries from one client in 15 minutes."""
+    access.claims(p, body.plivo_auth_id)
+    if p.kind == "setup" and (wait := hot.sign_in_tried({f"setup:{access.client(request)}": 10}, 900)):
+        raise ApiError(429, "too_many_attempts", "too many tries to register; try again later", {"retry_after": wait})
     t = T.tenant
     held = select(t.c.id).where(t.c.plivo_auth_id == body.plivo_auth_id)
     with read() as db:
         if existing := db.execute(held).scalar():
             raise _exists(existing)
     account = {"plivo_auth_id": body.plivo_auth_id, "plivo_token_enc": plivo.encrypt(body.plivo_auth_token)}
-    plivo.rest(SimpleNamespace(**account), "GET", "")
+    named = str(plivo.rest(SimpleNamespace(**account), "GET", "").get("name") or "").strip()[:200]
     fallback = {"fallback_answer_url": url, "fallback_method": "POST"} if (url := body.fallback_answer_url) else {}
     tenant_id, app_id = uuid.uuid4(), None
     intent = body.plivo_app and intend(tenant_id, "Application", f"hs-{tenant_id}", **account)
     try:
         with tx() as db:
-            row = insert(t).values(id=tenant_id, name=body.name, **account)
+            row = insert(t).values(id=tenant_id, name=body.name or named or body.plivo_auth_id, **account)
             if (tenant := db.execute(row.on_conflict_do_nothing().returning(*t.c)).first()) is None:
                 raise _exists(db.execute(held).scalar())
             app_id = plivo.register_app(tenant, **fallback) if intent else None
@@ -689,6 +717,21 @@ def list_numbers(p: Principal = ADMIN, paged: Paging = Depends(paging)):
     with read() as db:
         rows = page_rows(db, docs(p.tenant_id, "number"), paged, T.config.c.key, str)
     return page([_number(r) for r in rows], paged, "number")
+
+
+@router.get("/numbers/available", response_model=Page[m.PlivoNumber])
+def available_numbers(p: Principal = ADMIN, paged: Paging = Depends(paging)):
+    """The phone numbers on the tenant's Plivo account, in Plivo's order, each with whether the tenant routes it.
+    Routing one is a choice the caller makes with PUT /numbers/{number}."""
+    if not ((after := paged.after or "0").isascii() and after.isdigit() and len(after) < 10):
+        raise ApiError(422, "invalid_cursor", "cursor is not one this API returned")
+    with read() as db:
+        tenant = live_tenant(db, p.tenant_id)
+        routed = set(db.execute(docs(p.tenant_id, "number").with_only_columns(T.config.c.key)).scalars())
+    start = int(after)
+    numbers = [plivo.e164(o["number"]) for o in islice(plivo.listed(tenant, "Number/", start), paged.limit + 1)]
+    rows = [{"number": n, "routed": n in routed, "next_offset": start + i} for i, n in enumerate(numbers, 1)]
+    return page(rows, paged, "next_offset")
 
 
 @router.get("/numbers/{number}", response_model=m.EntryPoint)

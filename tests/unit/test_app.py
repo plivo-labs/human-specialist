@@ -1,10 +1,13 @@
+import dataclasses
 import json
 import logging
 import re
+import threading
 import time
 import timeit
 import uuid
 from logging.handlers import QueueHandler
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -12,11 +15,12 @@ import pytest
 from fastapi import APIRouter
 from fastapi.testclient import TestClient
 from prometheus_client import REGISTRY
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 
 from hs import access, core, events
 from hs import app as service
 from tests.harness.sim import serve
+from tests.unit.test_agents import Desk
 
 
 @pytest.fixture
@@ -184,6 +188,30 @@ def test_the_app_boots_and_status_answers():
         assert client.get("/status").json() == {"db": True}
 
 
+def test_a_status_poll_once_a_tenant_exists_asks_nothing_about_setup(monkeypatch):
+    client = TestClient(service.app)
+
+    def statements() -> list[str]:
+        sent = []
+
+        def count(conn, cursor, statement, *_):
+            sent.append(statement)
+
+        event.listen(core.engine, "before_cursor_execute", count)
+        try:
+            assert client.get("/status").json() == {"db": True}
+        finally:
+            event.remove(core.engine, "before_cursor_execute", count)
+        return sent
+
+    Desk()
+    baseline = statements()
+    monkeypatch.setattr(core, "settings", dataclasses.replace(core.settings, setup_plivo_auth_id="MAOWNER"))
+    monkeypatch.setattr(access, "CLAIMED", threading.Event())
+    assert len(statements()) == len(baseline) + 1, "the first poll looks for a tenant on the health check's connection"
+    assert statements() == baseline
+
+
 def test_a_plugin_gets_its_three_hooks(plugins):
     router = APIRouter()
     router.get("/extra/ping")(lambda: {"pong": True})
@@ -204,6 +232,103 @@ def test_a_plugin_gets_its_three_hooks(plugins):
         assert client.get("/extra/ping").json() == {"pong": True}
     assert {f"acme:{__name__}.{on_event.__qualname__}": on_event} == events.HOOKS
     assert [resolve] == access.RESOLVERS
+
+
+@pytest.fixture
+def ui(tmp_path, monkeypatch):
+    monkeypatch.setattr(service.app.router, "default", service.app.router.default)
+    # The app caches its OpenAPI document once built; one with a test's plugin route must not outlive the test.
+    monkeypatch.setattr(service.app, "openapi_schema", None)
+    monkeypatch.setattr(service, "UI", tmp_path)
+    return tmp_path
+
+
+def test_the_ui_answers_only_what_no_route_matched(ui, plugins):
+    (ui / "index.html").write_text("<div id=root></div>")
+    router = APIRouter()
+    router.get("/toy/hello")(lambda: {"hello": True})
+    plugins({"toy": lambda hs: hs.app.include_router(router)})
+    with TestClient(service.app) as client:
+        assert (
+            client.get("/").text == client.get("/desk/abc").text == client.get("/plivo").text == "<div id=root></div>"
+        )
+        assert client.get("/status").json() == {"db": True}
+        assert client.get("/openapi.json").json()["info"]["title"] == "human-specialist"
+        assert client.get("/toy/hello").json() == {"hello": True}
+        assert client.get("/api/v1/tenants").json()["error"]["code"] == "unauthorized"
+        assert client.get("/api/v1/sessions").status_code == 405, "a route's method mismatch is not the UI's"
+        assert client.get("/assets/missing.js").json()["error"]["code"] == "not_found"
+        assert client.head("/desk").status_code == 200
+
+
+def test_only_a_hashed_asset_is_cached_for_good_however_its_path_is_spelled(ui):
+    (ui / "index.html").write_text("<div id=root></div>")
+    (ui / "config.js").write_text('window.HS_URL = "";')
+    (ui / "assets").mkdir()
+    (ui / "assets" / "index-1a2b3c.js").write_text("export {};")
+    revalidated = [
+        "/",
+        "/index.html",
+        "/config.js",
+        "/assets/%2e%2e%2findex.html",
+        "/assets/%2e%2e%2fconfig.js",
+        "/desk/abc",
+    ]
+    with TestClient(service.app) as client:
+        for path, policy in [(p, "no-cache") for p in revalidated] + [("/assets/index-1a2b3c.js", "immutable")]:
+            first = client.get(path)
+            again = client.get(path, headers={"If-None-Match": first.headers["etag"]})
+            answers = [(r.status_code, policy in r.headers["cache-control"]) for r in (first, client.head(path), again)]
+            assert answers == [(200, True), (200, True), (304, True)], (path, answers)
+
+
+def test_a_request_the_ui_does_not_serve_answers_as_it_would_without_the_ui(ui, monkeypatch):
+    (ui / "index.html").write_text("<div id=root></div>")
+    api = [(m, p) for p in ("/api/v1/missing", "/plivo/missing", "/api") for m in ("GET", "HEAD", "POST", "OPTIONS")]
+    paths = (
+        "/status/x",
+        "/metrics",
+        "/nowhere",
+        "/deskx",
+        "/assets/missing.js",
+        "/desk/a.b",
+        "/desk/..%2f..%2fetc",
+        "/desk/%2e%2e/api/v1/x",
+        "/desk/%252e%252e/api/v1/x",
+        "/desk/%2e%2e%2f%2e%2e%2fapi",
+        "/desk/%252e%252e%252fapi",
+    )
+    unmatched = [*api, *[(m, p) for p in paths for m in ("GET", "HEAD")], ("POST", "/desk"), ("OPTIONS", "/desk")]
+
+    def answers() -> list:
+        with TestClient(service.app) as client:
+            sent = [client.request(method, path) for method, path in unmatched]
+        return [(r.status_code, r.content and r.json()["error"]) for r in sent]  # /plivo/ answers a bare status
+
+    monkeypatch.setattr(service, "UI", ui / "missing")
+    without = answers()
+    monkeypatch.setattr(service, "UI", ui)
+    assert answers() == without
+    assert {status for status, _ in without} == {404}
+
+
+def test_hs_and_the_bundled_proxy_serve_the_page_only_for_the_consoles_own_routes():
+    repo = Path(__file__).resolve().parents[2]
+    routes = re.findall(r'route(?::| ===) "/([^"?]+)"', (repo / "ui/src/main.tsx").read_text())
+    names, tail = service.CONSOLE.removeprefix("(").split(")", 1)
+    assert (sorted(names.split("|")), tail) == (sorted(routes), "(/[A-Za-z0-9_-]+)*/?$"), (
+        "every route, plain segments under it"
+    )
+    caddy = (repo / "docker/Caddyfile").read_text()
+    assert re.findall(r"^\s*@console (.+)$", caddy, re.M) == [f"path_regexp ^/{service.CONSOLE}"]
+    cached = dict(re.findall(r"^\s*header @(\w+) Cache-Control (.+)$", caddy, re.M))
+    assert cached == {"asset": '"public, max-age=31536000, immutable"', "page": "no-cache"}, "the service's policies"
+
+
+def test_with_no_ui_folder_the_root_is_not_found(tmp_path, monkeypatch):
+    monkeypatch.setattr(service, "UI", tmp_path / "missing")
+    with TestClient(service.app) as client:
+        assert client.get("/").json()["error"]["code"] == "not_found"
 
 
 def test_a_plugin_whose_setup_raises_stops_startup(plugins, caplog):

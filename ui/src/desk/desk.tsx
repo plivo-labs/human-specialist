@@ -1,16 +1,17 @@
 import * as Menu from "@radix-ui/react-dropdown-menu";
-import { ChevronDown, Phone as Dial } from "lucide-react";
+import { ChevronDown, MessageSquare, Phone as Dial } from "lucide-react";
 import { type ReactNode, useEffect, useReducer, useRef, useState } from "react";
 import { ApiError, BASE, type Page, asAgent, every, hold, reloadToSignIn, renew, renewals } from "../api";
 import { CHANNEL } from "../conversations";
-import { phone as number, plain, time } from "../format";
+import { ago, hue, phone as number, plain, time } from "../format";
 import { NO_PASSWORD, renewDue } from "../held";
 import { Dropdown, go, menuItem } from "../shell";
-import type { Conversation, ConversationSummary, Disposition, Envelope, Me, PresenceStatus, Session, Status, TransferTargets } from "../types";
-import { Button, Card, Field, Form, Input, Lamp, Listed, Modal, Notice, Submit, act, cls, failed, useLoad } from "../ui";
+import type { Conversation, ConversationSummary, Destination, Disposition, Envelope, Me, PresenceStatus, Session, Status, Task, Template, TransferTargets } from "../types";
+import { Button, Card, Field, Form, Input, Lamp, Listed, Modal, Notice, PhoneInput, Select, Submit, Textarea, act, cls, failed, useLoad } from "../ui";
 import { type Phone, startPhone } from "./phone";
 import { CallWidget, Offers } from "./stage";
-import { type Action, type State, TASK, autoAnswer, frames, init, namesMe, onDial, onLine, reduce, sdkFree, stalled } from "./state";
+import { fill, holes } from "./template";
+import { type Action, type State, TASK, autoAnswer, frames, history, init, namesMe, onDial, onLine, own, recent, recentCalls, reduce, sdkFree, stalled } from "./state";
 
 export type Ctx = { s: State; dispatch: (a: Action) => void; phone: { current: Phone | null }; loadLine: (cid: string) => Promise<void>; loadAll: () => void; now: number; ends: number };
 type Render = { session: Session; children: (ctx: Ctx) => ReactNode };
@@ -57,6 +58,7 @@ function Live({ session: first, children, boot: [me, statuses, dispositions] }: 
   ref.current = s;
   const phone = useRef<Phone | null>(null);
   const asked = useRef<Record<string, number>>({});
+  const timed = useRef(new Set<string>());
   const tried = useRef(0);
   const lastEvent = useRef("");
   const sdkToken = useRef(first.plivo.access_token);
@@ -73,8 +75,21 @@ function Live({ session: first, children, boot: [me, statuses, dispositions] }: 
       }
     });
     if (n === asked.current[cid] && conv !== undefined) dispatch({ type: "line", cid, conv });
+    const mine = !!conv?.assignments.some((a) => a.agent_id === me.id);
+    if (n === asked.current[cid] && conv !== undefined && !mine) timed.current.delete(cid);
+    if (mine && !timed.current.has(cid)) {
+      timed.current.add(cid);
+      history((after) => asAgent<Page<Envelope>>("GET", `/api/v1/conversations/${cid}/timeline?after=${after}&limit=200`), () => timed.current.has(cid)).then(
+        (events) => dispatch({ type: "history", events }),
+        (e) => {
+          if (e instanceof ApiError && e.status < 500) return;
+          timed.current.delete(cid);
+          failed("Loading the activity", e);
+        },
+      );
+    }
     if (conv && TASK.has(conv.channel))
-      asAgent<Page<{ title: string }>>("GET", `/api/v1/tasks?conversation_id=${cid}&limit=1`).then((t) => t.data[0] && dispatch({ type: "names", names: { [cid]: t.data[0].title } }), () => {});
+      asAgent<Page<Task>>("GET", `/api/v1/tasks?conversation_id=${cid}&limit=50`).then((t) => own(t.data, cid)).then((mine) => mine && dispatch({ type: "names", names: { [cid]: mine.title } }), () => {});
   };
 
   const loadAll = () =>
@@ -200,16 +215,20 @@ function Live({ session: first, children, boot: [me, statuses, dispositions] }: 
   return children({ s, dispatch, phone, loadLine, loadAll, now, ends });
 }
 
-export const Desked = ({ ctx, children }: { ctx: Ctx; children: ReactNode }) => (
+// On the inbox at md and wider the cards top the My Conversations column, scrolling so the list keeps 14rem: the
+// page's columns join this grid. Elsewhere both wrappers are `contents`, so the cards size against the desk as before.
+export const Desked = ({ ctx, inbox, children }: { ctx: Ctx; inbox: boolean; children: ReactNode }) => (
   <div className="flex h-full flex-col">
     <Warnings s={ctx.s} dispatch={ctx.dispatch} ends={ctx.ends} now={ctx.now} />
-    <Offers ctx={ctx} />
-    <CallWidget ctx={ctx} />
-    <div className="min-h-0 flex-1 overflow-auto">{children}</div>
+    <div className={cls("contents", inbox && "md:grid md:min-h-0 md:flex-1 md:grid-cols-[315px_minmax(0,1fr)_auto] md:grid-rows-[minmax(0,auto)_minmax(14rem,1fr)]")}>
+      <div className={cls("contents", inbox && "md:col-start-1 md:row-start-1 md:block md:overflow-y-auto md:border-r md:border-st2 md:*:max-h-none")}>
+        <Offers ctx={ctx} />
+        <CallWidget ctx={ctx} />
+      </div>
+      <div className={cls("min-h-0 flex-1 overflow-auto", inbox && "md:contents")}>{children}</div>
+    </div>
   </div>
 );
-
-export const tint = (st?: PresenceStatus) => (st?.availability ? "var(--available)" : (st?.color ?? "var(--tertiary)"));
 
 export function StatusMenu({ ctx: { s, dispatch } }: { ctx: Ctx }) {
   const current = s.statuses.find((x) => x.id === s.me.status?.id);
@@ -220,7 +239,7 @@ export function StatusMenu({ ctx: { s, dispatch } }: { ctx: Ctx }) {
       className="max-h-[170px] w-[222px]"
       trigger={
         <Button size="sm" className="gap-2">
-          <Lamp color={tint(current)} />
+          <Lamp color={hue(current)} />
           {current?.name ?? s.me.status?.name ?? "Offline"}
           <ChevronDown className="opacity-60" aria-hidden />
         </Button>
@@ -237,7 +256,7 @@ export function StatusMenu({ ctx: { s, dispatch } }: { ctx: Ctx }) {
             })
           }
         >
-          <Lamp color={tint(st)} />
+          <Lamp color={hue(st)} />
           {st.name}
         </Menu.Item>
       ))}
@@ -245,9 +264,10 @@ export function StatusMenu({ ctx: { s, dispatch } }: { ctx: Ctx }) {
   );
 }
 
+const off = (s: State) => (s.me.role === "admin" ? "Turn it on under Settings, Outbound Configurations." : "An admin turns it on under Settings, Outbound Configurations.");
+
 export function cantCall(s: State) {
-  const off = s.me.role === "admin" ? "Turn it on under Settings, Outbound Configurations." : "An admin turns it on under Settings, Outbound Configurations.";
-  if (!s.me.settings.agent_direct_dial) return `Calling out is off. ${off}`;
+  if (!s.me.settings.agent_direct_dial) return `Calling out is off. ${off(s)}`;
   if (s.lines.some((l) => l.conv.channel === "call" || l.via === "outbound")) return "Finish the current call first.";
   return s.phone.state === "ready" ? "" : "Calling needs this browser's phone, which is not ready. The notice above says why.";
 }
@@ -266,22 +286,145 @@ export function Dialer({ ctx }: { ctx: Ctx }) {
   const dial = async (to: string) => (await callOut(ctx, to)) && setOpen(false);
   return (
     <>
-      <Button className={cls(why && "opacity-60")} title={why || undefined} onClick={() => setOpen(true)}>
-        <Dial aria-hidden /> Call
+      <Button className={cls("max-sm:px-2.5", why && "opacity-60")} title={why || undefined} onClick={() => setOpen(true)}>
+        <Dial aria-hidden /> <span className="max-sm:sr-only">Call</span>
       </Button>
       <Modal open={open} onClose={() => setOpen(false)} title="Outgoing call">
         {why ? (
           <p className="pb-2 text-p-400 text-secondary">{why}</p>
         ) : (
-          <Form onSubmit={(f) => dial(String(f.get("to")).trim())}>
-            <Field label="Number" hint="This browser connects first, then the customer's phone rings.">
-              <Input name="to" required autoFocus inputMode="tel" placeholder="+14155550100" pattern="\+\d{6,15}" title="A plus sign, then the country code and number" />
+          <>
+            <Form onSubmit={(f) => dial(String(f.get("to")))}>
+              <Field label="Number" hint="This browser connects first, then the customer's phone rings.">
+                <PhoneInput name="to" required autoFocus />
+              </Field>
+              <Submit className="justify-self-end">Call</Submit>
+            </Form>
+            <Recent me={ctx.s.me.id} dial={dial} />
+          </>
+        )}
+      </Modal>
+    </>
+  );
+}
+
+const cantMessage = (s: State) =>
+  !s.me.settings.agent_direct_dial ? `Messaging out is off. ${off(s)}` : s.statuses.find((x) => x.id === s.me.status?.id)?.availability ? "" : "Set a status that takes conversations first.";
+
+export function Messenger({ ctx }: { ctx: Ctx }) {
+  const [open, setOpen] = useState(false);
+  const [channel, setChannel] = useState("sms");
+  const [tpl, setTpl] = useState<Filled>();
+  const why = cantMessage(ctx.s);
+  const ready = channel === "sms" || !!tpl?.values.every((v) => v.trim());
+  const send = async (f: FormData) => {
+    const to = String(f.get("to"));
+    const content = channel === "sms" ? { text: f.get("text") } : { template: fill(tpl!.t, tpl!.values) };
+    const made = await act(`Messaging ${number(to)}`, () => asAgent<{ conversation_id: string }>("POST", `/api/v1/conversations`, { channel, to, agent_id: ctx.s.me.id, ...content }), "Message sent");
+    if (!made) return;
+    setOpen(false);
+    ctx.loadLine(made.conversation_id);
+    go(`/desk/${made.conversation_id}`);
+  };
+  return (
+    <>
+      <Button className={cls("max-sm:px-2.5", why && "opacity-60")} title={why || undefined} onClick={() => setOpen(true)}>
+        <MessageSquare aria-hidden /> <span className="max-sm:sr-only">Message</span>
+      </Button>
+      <Modal open={open} onClose={() => setOpen(false)} title="New message">
+        {why ? (
+          <p className="pb-2 text-p-400 text-secondary">{why}</p>
+        ) : (
+          <Form onSubmit={send}>
+            <Field label="Channel">
+              <Select value={channel} onChange={(e) => setChannel(e.target.value)}>
+                <option value="sms">SMS</option>
+                <option value="whatsapp">WhatsApp</option>
+              </Select>
             </Field>
-            <Submit className="justify-self-end">Call</Submit>
+            <Field label="Number">
+              <PhoneInput name="to" required autoFocus />
+            </Field>
+            {channel === "sms" ? (
+              <Field label="Message">
+                <Textarea name="text" required />
+              </Field>
+            ) : (
+              <Templates tpl={tpl} set={setTpl} />
+            )}
+            <Submit className="justify-self-end" disabled={!ready}>
+              Send
+            </Submit>
           </Form>
         )}
       </Modal>
     </>
+  );
+}
+
+type Filled = { t: Template; values: string[] };
+
+function Templates({ tpl, set }: { tpl?: Filled; set: (f?: Filled) => void }) {
+  const load = useLoad(() => every<Template>((c) => asAgent<Page<Template>>("GET", `/api/v1/whatsapp/templates?status=approved&limit=200${c}`)));
+  // A pick lives only as long as the list it came from: closing the window or switching channel drops it.
+  useEffect(() => () => set(undefined), []);
+  return (
+    <Listed load={{ ...load, error: load.error && `The WhatsApp templates did not load. ${load.error}` }} empty={<p className="text-s-400 text-secondary">No approved WhatsApp templates. They come from the WhatsApp accounts in the organization's settings.</p>}>
+      {(all) => (
+        <>
+          <Field label="Template" hint={tpl?.t.components.find((c) => c.type.toLowerCase() === "body")?.text}>
+            <Select
+              required
+              value={tpl?.t.id ?? ""}
+              onChange={(e) => {
+                const t = all.find((x) => x.id === e.target.value);
+                set(t && { t, values: holes(t).map(() => "") });
+              }}
+            >
+              <option value="">Pick an approved template</option>
+              {all.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.name} ({t.language})
+                </option>
+              ))}
+            </Select>
+          </Field>
+          {tpl &&
+            holes(tpl.t).map((h, i) => (
+              <Field key={`${tpl.t.id}-${i}`} label={h.label}>
+                <Input required type={h.media ? "url" : "text"} value={tpl.values[i]} onChange={(e) => set({ ...tpl, values: tpl.values.with(i, e.target.value) })} />
+              </Field>
+            ))}
+        </>
+      )}
+    </Listed>
+  );
+}
+
+function Recent({ me, dial }: { me: string; dial: (to: string) => Promise<unknown> }) {
+  const load = useLoad(() =>
+    Promise.all([
+      recentCalls(asAgent, me),
+      every<Destination>((c) => asAgent<Page<Destination>>("GET", `/api/v1/transfer-destinations?limit=200${c}`)).catch((e) => (console.warn("The contacts' names did not load", e), [])),
+    ]),
+  );
+  return (
+    <section aria-labelledby="recent-calls" className="mt-5 grid gap-1 border-t pt-4">
+      <h3 id="recent-calls" className="text-s-500 text-secondary">Recent calls</h3>
+      <Listed load={{ ...load, data: load.data && recent(load.data[0].data, load.data[1]) }} empty={<p className="text-s-400 text-secondary">No calls out yet.</p>}>
+        {(calls) =>
+          calls.map((c) => (
+            <button key={c.id} type="button" className="flex min-h-9 items-center justify-between gap-2 rounded-sm px-2 py-1 text-left text-s-400 hover:bg-muted" aria-label={`Call ${c.name ?? number(c.number)} again`} onClick={() => dial(c.number!)}>
+              <span className="grid">
+                {c.name}
+                <span className="font-mono">{number(c.number)}</span>
+              </span>
+              <span className="text-tertiary">{ago(c.created_at)}</span>
+            </button>
+          ))
+        }
+      </Listed>
+    </section>
   );
 }
 

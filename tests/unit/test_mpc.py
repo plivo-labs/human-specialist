@@ -123,17 +123,50 @@ def state(cid) -> tuple:
         )
 
 
-def checked(t: Tenant, conv, monkeypatch) -> tuple:
-    monkeypatch.setattr(mpc.plivo, "rest", lambda *_, **__: {"status": "Ended", "objects": []})
+NOT_FOUND = mpc.plivo.Refused(422, "plivo_refused", "Plivo refused the request", {"status": 404})
+
+
+def ended(_, method: str, path: str, **__) -> dict:
+    """Plivo once the caller hung up: its room reads ended and its leg is not live."""
+    if path.startswith("Call/"):
+        raise NOT_FOUND
+    return {"status": "Ended", "objects": []}
+
+
+def checked(t: Tenant, conv, monkeypatch, rest=ended) -> tuple:
+    monkeypatch.setattr(mpc.plivo, "rest", rest)
     mpc._check(SimpleNamespace(payload={"tenant_id": str(t.id), "conversation_id": str(conv.id), "room": conv.room}))
+    jobs.run_now("plivo", f"live:{t.id}:{conv.call_uuid}", wait=True)
     return state(conv.id)
 
 
-def test_a_waited_out_callers_late_queue_exit_reads_queue_timeout_after_the_room_check_saw_its_room_end(monkeypatch):
+def test_a_room_that_reads_404_while_an_agent_joins_it_ends_nothing_while_the_callers_leg_is_live(monkeypatch):
+    """Plivo names a room only while it is on, so a room that has not started yet reads 404 too; here another replica
+    records the agent's join while the check reads the room."""
+    t = Tenant()
+    conv = queued(t, 600, edited=600, ago=0)
+    with core.tx() as db:
+        offer = cv.offer(db, cv.lock(db, conv.id), t.agent())
+
+    def rest(_, method: str, path: str, **__) -> dict:
+        if path.startswith("Call/"):
+            return {"call_uuid": conv.call_uuid, "call_status": "in-progress"}
+        with core.tx() as db:
+            cv.lock(db, conv.id)
+            cv.move(db, offer, "accept")
+        raise NOT_FOUND
+
+    assert checked(t, conv, monkeypatch, rest) == ("live", None)
+
+
+@pytest.mark.parametrize("cause", [{}, {"ParticipantExitCause": flow.WAIT_TIMEOUT}], ids=["doc", "cause"])
+def test_a_waited_out_callers_late_queue_exit_reads_queue_timeout_after_the_room_check_saw_its_room_end(
+    monkeypatch, cause
+):
     t = Tenant()
     conv = queued(t, 600, edited=600, ago=601)
     assert checked(t, conv, monkeypatch) == ("queued", None)
-    exit = {"CallUUID": conv.call_uuid, "ParticipantExitCause": flow.WAIT_TIMEOUT}
+    exit = {"ParticipantCallUUID": conv.call_uuid, **cause}
     flow.queue_exit(conv.room, tenant=SimpleNamespace(id=t.id), form=exit)
     assert state(conv.id) == ("open", "queue_timeout")
 
@@ -470,3 +503,49 @@ def test_a_move_into_a_status_being_deleted_a_failed_ring_and_the_delete_all_com
     with core.read() as db:
         now = dict(db.execute(select(P.c.agent_id, P.c.status_id).where(P.c.agent_id.in_([a, b]))).all())
     assert now == {a: free, b: brk}
+
+
+def test_a_cold_transfer_the_redirect_records_while_its_call_closes_and_is_indexed_still_reaches_search():
+    """The redirect's record of a transfer pauses once it read the call; the caller's hangup closes the call, and its
+    search document is written, before the record's entry lands. The transfer still reaches search."""
+    t = Tenant()
+    conv = t.open()
+    with core.tx() as db:
+        source = cv.move(db, cv.offer(db, cv.lock(db, conv.id), t.agent()), "accept")
+        db.execute(update(T.assignment).where(T.assignment.c.id == source.id).values(state="done"))
+    x = {"from_assignment": str(source.id), "transfer_id": str(uuid.uuid4()), "channel": "call", "mode": "cold"}
+    p = {"tenant_id": str(t.id), "conversation_id": str(conv.id), "transfer": x, "action": {"type": "hangup"}}
+    paused, release, redirect = Future(), threading.Event(), []
+
+    def pause(conn, cursor, statement, *_) -> None:
+        reads = statement.lstrip().startswith("SELECT") and "conversation" in statement
+        if threading.get_ident() in redirect and reads and not paused.done():
+            paused.set_result(cursor.connection.get_backend_pid())
+            release.wait(10)
+
+    def redirected() -> None:
+        redirect.append(threading.get_ident())
+        mpc._redirected(p, {})
+
+    def hung_up() -> None:
+        with core.tx() as db:
+            cv.gone(db, cv.lock(db, conv.id))
+
+    sqlalchemy.event.listen(core.engine, "after_cursor_execute", pause)
+    try:
+        with ThreadPoolExecutor(2) as pool:
+            try:
+                recording = pool.submit(redirected)
+                pid = paused.result(5)
+                closing = pool.submit(hung_up)
+                if not waiter(pid):
+                    closing.result(5)
+                    jobs.run_now("search_index", str(conv.id), wait=True)
+            finally:
+                release.set()
+            recording.result(), closing.result()
+    finally:
+        sqlalchemy.event.remove(core.engine, "after_cursor_execute", pause)
+    jobs.run_now("search_index", str(conv.id), wait=True)
+    with core.read() as db:
+        assert "transfer" in db.execute(select(T.search.c.types).where(T.search.c.conversation_id == conv.id)).scalar()

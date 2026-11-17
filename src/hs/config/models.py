@@ -9,9 +9,10 @@ from typing import Annotated, Literal
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, create_model, model_validator
+from pydantic import AfterValidator, AwareDatetime, BaseModel, ConfigDict, Field, create_model, model_validator
 
 from hs import access
+from hs.core import ApiError, capped
 
 E164_PATTERN = r"^\+[1-9]\d{6,14}$"
 E164 = Annotated[str, Field(pattern=E164_PATTERN)]
@@ -36,7 +37,8 @@ def address(channel: str, value: str) -> str:
         value, pattern = "+" + "".join(value.split()).removeprefix("+"), E164_PATTERN
     else:
         return value
-    if not re.fullmatch(pattern, value):
+    # No address is longer, and the email pattern takes quadratic time on a crafted long one.
+    if len(value) > 320 or not re.fullmatch(pattern, value):
         raise ValueError(f"not an address of {channel}")
     return value
 
@@ -322,6 +324,27 @@ class _Inline:
 EnqueueRoute = Annotated[OwnRoute, _Inline()]
 
 
+class Turn(Body):
+    """One turn of the conversation a bot had with the customer before it handed over."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    role: Literal["customer", "bot"]
+    text: str = Field(min_length=1, max_length=4000)
+    at: AwareDatetime | None = None
+
+
+def _turns(turns: list[Turn]) -> list[Turn] | None:
+    """At most 200 turns and 32 KB of JSON; an empty list is none."""
+    if len(turns) > 200:
+        raise ApiError(422, "transcript_too_large", "transcript is at most 200 turns")
+    capped([t.model_dump(mode="json") for t in turns], 32768, "transcript")
+    return turns or None
+
+
+Transcript = Annotated[list[Turn], AfterValidator(_turns)]
+
+
 class QueueIn(Route, NameIn):
     enabled: bool = Field(True, description="A disabled queue refuses new contacts and keeps those it holds.")
     priority: int = Field(5, ge=1, le=10)
@@ -458,6 +481,11 @@ class EntryPointIn(Body):
 class EntryPoint(EntryPointIn):
     id: UUID
     number: str
+
+
+class PlivoNumber(BaseModel):
+    number: str
+    routed: bool = Field(description="Whether the tenant routes it: PUT /numbers/{number} stored its entry point.")
 
 
 Color = Annotated[str, Field(pattern=r"^#[0-9A-Fa-f]{6}$")]
@@ -735,7 +763,7 @@ class Stored(Settings):
 
 
 class TenantIn(BaseModel):
-    name: Name
+    name: Name | None = Field(None, description="Left out, the name Plivo gives the account, else its Auth ID.")
     plivo_auth_id: str = Field(min_length=1)
     plivo_auth_token: str = Field(min_length=1)
     fallback_answer_url: str | None = None

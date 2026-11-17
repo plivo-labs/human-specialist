@@ -9,7 +9,6 @@ transition is one guarded change: none means a duplicate or late event, and the 
 import json
 from datetime import UTC, datetime, timedelta
 from functools import partial
-from operator import attrgetter
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -563,6 +562,13 @@ def participant(db: Connection, a: Row, type_: str, alias: str | None = None, **
     emit_event(db, type_, a.tenant_id, a.conversation_id, data, a.agent_id)
 
 
+def supervised(db: Connection, conv: Row, a: Row, type_: str, agent_id) -> None:
+    """Tell `agent_id` what supervisor `a` does. `visible` is false only for a listener that has not revealed itself."""
+    seen = a.mode != "listen" or conv.routing.get("revealed") == str(a.id)
+    data = {"supervisor_id": str(a.agent_id), "mode": a.mode, "visible": seen}
+    emit_event(db, type_, conv.tenant_id, conv.id, data, agent_id)
+
+
 def _leave(db: Connection, a: Row) -> None:
     """After a cold transfer to a queue the wrap-up is manual and its slot waits for the room it left to end
     (`room_ended`)."""
@@ -616,7 +622,7 @@ def _free(db: Connection, a: Row) -> None:
         if a.reason in BUSY_OR_UNREGISTERED:
             db.execute(update(T.presence).where(T.presence.c.agent_id == a.agent_id).values(unreachable=True))
             payload["unreachable"] = True
-        jobs.schedule(db, "route_agent", payload, key=str(a.agent_id))
+        jobs.schedule_last(db, "route_agent", payload, key=str(a.agent_id))
         hot.give(db, a)
 
 
@@ -655,10 +661,9 @@ def move_out(db: Connection, a: Row, reason: str) -> Row | None:
     return move(db, a, "leave" if wraps else "end", reason=reason)
 
 
-def by_agent(rows, agent=attrgetter("agent_id")) -> list:
-    """Rows in agent-id order, `agent` reading each one's agent. Each frees its agent's shared `route_agent` job row,
-    so two conversations closing at once lock those rows in one order and cannot deadlock."""
-    return sorted(rows, key=lambda r: str(agent(r)))
+def by_agent(rows) -> list:
+    """Rows in agent-id order, the order a transaction takes several agents' rows in."""
+    return sorted(rows, key=lambda r: str(r.agent_id))
 
 
 def kick_agent(db: Connection, conv: Row, a: Row) -> None:
@@ -785,8 +790,15 @@ def depart(db: Connection, conv: Row, action: dict, by: str = "system", transfer
 def gone(db: Connection, conv: Row, result=None, every: list[Row] | None = None, why="caller_left", **cols):
     """The customer is gone, or `why` says otherwise: offers are withdrawn and stints end; the conversation waits in
     wrap-up for its agents, or closes now if none is left. Without `result` it is `answered` once an agent took it,
-    else `abandoned`. `every` is its rows if the caller read them; `cols` go with the move to wrap-up."""
+    else `abandoned`. `every` is its rows if the caller read them; `cols` go with the move to wrap-up. A call's warm
+    transfer target that joined is told it was removed, and a supervisor on it that it left, as no event of the call
+    reaches them once they are off."""
     every = rows(db, conv.id) if every is None else every
+    for a in (a for a in every if (a.channel, a.state) == ("call", "active")):
+        if (a.role, a.via) == ("secondary", "transfer"):
+            participant(db, a, "call.participant_removed", reason="removed")
+        elif a.role == "monitor":
+            supervised(db, conv, a, "supervisor.left", a.agent_id)
     out = {a.id: move_out(db, a, why) or a for a in by_agent([a for a in every if a.state in ON])}
     after = [out.get(a.id, a) for a in every]
     busy = any(a.state in ("active", "wrap_up") for a in after)
@@ -806,6 +818,14 @@ def entry(db: Connection, conv: Row, kind: str, body: dict, *, agent_id=None, pr
         if kind == "message" and conv.channel in TEXT:
             _said(db, conv, body.get("direction") == "inbound")
     return row
+
+
+def keep_transcript(db: Connection, conv: Row, turns: list | None) -> None:
+    """The first transcript a handoff brings stays: the caller holds the conversation's lock, so none races it. It is
+    dated at the opening, since it came before the handoff, so it never moves the last activity."""
+    E = T.entry
+    if turns and not db.execute(select(E.c.id).where(E.c.conversation_id == conv.id, E.c.kind == "transcript")).first():
+        entry(db, conv, "transcript", {"turns": [t.model_dump(mode="json") for t in turns]}, at=conv.opened_at)
 
 
 def set_marks(db: Connection, cid, *where, **marks) -> None:

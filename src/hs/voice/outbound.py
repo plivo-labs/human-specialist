@@ -141,7 +141,9 @@ def _seat(db: Connection, conv: Row, a: Row | None = None) -> Response:
         adding |= {"dial": str(a.id)} if conv.channel != "call" else {}
         adding |= {"path": f"{mpc.room_of(adding)}/Participant/", "params": lead}
         plivo.command(db, "dial", _key(adding), adding)
-    return plivo.xml(("MultiPartyCall", room | {"role": "Agent", "startMpcOnEnter": True}, name, *hold))
+    return plivo.xml(
+        ("MultiPartyCall", room | {"role": "Agent", "startMpcOnEnter": True, "relayDTMFInputs": True}, name, *hold)
+    )
 
 
 def answer(tenant: Row, form: dict, c: UUID | None, aid: UUID | None = None) -> Response:
@@ -211,23 +213,26 @@ def room(db: Connection, conv: Row, event: str, form: dict) -> bool:
     if a and leg and leg == conv.call_uuid and event in ("ParticipantJoin", "ParticipantExit"):
         _live(db, conv, a, speak=event == "ParticipantJoin")
     elif a and leg and leg == a.call_uuid and event == "ParticipantExit" and not _up(conv):
-        _failed(db, conv, a, "cancelled", flow.hangup_facts({}, "agent"), leg)
+        failed(db, conv, a, "cancelled", flow.hangup_facts({}, "agent"), leg)
         return True
     return conv.channel != "call"
 
 
-def _failed(db: Connection, conv: Row, a: Row, result: str, hangup: dict, ended: str | None = None) -> None:
+def failed(db: Connection, conv: Row, a: Row, result: str, hangup: dict, ended: str | None = None) -> None:
     """The call ended before the lead answered: call.failed and call.ended, told to the agent too, and it closes
-    with `result`; on a text or task conversation only the call ends. The agent's dial `a` is let go without wrap-up,
-    and every leg but the one that `ended` is hung up."""
+    with `result`; on a text or task conversation only the call ends. The agent's dial `a`, unless it was withdrawn
+    already, is let go without wrap-up, and every leg but the one that `ended` is hung up. A ring no leg's end told of
+    is cancelled, now when Plivo's reply to the Make Call is in, else when `_done` gets it."""
     if conv.channel != "call":
         conversations.end_joined(db, a, hangup, result)
         return
     flow.emit(db, "call.failed", conv, a.agent_id, result=result, hangup_cause_code=hangup["hangup_cause_code"])
     if a.state == "offered":
         conversations.move(db, a, "withdraw", reason="cancelled")
-    else:
+    elif a.state == "active":
         conversations.move(db, a, "end", reason=result)
+    if a.state != "active" and a.ring and not ended:
+        plivo.command(db, "cancel", str(a.id), {"tenant_id": str(a.tenant_id), "request_uuid": str(a.ring)})
     for leg in {a.call_uuid, conv.call_uuid} - {ended, None}:
         _hang(db, conv, leg)
     C = T.conversation
@@ -236,18 +241,19 @@ def _failed(db: Connection, conv: Row, a: Row, result: str, hangup: dict, ended:
 
 
 def status(tenant: Row, form: dict, c: UUID, aid: UUID | None = None) -> Response:
-    """A leg of an outbound call changed. The agent's leg ending before the lead answers cancels the call; once both
-    are on, the room takes the agent's end. The lead's leg is bound when first seen. The lead answering, or a hangup
-    that says it answered, makes the call live; its end tells call.ended, or fails a call it never answered."""
+    """A leg of an outbound call changed. The agent's leg ending before the lead answers cancels the call, as does the
+    end of a withdrawn dial whose call's end is untold (the call keeps any result it has); once both are on, the room
+    takes the agent's end. The lead's leg is bound when first seen. The lead answering, or a hangup that says it
+    answered, makes the call live; its end tells call.ended, or fails a call it never answered."""
     call_uuid, event = form.get("CallUUID", ""), form.get("EventName", "Hangup")
     with tx() as db:
         if (conv := mpc.find_conv(db, tenant, c)) is None or (a := mpc.dialed(db, conv, aid)) is None:
             conversations.hang_dial(db, conv, aid, "customer", call_uuid if event != "Hangup" else None)
             return Response()
-        if a.state == "offered" or call_uuid == a.call_uuid:
-            if not _up(conv) and a.state in ("offered", "active"):  # not once a move has let the agent go
-                by = "system" if a.state == "offered" else "agent"
-                _failed(db, conv, a, "cancelled", flow.hangup_facts(form, by), call_uuid)
+        if a.state in ("offered", "withdrawn") or call_uuid == a.call_uuid:
+            if (a.state == "withdrawn" and not flow._told(db, conv)) or (a.state in conversations.ON and not _up(conv)):
+                by = "agent" if a.state == "active" else "system"
+                failed(db, conv, a, conv.result or "cancelled", flow.hangup_facts(form, by), call_uuid)
             elif conv.channel != "call" and a.state == "active" and event == "Hangup":
                 conversations.end_joined(db, a, flow.hangup_facts(form, "agent"))
             return Response()
@@ -259,7 +265,7 @@ def status(tenant: Row, form: dict, c: UUID, aid: UUID | None = None) -> Respons
             conv = live
         if event == "Hangup" and not _up(conv):
             code = form.get("PlivoHangupCauseCode", "")
-            _failed(db, conv, a, RESULTS.get(code, "failed_carrier"), flow.hangup_facts(form, "customer"), call_uuid)
+            failed(db, conv, a, RESULTS.get(code, "failed_carrier"), flow.hangup_facts(form, "customer"), call_uuid)
         elif event == "Hangup":
             source, agent_left = form.get("PlivoHangupSource"), a.state != "active"
             by = "customer" if source == "Callee" else "agent" if source == "API Request" or agent_left else "system"
@@ -316,8 +322,14 @@ def _lost(p: dict, refused: plivo.Refused | None = None) -> None:
                 return
             answered = "assignment_id" in p and a.state != "offered"
             if not _up(conv) and not answered and not (joined and _live(db, conv, a)):
-                _failed(db, conv, a, "failed_carrier", flow.hangup_facts({}, "system"))
+                failed(db, conv, a, "failed_carrier", flow.hangup_facts({}, "system"))
             return
+
+
+def _away(db: Connection, conv: Row, a: Row) -> None:
+    """Routing withdrew the offers of an agent gone unavailable; one that is its dial ends its call."""
+    if a.via == "outbound":
+        failed(db, conv, a, "cancelled", conversations.no_cause("system", 0))
 
 
 def _unknown(p: dict) -> None:
@@ -336,7 +348,7 @@ def _check_later(db: Connection, p: dict) -> None:
 
 
 jobs.handler("dial_check", lane="plivo")(lambda job: _lost(job.payload))
-flow.DIALED |= {"answer": answer, "status": status, "room": room}
+flow.DIALED |= {"answer": answer, "status": status, "room": room, "away": _away}
 plivo.OPS["dial"] = plivo.Op(True, lambda t, p: plivo.rest(t, "POST", p["path"], **p["params"]), _done, _lost, _unknown)
 plivo.OPS["consent"] = plivo.Op(False, _consent)
 plivo.OPS["cancel"] = plivo.Op(False, lambda t, p: plivo.rest(t, "DELETE", f"Request/{p['request_uuid']}/"))

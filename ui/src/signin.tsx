@@ -1,82 +1,57 @@
-import { useState } from "react";
-import { ApiError, type Page, api, asAgent, every, hold, reloadToSignIn, mint, store } from "./api";
+import { type InputHTMLAttributes, useState } from "react";
+import { ApiError, BASE, type Page, api, asAgent, every, hold, reason, reloadToSignIn, mint, store } from "./api";
 import { operatorKey } from "./format";
-import { signInTrouble } from "./held";
-import { ROLES, SignInLink, allAgents, allQueues } from "./setup/agents";
-import { start } from "./setup/start";
+import { asksForKey, showsKey, signInTrouble } from "./held";
+import { ROLES, allAgents } from "./setup/agents";
+import { type Api, type Registered, registrar, start } from "./setup/start";
 import { go } from "./shell";
-import type { Disposition, Session } from "./types";
+import type { Agent, Disposition, Queue, Session } from "./types";
 import { Button, Card, Copy, Field, Form, Input, Modal, Notice, Submit, Tab, TabList, TabPanel, Tabs, act, useLoad } from "./ui";
 
-type Registered = { tenant_id: string; api_key: string };
+export type Minted = { key: string; email?: string | null };
+const HS = (key?: string): Api => ({
+  call: <T,>(method: string, path: string, body?: unknown) => api<T>(method, path, body, key),
+  agents: () => every<Agent>((c) => api<Page<Agent>>("GET", `/api/v1/agents?limit=200${c}`, undefined, key)),
+  queues: () => every<Queue>((c) => api<Page<Queue>>("GET", `/api/v1/queues?limit=200${c}`, undefined, key)),
+  dispositions: () => every<Disposition>((c) => api<Page<Disposition>>("GET", `/api/v1/dispositions?limit=200${c}`, undefined, key)),
+});
 
 const trouble = (e: unknown) => {
   const t = e instanceof ApiError && signInTrouble(e.code, e.details?.retry_after);
   return Promise.reject(t ? new Error(t) : e);
 };
-const enter = (route: string) => ((location.hash = route), location.reload());
-const Password = ({ label, name, hint, fresh }: { label: string; name: string; hint?: string; fresh?: boolean }) => (
-  <Field label={label} hint={hint}>
-    <Input name={name} type="password" required autoComplete={fresh ? "new-password" : "current-password"} {...(fresh && { minLength: 8, maxLength: 128 })} />
-  </Field>
-);
+const Entry = ({ label, hint, ...p }: InputHTMLAttributes<HTMLInputElement> & { label: string; hint?: string }) => <Field label={label} hint={hint}><Input required {...p} /></Field>;
+const Password = ({ label, name, fresh }: { label: string; name: string; fresh?: boolean }) => <Entry label={label} name={name} type="password" autoComplete={fresh ? "new-password" : "current-password"} {...(fresh && { minLength: 8, maxLength: 128 })} />;
 
 export function You() {
-  const first = store.get<boolean>("start");
   const agents = useLoad(allAgents);
   const bosses = agents.data?.filter((a) => a.role === "admin" || a.role === "supervisor") ?? [];
-  const sit = async (label: string, run: () => Promise<Session>) => {
-    const s = await act(label, run, "Signed in");
-    if (!s) return;
-    store.set("start", null);
-    hold({ key: null, session: s });
-    go("/desk");
+  const [asked, setAsked] = useState<string>();
+  const sit = async (label: string, run: () => Promise<{ session: Session | null }>, email?: string) => {
+    const r = await act(label, run, (r) => (r.session ? "Signed in" : "This email already has an account"));
+    if (r?.session) (hold({ key: null, session: r.session }), go("/desk"));
+    else if (r) setAsked(email);
   };
   return (
     <Card>
       <div className="grid gap-4">
-        <h1 className="title">{first ? "Get started" : "Who are you?"}</h1>
-        {first && (
-          <>
-            <p className="text-s-400 text-secondary">This is the organization's API key. It is shown only this once, so store it in your password manager now.</p>
-            <div className="flex items-center gap-2 rounded-sm bg-muted p-2">
-              <code className="min-w-0 flex-1 break-all px-1 font-mono text-s-400">{store.get<string>("key")}</code>
-              <Copy value={store.get<string>("key")!} />
-            </div>
-            <Field label="Your agents sign in here" hint="Hand them this link with the email and password you set for each under Settings, Users.">
-              <SignInLink />
-            </Field>
-          </>
-        )}
-        <p className="text-s-400 text-secondary">
-          {first
-            ? "Get started adds you as an administrator who signs in with this email and password, and a queue named General with you in it. It routes your number to General, lets agents call out with it as the caller ID, and adds the wrap-up outcomes Resolved, Follow-up needed and Not resolved when you have none. Change any of it later under Settings."
-            : "Your status, the dialer and the calls that ring here belong to the user you choose."}
-        </p>
+        <h1 className="title">Who are you?</h1>
         {agents.error && <Notice tone="danger">{agents.error}</Notice>}
-        {!first && bosses.map((a) => (
-          <Button key={a.id} size="md" className="justify-start" onClick={() => sit(`Signing in as ${a.name}`, () => mint(a.id))}>
+        {bosses.map((a) => (
+          <Button key={a.id} size="md" className="justify-start" onClick={() => sit(`Signing in as ${a.name}`, () => mint(a.id).then((session) => ({ session })))}>
             {a.name}, {ROLES[a.role ?? "agent"]}
           </Button>
         ))}
-        <Form onSubmit={(f) => sit(first ? "Getting started" : "Adding you", () => start({ call: api, agents: allAgents, queues: allQueues, dispositions: () => every<Disposition>((c) => api<Page<Disposition>>("GET", `/api/v1/dispositions?limit=200${c}`)) }, String(f.get("name")).trim(), first ? String(f.get("number")).trim() : undefined, { email: String(f.get("email")).trim(), password: String(f.get("password")) }))}>
-          <Field label={bosses.length && !first ? "Or add yourself" : "Your name"} hint={first ? undefined : "This adds you as an administrator, with a phone login on your Plivo account."}>
-            <Input name="name" required autoComplete="name" />
-          </Field>
-          <Field label="Your email">
-            <Input name="email" type="email" required autoComplete="username" />
-          </Field>
-          <Password label="Your password" name="password" hint="8 to 128 characters. You sign in with it from now on, with no key." fresh />
-          {first && (
-            <>
-              <Field label="Your phone number" hint="A number on your Plivo account. If a step fails, fix it and press Get started again: the steps already done stay done.">
-                <Input name="number" required inputMode="tel" placeholder="+14155550100" pattern="\+\d{6,15}" title="A plus sign, then the country code and number" />
-              </Field>
-            </>
-          )}
-          <Submit className="w-full">{first ? "Get started" : "Continue"}</Submit>
+        <Form onSubmit={(f) => {
+          const you = { name: String(f.get("name")).trim(), email: String(f.get("email")).trim(), password: String(f.get("password")) };
+          return sit("Adding you", () => start(HS(), you, asked === you.email ? "reset" : "add"), you.email);
+        }}>
+          <Entry label={bosses.length ? "Or add yourself" : "Your name"} name="name" autoComplete="name" />
+          <Entry label="Your email" name="email" type="email" autoComplete="username" />
+          <Password label="Your password" name="password" fresh />
+          <Submit className="w-full">{asked ? `Set a new password for ${asked}` : "Continue"}</Submit>
         </Form>
-        <Button variant="ghost" onClick={() => (store.set("start", null), go("/agents"))}>{first ? "Skip" : "Not now"}</Button>
+        <Button variant="ghost" onClick={() => go("/agents")}>Not now</Button>
       </div>
     </Card>
   );
@@ -84,30 +59,51 @@ export function You() {
 
 const SCOPES = ["admin", "sessions", "calls", "reports", "events", "recordings", "messages"];
 
-const welcome = (r: Registered, name?: string) => {
-  store.set("tenant", r.tenant_id);
-  store.set("tenantName", name);
-  hold({ key: r.api_key, session: null, signedOut: null });
-  store.set("start", true);
-  enter("/you");
-};
+export function NewKey({ shown, onDone }: { shown: Minted; onDone: () => void }) {
+  return (
+    <aside aria-labelledby="new-key" className="fixed bottom-4 right-4 z-40 grid w-[calc(100%-2rem)] max-w-sm gap-3 rounded-sm border bg-background p-4 shadow-sh1">
+      <h2 id="new-key" className="text-s-600">Organization API key</h2>
+      <p className="text-s-400 text-secondary">Shown once. Copy it now.</p>
+      <span className="flex items-center gap-2">
+        <Input readOnly value={shown.key} aria-label="Organization API key" className="font-mono" onFocus={(e) => e.target.select()} />
+        <Copy value={shown.key} />
+      </span>
+      {shown.email && <p className="text-s-400">You sign in as <span className="font-medium">{shown.email}</span>.</p>}
+      <span className="flex justify-end gap-2">
+        <Button onClick={() => go("/numbers")}>Add a phone number</Button>
+        <Button variant="primary" onClick={onDone}>Done</Button>
+      </span>
+    </aside>
+  );
+}
 
-export function SignIn() {
+export function SignIn({ onMinted }: { onMinted: (m: Minted) => void }) {
   const [taken, setTaken] = useState<{ tenant: string; operator: string }>();
+  const [askKey, setAskKey] = useState(false);
+  const [stopped, setStopped] = useState<string>();
+  const [reg] = useState(() => registrar((plivo, operator) => api<Registered>("POST", `/api/v1/tenants`, plivo, operator).catch((e) => refused(e, operator)), HS, () => hold({ key: null, session: null })));
+  const refused = (e: unknown, operator: string) => {
+    if (e instanceof ApiError && asksForKey(e.status, operator)) return setAskKey(true), Promise.reject(new Error("This server needs its operator key."));
+    if (e instanceof ApiError && e.code === "tenant_exists") setTaken({ tenant: String(e.details?.tenant_id), operator });
+    return Promise.reject(e);
+  };
+  const land = (tenant: string, key: string, you?: { me: Agent; session: Session | null }) => {
+    store.set("tenant", tenant);
+    hold({ key: you ? null : key, session: you?.session ?? null, signedOut: null });
+    onMinted({ key, email: you?.me.email });
+    go(you ? "/desk" : "/you");
+  };
+  const status = useLoad(() => fetch(`${BASE}/status`).then((r) => r.json() as Promise<{ setup?: boolean }>));
   const why = store.get<string>("signedOut");
-  const org = new URLSearchParams(location.hash.split("?")[1]).get("org");
+  const org = new URLSearchParams(location.search).get("org");
   return (
     <Card>
-      {why && (
-        <div className="mb-5">
-          <Notice>{why}</Notice>
-        </div>
-      )}
+      {why && <div className="mb-5"><Notice>{why}</Notice></div>}
       <Tabs defaultValue="password">
-        <TabList label="Sign in or register">
+        <TabList label="Sign in or register" fill>
           <Tab value="password">Sign in</Tab>
-          <Tab value="key">Organization key</Tab>
-          <Tab value="register">Register an organization</Tab>
+          <Tab value="key">API key</Tab>
+          <Tab value="register">Register</Tab>
         </TabList>
         <TabPanel value="password" className="pt-6">
           <Form
@@ -117,12 +113,10 @@ export function SignIn() {
               if (!s) return;
               if (org) store.set("tenant", org);
               hold({ key: null, session: s, signedOut: null });
-              enter("/desk");
+              location.assign("/desk");
             }}
           >
-            <Field label="Email">
-              <Input name="email" type="email" required autoComplete="username" autoFocus />
-            </Field>
+            <Entry label="Email" name="email" type="email" autoComplete="username" autoFocus />
             <Password label="Password" name="password" />
             <Submit className="w-full">Sign in</Submit>
           </Form>
@@ -132,48 +126,36 @@ export function SignIn() {
             onSubmit={async (f) => {
               const key = String(f.get("key")).trim();
               const ok = await act("Signing in", () => api("GET", `/api/v1/agents?limit=1`, undefined, key), "Signed in");
-              if (ok) {
-                hold({ key, session: null, signedOut: null });
-                enter("/you");
-              }
+              if (ok) (hold({ key, session: null, signedOut: null }), location.assign("/you"));
             }}
           >
-            <Field label="Organization API key" hint="For setup and integrations: the key shown when the organization was registered. People sign in with their email instead.">
-              <Input name="key" type="password" required autoComplete="off" autoFocus />
-            </Field>
+            <Entry label="Organization API key" name="key" type="password" autoComplete="off" autoFocus />
             <Submit className="w-full">Sign in</Submit>
           </Form>
         </TabPanel>
         <TabPanel value="register" className="pt-6">
           <Form
             onSubmit={async (f) => {
-              const operator = operatorKey(f.get("operator"));
-              const body = { name: f.get("name"), plivo_auth_id: String(f.get("auth_id")).trim(), plivo_auth_token: String(f.get("auth_token")).trim() };
-              const exists = (e: unknown) => (e instanceof ApiError && e.code === "tenant_exists" && setTaken({ tenant: String(e.details?.tenant_id), operator }), Promise.reject(e));
-              const r = await act("Registering the organization", () => api<Registered>("POST", `/api/v1/tenants`, body, operator).catch(exists), "Organization registered");
-              if (r) welcome(r, String(body.name));
+              const run = () => reg.submit(f, f.has("operator") ? operatorKey(f.get("operator")) : "");
+              const r = await act("Creating the organization", () => run().catch((e) => (setStopped(reg.pending() ? reason(e) : undefined), Promise.reject(e))), "Organization created");
+              if (r) land(r.tenant_id, r.api_key, r);
             }}
           >
-            <p className="text-s-400 text-secondary">First run only. This creates the organization, points a Plivo application at this server, and shows the organization's API key.</p>
-            <Field label="Operator key">
-              <Input name="operator" type="password" required autoComplete="off" placeholder="HS_OPERATOR_KEY from docker/.env" />
-            </Field>
-            <Field label="Organization name">
-              <Input name="name" required placeholder="Your company name" />
-            </Field>
-            <Field label="Plivo Auth ID" hint="From your Plivo account. A sub-account's Auth ID and Auth Token also work, and keep this organization's numbers and usage apart.">
-              <Input name="auth_id" required autoComplete="off" spellCheck={false} />
-            </Field>
-            <Field label="Plivo Auth Token">
-              <Input name="auth_token" type="password" required autoComplete="off" />
-            </Field>
-            <Submit className="w-full">Register organization</Submit>
+            <fieldset disabled={!!stopped} className="grid gap-5">
+              <Entry label="Plivo Auth ID" name="auth_id" autoComplete="off" spellCheck={false} />
+              <Entry label="Plivo Auth Token" name="auth_token" type="password" autoComplete="off" />
+              <Entry label="Email" name="email" type="email" autoComplete="username" />
+              <Password label="Password" name="password" fresh />
+              {showsKey(status.data?.setup, askKey) && <Entry label="Operator key" hint="The server's HS_OPERATOR_KEY." name="operator" type="password" autoComplete="off" autoFocus={askKey} />}
+            </fieldset>
+            {stopped && <Notice tone="danger">The organization is created, but its setup stopped. {stopped}</Notice>}
+            <Submit className="w-full">{stopped ? "Try again" : "Create organization"}</Submit>
             {taken && (
               <Notice>
-                This Plivo account is already registered here, and its key was shown only once.
+                This Plivo account is already registered. If its setup stopped partway, make a new organization key, then add yourself.
                 <Button className="mt-2" onClick={async () => {
                   const r = await act("Making a key", () => api<{ api_key: string }>("POST", `/api/v1/tenants/${taken.tenant}/api-keys`, { scopes: SCOPES }, taken.operator), "Key made");
-                  if (r) welcome({ tenant_id: taken.tenant, api_key: r.api_key });
+                  if (r) land(taken.tenant, r.api_key);
                 }}>Make a new organization key</Button>
               </Notice>
             )}
@@ -186,7 +168,7 @@ export function SignIn() {
 
 export function ChangePassword({ onClose }: { onClose: () => void }) {
   return (
-    <Modal open onClose={onClose} title="Change password" sub="Every session of yours ends, this one too, so you sign in again with the new password.">
+    <Modal open onClose={onClose} title="Change password" sub="This signs you out everywhere.">
       <Form
         onSubmit={async (f) => {
           const body = { current_password: f.get("current"), password: f.get("password") };
@@ -195,7 +177,7 @@ export function ChangePassword({ onClose }: { onClose: () => void }) {
         }}
       >
         <Password label="Current password" name="current" />
-        <Password label="New password" name="password" hint="8 to 128 characters." fresh />
+        <Password label="New password" name="password" fresh />
         <Submit className="justify-self-end">Change password</Submit>
       </Form>
     </Modal>

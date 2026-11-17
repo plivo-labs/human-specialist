@@ -501,7 +501,7 @@ def test_a_caller_left_alone_while_its_transfer_rings_waits_in_a_new_room_where_
     target = call.agent()
     call.transfer("warm", {"type": "agent", "agent_id": str(target)})
     [old] = call.rows(via="transfer")
-    form = {"CallUUID": call.caller, "ParticipantExitCause": "alone"}
+    form = {"ParticipantCallUUID": call.caller, "ParticipantExitCause": "alone"}
     answers = [flow.queue_exit(0, tenant=SimpleNamespace(id=call.tenant), form=form).body for _ in range(2)]
     conv, rings = call.conv(), call.rows(via="transfer", state="offered")
     assert answers[0] == answers[1] and f"hs-{call.cid}-1" in answers[0].decode()
@@ -520,7 +520,7 @@ def test_a_caller_left_alone_while_its_transfer_rings_waits_in_a_new_room_where_
 
 def test_cancelling_a_transfer_while_it_rings_again_withdraws_the_new_ring_and_the_queue_routes_the_caller(call):
     tid = call.transfer("warm", {"type": "agent", "agent_id": str(call.agent())})
-    form = {"CallUUID": call.caller, "ParticipantExitCause": "alone"}
+    form = {"ParticipantCallUUID": call.caller, "ParticipantExitCause": "alone"}
     flow.queue_exit(0, tenant=SimpleNamespace(id=call.tenant), form=form)
     [again] = call.rows(via="transfer", state="offered")
     calls.cancel_transfer(call.cid, uuid.UUID(tid), p=call.key)
@@ -867,7 +867,7 @@ def test_a_transfer_its_agent_hung_up_on_tells_nothing_once_the_queue_takes_the_
         db.execute(update(C).where(C.c.id == call.queue).values(body=C.c.body.concat({"after_agent_action": back})))
     calls.hangup(call.cid, p=call.key)
     call.exit(call.primary)
-    flow.queue_exit(0, tenant=SimpleNamespace(id=call.tenant), form={"CallUUID": call.caller})
+    flow.queue_exit(0, tenant=SimpleNamespace(id=call.tenant), form={"ParticipantCallUUID": call.caller})
     assert (call.conv().state, call.conv().room) == ("queued", 1)
     for args in held:
         publish(*args)
@@ -982,7 +982,7 @@ def test_a_teardown_that_waited_on_its_primarys_leg_leaves_the_stint_the_caller_
         assert (method, path) == ("DELETE", f"Call/{first}/")
         monkeypatch.setattr(plivo, "rest", plain)
         call.exit(call.primary)
-        flow.queue_exit(0, tenant=SimpleNamespace(id=call.tenant), form={"CallUUID": call.caller})
+        flow.queue_exit(0, tenant=SimpleNamespace(id=call.tenant), form={"ParticipantCallUUID": call.caller})
         [taken] = call.rows(agent_id=nxt)
         call.join(taken)
         monkeypatch.setattr(plivo, "rest", down)
@@ -1008,7 +1008,7 @@ def test_a_room_check_that_finds_the_room_ended_leaves_a_caller_its_queue_hands_
     call.exit(call.primary)
     monkeypatch.setattr(plivo, "rest", lambda tenant, method, path, **params: {"status": "Ended", "objects": []})
     mpc._check(SimpleNamespace(payload={"tenant_id": str(call.tenant), "conversation_id": str(call.cid), "room": 0}))
-    answer = flow.queue_exit(0, tenant=SimpleNamespace(id=call.tenant), form={"CallUUID": call.caller})
+    answer = flow.queue_exit(0, tenant=SimpleNamespace(id=call.tenant), form={"ParticipantCallUUID": call.caller})
     assert "https://example.com/rate" in answer.body.decode()
 
 
@@ -1127,3 +1127,36 @@ def test_a_dial_into_a_text_conversation_and_the_accept_of_an_offer_there_both_c
     with pytest.raises(ApiError) as refused:
         dialing.result()
     assert refused.value.code == "conversation_not_joinable"
+
+
+def test_a_teardown_the_old_code_left_on_a_ringing_dial_ends_the_call_and_cancels_the_ring(call):
+    a, ring = call.agent(), uuid.uuid4()
+    with core.tx() as db:
+        conv, dial = outbound._open(
+            db, call.key, outbound.DialIn(agent_id=a, to="+15550003"), {"id": str(a)}, NUMBER, "sip:u@x"
+        )
+        cv.edit(db, dial, ring=ring)
+        calls._mark(db, conv, [])
+    calls._tear_down(conv.id, conv.room)
+    call.cid = conv.id
+    ended = call.conv()
+    assert (ended.state, ended.result) == ("closed", "cancelled") and len(call.events("call.failed")) == 1
+    assert call.job(f"cancel:{dial.id}").payload["request_uuid"] == str(ring)
+
+
+@pytest.mark.parametrize("hook", [False, True])
+def test_a_withdrawn_dials_hangup_closes_a_call_whose_end_no_one_told_and_its_end_is_told_once(call, hook):
+    a = call.agent()
+    with core.tx() as db:
+        conv, dial = outbound._open(
+            db, call.key, outbound.DialIn(agent_id=a, to="+15550003"), {"id": str(a)}, NUMBER, "sip:u@x"
+        )
+        withdrawn = cv.move(db, dial, "withdraw", reason="agent_offline")
+        if hook:
+            outbound._away(db, conv, withdrawn)
+    hangup, tenant = {"CallUUID": uuid.uuid4().hex, "HangupCauseCode": "1000"}, SimpleNamespace(id=call.tenant)
+    for _ in range(2):
+        outbound.status(tenant, hangup, conv.id, dial.id)
+    call.cid = conv.id
+    assert (call.conv().state, call.conv().result) == ("closed", "cancelled")
+    assert [len(call.events(kind)) for kind in ("call.failed", "call.ended")] == [1, 1]

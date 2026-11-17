@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from tests.acceptance.channels import accept, offered
 from tests.acceptance.conftest import (
     disposition,
     error,
@@ -20,7 +21,11 @@ from tests.acceptance.conftest import (
     wrap_up,
 )
 from tests.acceptance.test_conversation_reports import one, rows
+from tests.acceptance.test_inbound_routing import room_xml
+from tests.acceptance.test_keypad_relay import relays
 from tests.acceptance.test_recordings import transcript
+from tests.acceptance.test_text_transfer import live_sms, transfer
+from tests.acceptance.test_voice_calls import rings_to
 
 KINDS = ["callback", "task"]
 # A leg's hangup cause: its ring cancelled by HS, its answer refused, or HS hung it up once answered.
@@ -66,6 +71,8 @@ def test_a_call_from_a_callback_or_task_holds_and_resumes_its_customer(world, te
     agent, task, phone, stream = worked(tenant, kind)
     cid = task["conversation_id"]
     customer = call(tenant, agent, task, phone, stream)
+    assert room_xml(world, agent.phone.legs[-1]).get("relayDTMFInputs") == "true"
+    assert [relays(r) for r in rings_to(world, task["customer"])] == [False]
     ok(act(agent.api(), cid, "hold", {"on": True}))
     held = stream.wait_for("call.held", conversation_id=cid)
     assert (held["agent_id"], held["data"]["by_agent_id"], held["data"]["participant_id"]) == (agent.id, agent.id, None)
@@ -312,6 +319,10 @@ def test_a_redial_while_plivo_still_places_the_ended_call_goes_through_and_the_e
     assert told == [1, 1, 1] and second.state == customer.state == "in_progress"
 
 
+def made(r) -> bool:
+    return r.method == "POST" and r.path.endswith("/Call/")
+
+
 def added(r) -> bool:
     return r.method == "POST" and r.path.endswith("/Participant/") and r.params.get("role") == "Customer"
 
@@ -397,3 +408,53 @@ def test_a_redial_from_a_task_leaves_the_ended_calls_transcript_naming_its_custo
         s["speaker"] for s in run_jobs_until(world, lambda: transcript(tenant.api, rid), "the transcript")["segments"]
     }
     assert "Customer" in speakers and len(speakers) == 2
+
+
+@pytest.mark.parametrize("while_", ["rings", "placing"])
+def test_only_a_reader_who_controls_a_text_conversation_ends_the_call_its_agent_is_dialing(world, tenant, while_):
+    floor = team(tenant, "Floor")
+    settings(tenant, permissions={"agent": {"view": "team"}}, ring_timeout_sec=120)
+    first, target = tenant.agent("First", teams=[floor]).login(), tenant.agent("Target").login()
+    mate = tenant.agent("Mate", teams=[floor]).login(available=False)
+    sup = tenant.agent("Sup", role="supervisor", teams=[floor]).login(available=False)
+    cid, stream, _ = live_sms(world, tenant, first)
+    ok(transfer(first, cid, {"type": "agent", "agent_id": target.id}))
+    ok(accept(target, offered(stream, target, conversation_id=cid)))
+    stream.wait_for("conversation.wrap_up_started", conversation_id=cid, agent_id=first.id)
+    target.phone.on_ring("ignore")
+    placing = world.plivo.fault("stall", made, account=tenant.auth_id, times=1 if while_ == "placing" else 0)
+    call = {"agent_id": target.id, "to": lead(world)[0], "from": registered_number(tenant), "conversation_id": cid}
+    with ThreadPoolExecutor(1) as pool:
+        dialing = pool.submit(tenant.api.post, "/api/v1/calls", json=call)
+        ring = target.phone.wait_ring()
+        for reader in (first, mate, sup):
+            error(act(reader.api(), cid, "hangup"), 404, "conversation_not_found")
+        assert ring.state == "ringing" and not replayed(tenant, "call.failed", conversation_id=cid)
+        ok(act(target.api(), cid, "hangup"))
+        placing.release()
+        assert dialing.result(15).status_code == 201
+    assert ring.wait_state("completed").hangup_cause_code == CANCELLED
+    assert stream.wait_for("call.failed", conversation_id=cid)["data"]["result"] == "cancelled"
+
+
+@pytest.mark.parametrize("while_", ["rings", "placing"])
+def test_an_agent_going_away_while_its_call_from_a_task_rings_ends_the_call_once_and_keeps_the_task(
+    world, tenant, while_
+):
+    settings(tenant, ring_timeout_sec=120)
+    agent, task, phone, stream = worked(tenant, "task")
+    cid = task["conversation_id"]
+    agent.phone.on_ring("ignore")
+    placing = world.plivo.fault("stall", made, account=tenant.auth_id, times=1 if while_ == "placing" else 0)
+    with ThreadPoolExecutor(1) as pool:
+        dialing = pool.submit(tenant.api.post, "/api/v1/calls", json=placed(tenant, agent, task))
+        ring = agent.phone.wait_ring()
+        agent.set_status("Away")
+        assert stream.wait_for("call.failed", conversation_id=cid)["data"]["result"] == "cancelled"
+        placing.release()
+        assert dialing.result(15).status_code == 201
+    assert ring.wait_state("completed").hangup_cause_code == CANCELLED
+    world.wait(world.plivo.idle, what="the ended leg's callbacks handled")
+    fence(tenant)
+    told = [len(replayed(tenant, kind, conversation_id=cid)) for kind in ("call.failed", "call.ended")]
+    assert told == [1, 1] and not phone.legs and state(tenant, cid) not in ("closed", "queued")

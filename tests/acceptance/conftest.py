@@ -362,6 +362,13 @@ def fresh_second(world) -> None:
     world.wait(lambda: time.time() % 1 < 0.05, what="a new second")
 
 
+def held_until_exit(world, tenant, leg) -> None:
+    """Hold every status callback but `leg`'s until `leg`'s room exit is delivered."""
+    mine = lambda r: leg.call_uuid in (r.params.get("CallUUID"), r.params.get("ParticipantCallUUID"))  # noqa: E731
+    out = lambda r: mine(r) and r.params.get("EventName") == "ParticipantExit"  # noqa: E731
+    world.plivo.fault("delay", lambda r: not mine(r), account=tenant.auth_id, times=math.inf, after=out)
+
+
 def hang_up_with_the_room_alive(world, tenant, live) -> None:
     """The agent hangs up and HS's hangup has reached Plivo, but no status callback about the call's end has reached
     HS yet: they are held until the test ends."""

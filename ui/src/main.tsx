@@ -3,7 +3,7 @@ import { type ReactNode, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { held, hold, store } from "./api";
 import { Conversations } from "./conversations";
-import { type Ctx, Desk, Desked, Dialer, StatusMenu } from "./desk/desk";
+import { type Ctx, Desk, Desked, Dialer, Messenger, StatusMenu } from "./desk/desk";
 import { Floor } from "./desk/floor";
 import { DeskPage } from "./desk/side";
 import { time } from "./format";
@@ -14,21 +14,24 @@ import { Contacts, Hours, Skills, Statuses, Tasks, Teams } from "./setup/lists";
 import { Outbound, Workload } from "./setup/settings";
 import { Numbers, Queues } from "./setup/routing";
 import { Dispositions, PlivoAccount } from "./setup/tenant";
-import { type NavItem, Shell, UserMenu, go, initTheme, useRoute } from "./shell";
-import { ChangePassword, SignIn, You } from "./signin";
-import { Button, Toaster } from "./ui";
+import { type NavItem, Shell, UserMenu, follow, go, initTheme, useRoute } from "./shell";
+import { ChangePassword, type Minted, NewKey, SignIn, You } from "./signin";
+import { Button, Toaster, keepSheetOnEscape } from "./ui";
 
-function pickUpSession(e?: Event) {
-  const handed = new URLSearchParams(location.hash.slice(1)).get("session");
+function fromHash(e?: Event) {
+  const hash = location.hash.slice(1);
+  // Links made before the console moved to paths, such as #/signin?org=, still open their page.
+  if (hash.startsWith("/")) return void (history.replaceState(null, "", hash), dispatchEvent(new PopStateEvent("popstate")));
+  const handed = new URLSearchParams(hash).get("session");
   if (!handed) return;
   // A desk link is one agent's identity: a key the tab inherited from its opener must not ride along.
   hold({ key: null, session: JSON.parse(atob(handed)) });
-  history.replaceState(null, "", "#/desk");
+  history.replaceState(null, "", "/desk");
   if (e) location.reload();
 }
 
-const NAV: (NavItem & { need?: Need; page: (id?: string, ctx?: Ctx) => ReactNode })[] = [
-  { route: "/desk", label: "My Inbox", icon: Inbox, need: "session", page: (id, ctx) => <DeskPage ctx={ctx!} id={id} /> },
+const NAV: (NavItem & { need?: Need; inbox?: true; page: (id?: string, ctx?: Ctx) => ReactNode })[] = [
+  { route: "/desk", label: "My Inbox", icon: Inbox, need: "session", inbox: true, page: (id, ctx) => <DeskPage ctx={ctx!} id={id} /> },
   { route: "/floor", label: "Floor", icon: ChartPie, group: "Monitor", need: "boss", page: (_, ctx) => <Floor ctx={ctx!} /> },
   { route: "/conversations", label: "Conversations", icon: MessageSquare, page: (id) => <Conversations id={id} /> },
   { route: "/tasks", label: "Tasks", icon: ListTodo, page: () => <Tasks /> },
@@ -60,30 +63,36 @@ function Frame({ route, ctx }: { route: string; ctx?: Ctx }) {
       nav={nav}
       route={here.route}
       org={org}
-      status={ctx ? <><Dialer ctx={ctx} /><StatusMenu ctx={ctx} /></> : <Button onClick={() => go("/you")}>Take calls</Button>}
+      status={ctx ? <><Dialer ctx={ctx} /><Messenger ctx={ctx} /><StatusMenu ctx={ctx} /></> : <Button onClick={() => go("/you")}>Take calls</Button>}
       user={
         <>
-          <UserMenu name={me?.name ?? org ?? "Organization"} sub={me ? `${ROLES[me.role ?? "agent"]}.${until ? ` Signed in until ${time(until)}.` : ""}` : "Signed in with the organization key"} onPassword={me && (() => setChanging(true))} />
+          <UserMenu name={me?.name ?? org ?? "Organization"} email={me?.email} sub={me ? `${ROLES[me.role ?? "agent"]}.${until ? ` Signed in until ${time(until)}.` : ""}` : "Signed in with the organization key"} onPassword={me && (() => setChanging(true))} />
           {changing && <ChangePassword onClose={() => setChanging(false)} />}
         </>
       }
     >
-      {ctx ? <Desked ctx={ctx}>{here.page(id, ctx)}</Desked> : here.page(id)}
+      {ctx ? <Desked ctx={ctx} inbox={!!here.inbox}>{here.page(id, ctx)}</Desked> : here.page(id)}
     </Shell>
   );
 }
 
 function App() {
   const route = useRoute().split("?")[0];
+  const [minted, setMinted] = useState<Minted>();
   const { key, session } = held();
-  if (route === "/signin" || (!key && !session)) return <SignIn />;
-  if (session) return <Desk session={session}>{(ctx) => <Frame route={route} ctx={ctx} />}</Desk>;
-  return route === "/you" ? <You /> : <Frame route={route} />;
+  return (
+    <>
+      {route === "/signin" || (!key && !session) ? <SignIn onMinted={setMinted} /> : session ? <Desk session={session}>{(ctx) => <Frame route={route} ctx={ctx} />}</Desk> : route === "/you" ? <You /> : <Frame route={route} />}
+      {minted && <NewKey shown={minted} onDone={() => setMinted(undefined)} />}
+    </>
+  );
 }
 
 initTheme();
-pickUpSession();
-addEventListener("hashchange", pickUpSession);
+fromHash();
+addEventListener("hashchange", fromHash);
+document.addEventListener("click", follow);
+addEventListener("keydown", keepSheetOnEscape, true);
 createRoot(document.getElementById("root")!).render(
   <>
     <App />

@@ -455,17 +455,53 @@ def test_a_repeated_answer_for_a_seated_call_gets_its_room_again_after_its_numbe
     assert again.text == first.text
 
 
-def test_a_repeated_queue_exit_gets_the_same_xml_and_one_overflow(world, tenant):
+@pytest.mark.parametrize("cause", [{}, {"ParticipantExitCause": "Member Wait Timeout Triggered"}], ids=["doc", "cause"])
+def test_a_repeated_queue_exit_gets_the_same_xml_and_one_overflow(world, tenant, cause):
     nobody = hangup_action("Nobody is free")
     q = tenant.queue(name="Q", agents=[unavailable(tenant).id], wait_timeout_sec=1800, overflow_action=nobody)
     caller = world.plivo.call(line(tenant, queue_action(q)))
     world.wait(lambda: caller.mpc, what="the caller waiting in the queue's room")
     url = room_xml(world, caller).get("onExitActionUrl").partition("#")[0]
-    timed_out = {"CallUUID": caller.call_uuid, "ParticipantExitCause": "Member Wait Timeout Triggered"}
+    world.hold("queue_timeout")
+    world.travel(1800)
+    timed_out = {"ParticipantCallUUID": caller.call_uuid, "ParticipantRole": "Customer", **cause}
     signed = [world.plivo.sign(url, timed_out, tenant.auth_token) for _ in range(2)]  # a retry carries a new nonce
     first, again = [world.anon().post(url, data=timed_out, headers=headers) for headers in signed]
     assert first.status_code == again.status_code == 200 and first.text == again.text
     assert "Nobody is free" in first.text
+    fence(tenant)
+    assert len(tenant.events(type="conversation.overflowed")) == 1
+
+
+def test_a_caller_whose_agent_joined_and_left_before_hs_heard_the_join_is_not_overflowed(world, tenant):
+    agent, backup = tenant.agent().login(), tenant.agent("Backup").login()
+    agent.phone.on_ring("answer")
+    second = tenant.queue(name="Second", agents=[backup.id])
+    q = tenant.queue(name="First", agents=[agent.id], wait_timeout_sec=600, overflow_action=queue_action(second))
+    join = lambda r: r.params.get("EventName") == "ParticipantJoin" and r.params.get("ParticipantRole") == "Agent"  # noqa: E731
+    world.plivo.fault("delay", join, account=tenant.auth_id, after=lambda r: r.path.endswith("/hangup"))
+    caller = world.plivo.call(line(tenant, queue_action(q)))
+    leg = agent.phone.wait_ring().wait_state("in_progress")
+    world.wait(lambda: leg.mpc == caller.mpc, what="the agent in the caller's room")
+    leg.hangup()
+    caller.wait_state("completed")
+    world.wait(world.plivo.idle, what="every callback delivered")
+    fence(tenant)
+    assert (tenant.events(type="conversation.overflowed"), backup.phone.legs) == ([], [])
+    assert len(tenant.events(type="call.ended")) == 1
+
+
+def test_a_queue_exit_after_hs_timed_the_wait_out_overflows_once(world, tenant):
+    nobody = hangup_action("Nobody is free")
+    q = tenant.queue(name="Q", agents=[unavailable(tenant).id], wait_timeout_sec=1800, overflow_action=nobody)
+    caller = world.plivo.call(line(tenant, queue_action(q)))
+    world.wait(lambda: caller.mpc, what="the caller waiting in the queue's room")
+    url = room_xml(world, caller).get("onExitActionUrl").partition("#")[0]
+    world.run_jobs("queue_timeout")
+    world.wait(lambda: "Nobody is free" in caller.said, what="HS's overflow")
+    late = {"ParticipantCallUUID": caller.call_uuid, "ParticipantRole": "Customer"}
+    answer = world.anon().post(url, data=late, headers=world.plivo.sign(url, late, tenant.auth_token))
+    assert answer.status_code == 200 and "Nobody is free" not in answer.text
     fence(tenant)
     assert len(tenant.events(type="conversation.overflowed")) == 1
 
@@ -747,7 +783,8 @@ def test_an_agents_voicemail_reaches_that_agents_stream(world, tenant):
 def test_a_caller_who_leaves_a_queue_unanswered_ends_once_with_the_true_cause(
     world, tenant, monkeypatch, leaves, result, ended_by
 ):
-    # Plivo's waitTime and HS's queue timeout race once wait_timeout_sec is up; at 600 s the test picks the winner.
+    # Plivo's waitTime and HS's queue timeout race once wait_timeout_sec is up; the test picks the winner, Plivo's by
+    # holding HS's timer while 600 s pass.
     q = tenant.queue(name="Q", agents=[unavailable(tenant).id], wait_timeout_sec=600)
     monkeypatch.setattr(world.plivo, "exit_after_events", True)  # the room's end before the queue exit, as live
     stream = tenant.stream(after=0)
@@ -760,6 +797,8 @@ def test_a_caller_who_leaves_a_queue_unanswered_ends_once_with_the_true_cause(
     elif leaves.endswith("hs_first"):
         world.run_jobs("queue_timeout")
     else:
+        world.hold("queue_timeout")
+        world.travel(600)
         caller.wait_out()
     caller.wait_state("completed", timeout=10)
     closed = run_jobs_until(world, lambda: seen(stream, "conversation.closed"), "the conversation closed")[0]

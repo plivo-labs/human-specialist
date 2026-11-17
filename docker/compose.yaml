@@ -6,9 +6,7 @@ name: human-specialist
 x-hs: &hs
   image: ${COMPOSE_PROJECT_NAME:-human-specialist}:local
   # `up --build` builds this checkout and tags it with this project's name; compose never pulls it.
-  build:
-    context: ..
-    dockerfile: docker/Dockerfile
+  build: ..
   env_file: [.env]
 
 services:

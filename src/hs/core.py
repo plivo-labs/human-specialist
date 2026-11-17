@@ -92,6 +92,7 @@ class Settings:
     db_max_overflow: int = _env("DB_MAX_OVERFLOW", "10", _at_least("DB_MAX_OVERFLOW", 0))
     public_base_url: str = _env("PUBLIC_BASE_URL", cast=_base_url)
     operator_key: str = _env("HS_OPERATOR_KEY")
+    setup_plivo_auth_id: str = _env("HS_SETUP_PLIVO_AUTH_ID", "")
     secret_key: str = _env("HS_SECRET_KEY")
     plivo_api_url: str = _env("PLIVO_API_URL", "https://api.plivo.com", _slash)
     plivo_media_url: str = _env("PLIVO_MEDIA_URL", "https://media.plivo.com", _slash)
@@ -414,9 +415,8 @@ def _invalid(request: Request, exc: RequestValidationError) -> Response:
 def _http(request: Request, exc: HTTPException) -> Response:
     if isinstance(exc.__cause__, ClientDisconnect):  # FastAPI's body read wraps a caller gone mid-body in a 400
         return Response(status_code=499)
-    return render_error(
-        request, exc.status_code, HTTPStatus(exc.status_code).phrase.lower().replace(" ", "_"), str(exc.detail)
-    )
+    code = HTTPStatus(exc.status_code).phrase.lower().replace(" ", "_")
+    return render_error(request, exc.status_code, code, str(exc.detail))
 
 
 def _unhandled(request: Request, exc: Exception) -> Response:

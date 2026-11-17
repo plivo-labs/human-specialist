@@ -146,11 +146,12 @@ def _id(value) -> str | None:
     return None if value is None else str(uuid.UUID(str(value)))
 
 
-def emit(db: Connection, type_: str, tenant_id, data: dict, *, conversation_id=None, agent_id=None) -> None:
-    """Record an event in the caller's transaction, so it commits with the change it tells of."""
+def emit(db: Connection, type_: str, tenant_id, data: dict, *, conversation_id=None, agent_id=None, agents=()) -> None:
+    """Record an event in the caller's transaction, so it commits with the change it tells of; with `agents`, one
+    for each, in one statement per 1,000 (SQLAlchemy's execute_values page)."""
     body = CATALOG[type_].model_validate(data).model_dump(mode="json", by_alias=True)
-    row = {"e_tenant": _id(tenant_id), "e_type": type_, "e_conv": _id(conversation_id), "e_agent": _id(agent_id)}
-    db.execute(_recording(), row | {"e_data": body})
+    row = {"e_tenant": _id(tenant_id), "e_type": type_, "e_conv": _id(conversation_id), "e_data": body}
+    db.execute(_recording(), [row | {"e_agent": _id(a)} for a in agents or [agent_id]])
 
 
 @cache

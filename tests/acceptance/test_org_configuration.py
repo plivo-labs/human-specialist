@@ -1,5 +1,6 @@
-"""Agent statuses, holiday groups and queue names as a contact center configures them."""
+"""Agent statuses, holiday groups, queue names and queue overflows as a contact center configures them."""
 
+import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -26,6 +27,12 @@ def test_a_status_has_a_color_an_order_and_new_ones_come_first(tenant):
     assert ordered(tenant)[0] == lunch["id"]
     assert all(s["default"] for s in statuses(tenant) if s["id"] != lunch["id"])
     error(tenant.api.post(STATUSES, json={"name": "Odd", "availability": False, "color": "red"}), 422)
+
+
+def test_a_new_organizations_built_in_statuses_carry_their_colors(world):
+    amber = dict.fromkeys(("Idle", "Busy", "After Contact Work", "Away", "Break"), "#EBA000")
+    colors = {s["name"]: s["color"] for s in statuses(world.new_tenant("Colors"))}
+    assert colors == {"Available": "#27AE7D", "Offline": "#9B9FAA", **amber}
 
 
 def test_a_default_status_cannot_be_deleted(tenant):
@@ -132,6 +139,43 @@ def test_a_document_an_entry_point_or_queue_names_cannot_be_deleted_and_the_refu
     assert sorted(refused["details"]["used_by"], key=lambda u: u["kind"]) == users
     tenant.route_number(number, hangup_action())
     ok(tenant.api.delete(f"/api/v1/business-hours/{hours['id']}"))
+
+
+def test_a_queue_cannot_overflow_back_to_itself_through_queues(tenant):
+    a, b, c = (tenant.queue(name=n) for n in "ABC")
+
+    def overflow(q: dict, to: dict):
+        return tenant.api.patch(f"/api/v1/queues/{q['id']}", json={"overflow_action": queue_action(to)})
+
+    assert error(overflow(a, a), 422, "overflow_loop")["details"] == {"queues": [a["id"]]}
+    ok(overflow(a, b))
+    assert error(overflow(b, a), 422, "overflow_loop")["details"] == {"queues": [b["id"], a["id"]]}
+    ok(overflow(b, c))
+    assert error(overflow(c, a), 422, "overflow_loop")["details"] == {"queues": [c["id"], a["id"], b["id"]]}
+    assert ok(tenant.api.get(f"/api/v1/queues/{c['id']}"))["overflow_action"] is None
+    tenant.queue(name="D", overflow_action=queue_action(c))
+    own = str(uuid.uuid4())
+    itself = {"id": own, "name": "Self", "overflow_action": {"type": "queue", "queue_id": own}}
+    error(tenant.api.post("/api/v1/queues", json=itself), 422, "foreign_id")
+    later = {"name": "A2", "dtmf_actions": {"1": queue_action(a)}, "after_agent_action": queue_action(a)}
+    ok(tenant.api.patch(f"/api/v1/queues/{a['id']}", json=later))
+
+
+def test_a_call_into_an_overflow_loop_stored_behind_the_api_ends_as_at_a_queue_with_no_overflow(world, tenant):
+    b = tenant.queue(name="B", enabled=False)
+    a = tenant.queue(name="A", enabled=False, overflow_action=queue_action(b))
+    with psycopg2.connect(world._env["DATABASE_URL"]) as db, db.cursor() as cur:
+        back = Json({"overflow_action": a["overflow_action"] | {"queue_id": a["id"]}})
+        cur.execute("UPDATE hs.config SET body = body || %s WHERE id = %s", (back, b["id"]))
+    number, stream = tenant.number(), tenant.stream(after=0)
+    tenant.route_number(number, queue_action(a))
+    caller = world.plivo.call(number)
+    world.wait(lambda: caller.state == "completed", what="the call hung up")
+    world.advance(11)
+    closed = stream.wait_for("conversation.closed")
+    told = [e["data"] for e in tenant.events(type="conversation.overflowed", conversation_id=closed["conversation_id"])]
+    assert [(t["queue_id"], t["action"]["queue_id"]) for t in told] == [(a["id"], b["id"]), (b["id"], a["id"])]
+    assert closed["data"]["result"] == "enqueue_failed"
 
 
 def status(tenant, name: str, **fields) -> dict:

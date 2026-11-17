@@ -124,3 +124,25 @@ def test_a_conversations_tasks_are_listed_through_an_index_for_either_conversati
         db.execute(text("ANALYZE hs.task; SET search_path TO hs"))
         plan = "\n".join(db.execute(text("EXPLAIN " + tasks._TASKS.text), args).scalars())
     assert "ix_task_conversation" in plan and "ix_task_origin" in plan, plan
+
+
+def test_an_upgrade_colors_the_built_in_statuses_still_gray_by_key_and_leaves_every_other_status(database):
+    url, tenant = database(), str(uuid.uuid4())
+    alembic(url, "upgrade", "0002_agent_sign_in")
+    seeded = [
+        ("online", {"name": "Here", "default": True, "color": "#9B9FAA"}),
+        ("offline", {"name": "Offline", "default": True}),
+        (None, {"name": "Break", "default": True}),
+        (None, {"name": "Busy", "default": True, "color": "#EB5757"}),
+        (None, {"name": "Lunch", "color": "#9B9FAA"}),
+    ]
+    with psycopg2.connect(url) as conn, conn.cursor() as cur:
+        add = "INSERT INTO hs.tenant (id, name, plivo_auth_id, plivo_token_enc) VALUES (%s, 't', 'a', 'x')"
+        cur.execute(add, [tenant])
+        for key, body in seeded:
+            add = "INSERT INTO hs.config (tenant_id, kind, key, body) VALUES (%s, 'status', %s, %s)"
+            cur.execute(add, [tenant, key, json.dumps(body)])
+    alembic(url, "upgrade", "head")
+    colors = dict(query(url, "SELECT body->>'name', body->>'color' FROM hs.config WHERE kind = 'status'"))
+    kept = {"Busy": "#EB5757", "Lunch": "#9B9FAA"}
+    assert colors == {"Here": "#27AE7D", "Offline": "#9B9FAA", "Break": "#EBA000", **kept}

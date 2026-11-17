@@ -7,6 +7,7 @@ export type Agent = {
   email?: string | null;
   role: "admin" | "supervisor" | "agent" | null;
   teams: string[];
+  skills: { skill_id: string; level: number | null }[];
   status: Status | null;
   caller_id: string | null;
   endpoint_username: string | null;
@@ -34,8 +35,11 @@ export type Queue = {
   id: string;
   name: string;
   agents?: string[];
+  teams?: string[];
+  skills?: { skill_id: string; operator: string; level: number }[];
   strategy?: "availability" | "simultaneous" | "fewest_handled" | "least_handle_time";
   wait_timeout_sec?: number;
+  text?: { wait_timeout_sec: number | Record<string, number> };
   enqueue_url: string;
   priority: number;
   capacity: number;
@@ -43,6 +47,8 @@ export type Queue = {
 };
 
 export type Action = { type: string; queue_id?: string; [more: string]: unknown };
+export type AccountNumber = { number: string; routed: boolean };
+export type Template = { id: string; name: string; language: string; namespace: string; components: { type: string; format?: string; text?: string; buttons?: { text: string; url?: string }[] }[] };
 export type EntryPoint = { id: string; number: string; open_action: Action; business_hours_id: string | null; closed_action: Action | null };
 
 export type Assignment = {
@@ -74,10 +80,16 @@ export type ConversationSummary = {
   unread_count?: number;
 };
 
+export type Note = { id: string; text: string; agent_id: string | null; created_at: string };
+
+export type Turn = { role: "customer" | "bot"; text: string; at: string | null };
+
 export type Conversation = ConversationSummary & {
   context: Record<string, unknown> | null;
+  transcript?: Turn[] | null;
+  notes?: Note[];
   assignments: Assignment[];
-  dispositions: { agent_id: string | null; disposition?: string | null; sub_disposition?: string | null; skipped: boolean }[];
+  dispositions: { agent_id: string | null; disposition?: string | null; sub_disposition?: string | null; skipped: boolean; note?: string | null }[];
 };
 
 export type Message = {
@@ -121,7 +133,7 @@ export type Floor = {
   queues: { queue_id: string; name: string; waiting: number; oldest_wait_sec: number }[];
 };
 
-export type Skill = Named & { min_level: number; max_level: number };
+export type Skill = Named & { min_level: number; max_level: number; is_level_required: boolean };
 export type Destination = Named & { number: string | null; url: string | null };
 export type Slot = { day: string; start: string; end: string };
 export type Holiday = { date: string; name: string; slots?: unknown[] };

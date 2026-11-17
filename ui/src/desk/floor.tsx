@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { type Page as Paged, asAgent, every } from "../api";
-import { clock } from "../format";
+import { clock, hue } from "../format";
 import { go } from "../shell";
 import type { Agent, Floor as FloorData } from "../types";
 import { Button, Empty, Listed, Page, State, Table, type Tone, act, cls, td, tr, useLoad } from "../ui";
@@ -68,7 +68,9 @@ export function Floor({ ctx }: { ctx: Ctx }) {
                       <td className={td}>
                         <State tone={tone}>{word}</State>
                       </td>
-                      <td className={cls(td, "hidden text-secondary sm:table-cell")}>{r.status?.name ?? "Offline"}</td>
+                      <td className={cls(td, "hidden text-secondary sm:table-cell")}>
+                        <State color={hue(s.statuses.find((x) => x.id === r.status?.id))}>{r.status?.name ?? "Offline"}</State>
+                      </td>
                       <td className={cls(td, "text-right")}>
                         {s.me.grants.monitor && r.activity === "on_call" && r.conversation_id && r.agent_id !== s.me.id && (
                           <span className="inline-flex gap-2">

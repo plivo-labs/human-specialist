@@ -1,6 +1,20 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { explain, operatorKey, time } from "./format.ts";
+import { dialable, explain, hue, operatorKey, time } from "./format.ts";
+
+test("a status shows the color it was saved with, whatever its name or availability", () => {
+  const status = (name: string, availability: boolean, color?: string) => ({ id: name, name, availability, color, sequence: 0, default: true });
+  assert.equal(hue(status("Test", true, "#eb5757")), "#EB5757", "an available status saved red is red");
+  assert.equal(hue(status("Available", true, "#9B9FAA")), "#9B9FAA", "an available status saved gray is gray");
+  assert.equal(hue(status("Away", false)), "#9B9FAA", "a status with no color is gray");
+  assert.equal(hue(undefined), "#9B9FAA");
+});
+
+test("a pasted phone number loses its spaces, dashes, dots and brackets", () => {
+  assert.equal(dialable(" +1 (415) 555-0100 "), "+14155550100");
+  assert.equal(dialable("+44 20.7946.0958"), "+442079460958");
+  assert.equal(dialable("+14155550100"), "+14155550100");
+});
 
 test("a 422 names each field and why it was refused", () => {
   const details = {

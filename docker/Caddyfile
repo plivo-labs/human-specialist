@@ -16,6 +16,15 @@
 	}
 	handle {
 		root * /srv
+		@console path_regexp ^/(signin|you|desk|floor|conversations|tasks|teams|queues|skills|statuses|contacts|outbound|hours|workload|dispositions|agents|numbers|plivo)(/[A-Za-z0-9_-]+)*/?$
+		@asset {
+			path /assets/*
+			file
+		}
+		@page not path /assets/*
+		header @asset Cache-Control "public, max-age=31536000, immutable"
+		header @page Cache-Control no-cache
+		rewrite @console /index.html
 		file_server
 	}
 }

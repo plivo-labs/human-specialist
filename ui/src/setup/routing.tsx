@@ -2,27 +2,30 @@ import { CircleHelp, Plus } from "lucide-react";
 import { useState } from "react";
 import { type Page as Paged, api, every } from "../api";
 import { phone } from "../format";
-import type { Action, Agent, BusinessHours, EntryPoint, Named, Queue } from "../types";
-import { Badge, Button, Confirm, Copy, Editor, Empty, Field, Input, ListView, Notice, Page, Select, State, act, cls, useLoad } from "../ui";
-import { allAgents, allQueues, names } from "./agents";
-import { type Picks, type Route, pickable, route, routedBy, shownOf } from "./numbers";
+import type { Action, BusinessHours, EntryPoint, Named, Queue, Skill } from "../types";
+import { Badge, Button, Confirm, Copy, Editor, Empty, Field, Input, ListView, Notice, Page, PhoneInput, Rows, Select, State, act, cls, useLoad } from "../ui";
+import { NumbersFailed, allAgents, allQueues, names, put, useAccountNumbers } from "./agents";
+import { OTHER_CHANNELS, type Picks, pickable, reach, route, routedBy, saveQueue, shownOf, textWait } from "./numbers";
+import { Unit } from "./settings";
 
 const off = (q: Queue) => (q.enabled ? q.name : `${q.name} (disabled)`);
-const minutes = (s?: number) => (s == null ? "No limit" : s % 60 ? `${s} s` : `${s / 60} min`);
 
-function AgentPicker({ agents, chosen }: { agents: Agent[]; chosen?: string[] }) {
-  if (!agents.length) return <p className="text-s-400 text-secondary">No users yet. Add them under Users first.</p>;
+function Picker({ label, name, rows, chosen, none, hint }: { label: string; name: string; rows: Named[]; chosen?: string[]; none: string; hint?: string }) {
+  if (!rows.length) return <p className="text-s-400 text-secondary">{none}</p>;
   return (
     <fieldset className="grid max-h-64 gap-2 overflow-y-auto">
-      <legend className="pb-1.5 text-s-500 text-secondary">Agents</legend>
-      {agents.map((a) => (
+      <legend className="pb-1.5 text-s-500 text-secondary">{label}</legend>
+      {hint && <p className="text-s-400 text-muted-foreground">{hint}</p>}
+      {rows.map((a) => (
         <label key={a.id} className="flex items-center gap-2 text-p-400">
-          <input type="checkbox" name="agents" value={a.id} defaultChecked={chosen?.includes(a.id)} className="size-4 accent-primary" /> {a.name}
+          <input type="checkbox" name={name} value={a.id} defaultChecked={chosen?.includes(a.id)} className="size-4 accent-primary" /> {a.name}
         </label>
       ))}
     </fieldset>
   );
 }
+
+const RULES = [["", "Any level"], [">=", "At least"], [">", "Above"], ["=", "Exactly"], ["!=", "Not"], ["<=", "At most"], ["<", "Below"]];
 
 const Count = ({ ids, of, word }: { ids: string[]; of: { id: string; name: string | null }[]; word: string }) =>
   ids.length > 1 ? <Badge>{`${ids.length} ${word}s`}</Badge> : ids.length ? <>{names(ids, of)}</> : <span className="text-tertiary">No {word}s</span>;
@@ -34,10 +37,12 @@ export function Queues() {
       allAgents(),
       every<EntryPoint>((c) => api<Paged<EntryPoint>>("GET", `/api/v1/numbers?limit=200${c}`)),
       every<Named>((c) => api<Paged<Named>>("GET", `/api/v1/menus?limit=200${c}`)),
+      every<Named>((c) => api<Paged<Named>>("GET", `/api/v1/teams?limit=200${c}`)),
+      every<Skill>((c) => api<Paged<Skill>>("GET", `/api/v1/skills?limit=200${c}`)),
     ]),
   );
   const [edit, setEdit] = useState<Queue | "new" | null>(null);
-  const [queues, agents, numbers, menus] = load.data ?? [];
+  const [queues, agents, numbers, menus, teams, skills] = load.data ?? [];
   const queue = edit === "new" ? undefined : (edit ?? undefined);
   const users = queue ? routedBy(queue.id, [...numbers!.map((n): [string, EntryPoint] => [phone(n.number), n]), ...menus!.map((m): [string, Named] => [`menu ${m.name}`, m]), ...queues!.map((q): [string, Queue] => [`queue ${q.name}`, q])]) : [];
   const flip = async () => (await act(queue!.enabled ? "Disabling the queue" : "Enabling the queue", () => api("PATCH", `/api/v1/queues/${queue!.id}`, { enabled: !queue!.enabled }), queue!.enabled ? "Queue disabled" : "Queue enabled")) && (load.reload(), setEdit(null));
@@ -63,7 +68,7 @@ export function Queues() {
           ],
           ["State", (q) => <State tone={q.enabled ? "live" : "off"}>{q.enabled ? "Active" : "Disabled"}</State>],
           ["Capacity", (q) => <span className="font-mono text-xs-400">{q.capacity}</span>],
-          ["Agents", (q) => <Count ids={q.agents ?? []} of={agents!} word="agent" />],
+          ["Agents", (q) => (q.teams?.length || q.skills?.length ? <Badge>{reach(q)}</Badge> : <Count ids={q.agents ?? []} of={agents!} word="agent" />)],
         ]}
       />
       {edit && (
@@ -72,8 +77,8 @@ export function Queues() {
           row={queue}
           reload={load.reload}
           onClose={() => setEdit(null)}
-          body={(f) => ({ name: f.get("name"), priority: Number(f.get("priority")), capacity: Number(f.get("capacity")), agents: f.getAll("agents") })}
-          save={(b) => (queue ? api("PATCH", `/api/v1/queues/${queue.id}`, b) : api("POST", `/api/v1/queues`, b))}
+          body={(f) => f}
+          save={(f) => saveQueue(api, f, queue)}
           remove={queue && (() => api("DELETE", `/api/v1/queues/${queue.id}`))}
           left={
             queue &&
@@ -107,10 +112,54 @@ export function Queues() {
           <Field label="Capacity">
             <Input name="capacity" type="number" required min={1} defaultValue={queue?.capacity ?? 50} className="font-mono" />
           </Field>
+          <fieldset className="grid gap-3">
+            <legend className="pb-1.5 text-s-500 text-secondary">How long a contact waits before the queue gives up</legend>
+            <div className="grid grid-cols-2 gap-4">
+              <Unit label="Call" name="wait_call" value={queue?.wait_timeout_sec ?? 20} unit="seconds" min={0} max={86_400} />
+              {OTHER_CHANNELS.map(([ch, label]) => (
+                <Unit key={ch} label={label} name={`wait_${ch}`} value={textWait(queue, ch)} unit="seconds" min={0} max={604_800} />
+              ))}
+            </div>
+            <p className="text-s-400 text-muted-foreground">A call waits 20 seconds unless you change it. 0 sets no time limit: a call or an email then waits for an agent, and any other contact leaves once every agent who could take it was offered it.</p>
+          </fieldset>
           {users.length > 0 && <Notice>{queue!.enabled ? "Disabling it fails callers sent here by" : "Callers are sent here by"} {users.join(", ")}.</Notice>}
-          <AgentPicker agents={agents ?? []} chosen={queue?.agents} />
+          <Picker label="Agents" name="agents" rows={agents ?? []} chosen={queue?.agents} none="No users yet. Add them under Users first." />
+          <Picker label="Teams" name="teams" rows={teams ?? []} chosen={queue?.teams} none="No teams yet. Add them under Teams." hint="The queue offers its conversations to the agents checked above and to every member of the teams checked here." />
+          {skills?.length ? (
+            <div className="grid gap-1.5">
+              <Rows label="Skills" add="Add skill" items={queue?.skills ?? []} blank={{ skill_id: "", operator: "", level: 0 }}>
+                {(r) => (
+                  <span className="grid flex-1 grid-cols-2 gap-2 sm:grid-cols-[1fr_8rem_5rem]">
+                    <Select name="skills" required defaultValue={r.skill_id} aria-label="Skill" className="col-span-2 sm:col-span-1">
+                      <option value="" disabled>
+                        Choose a skill
+                      </option>
+                      {r.skill_id && !skills.some((s) => s.id === r.skill_id) && <option value={r.skill_id}>An unknown skill</option>}
+                      {skills.map((s) => (
+                        <option key={s.id} value={s.id}>
+                          {s.name}
+                        </option>
+                      ))}
+                    </Select>
+                    <Select name="operator" defaultValue={r.operator} aria-label="Rule" className="[&:has(option[value='']:checked)+input]:invisible" onChange={(e) => e.target.value || ((e.target.parentElement!.nextElementSibling as HTMLInputElement).value = "")}>
+                      {RULES.map(([v, l]) => (
+                        <option key={v} value={v}>
+                          {l}
+                        </option>
+                      ))}
+                      {r.operator === "<>" && <option value="<>">Not</option>}
+                    </Select>
+                    <Input name="level" type="number" min={0} max={100} placeholder="0" defaultValue={r.level} aria-label="Level" className="font-mono" />
+                  </span>
+                )}
+              </Rows>
+              <p className="text-s-400 text-muted-foreground">With skills, only the agents and team members who hold at least one of these skills, at a level its rule admits, are offered the queue's conversations. A conversation's sticky agent among them is offered it whatever its skills. Any level admits whoever holds the skill, and is the only rule a skill without levels meets.</p>
+            </div>
+          ) : (
+            <p className="text-s-400 text-secondary">No skills yet. Add them under Skills to route by skill.</p>
+          )}
           {queue && (
-            <Field label="Enqueue URL" hint={`Callers wait up to ${minutes(queue.wait_timeout_sec)}. Strategy: ${STRATEGY[queue.strategy ?? "availability"]}.`}>
+            <Field label="Enqueue URL" hint={`Strategy: ${STRATEGY[queue.strategy ?? "availability"]}.`}>
               <span className="flex items-center gap-2">
                 <Input readOnly value={queue.enqueue_url} onFocus={(e) => e.target.select()} />
                 <Copy value={queue.enqueue_url} />
@@ -127,7 +176,6 @@ const STRATEGY: Record<NonNullable<Queue["strategy"]>, string> = { availability:
 const ROUTE: Record<string, string> = { menu: "A menu", voicemail: "Voicemail", forward: "Forwarded", redirect: "Your own XML", hangup: "Hang up" };
 
 const kept = (a: Action | null | undefined, offered: string[]) => a && !offered.includes(a.type) && <option value={a.type}>{ROUTE[a.type] ?? a.type}</option>;
-const put = (number: string, body: Route) => api("PUT", `/api/v1/numbers/${encodeURIComponent(number)}`, body);
 
 export function Numbers() {
   const load = useLoad(() =>
@@ -137,6 +185,7 @@ export function Numbers() {
       every<BusinessHours>((c) => api<Paged<BusinessHours>>("GET", `/api/v1/business-hours?limit=200${c}`)),
     ]),
   );
+  const owned = useAccountNumbers();
   const [edit, setEdit] = useState<EntryPoint | "new" | null>(null);
   const [numbers, queues, hours] = load.data ?? [];
   const reroute = (n: EntryPoint, queue_id: string) =>
@@ -183,12 +232,12 @@ export function Numbers() {
           ["Business hours", (n) => (n.business_hours_id ? (hours!.find((h) => h.id === n.business_hours_id)?.name ?? "Unknown") : "Always open"), "hidden sm:table-cell"],
         ]}
       />
-      {edit && <NumberSheet row={edit === "new" ? undefined : edit} numbers={numbers!} queues={queues!} hours={hours!} reload={load.reload} onClose={() => setEdit(null)} />}
+      {edit && <NumberSheet row={edit === "new" ? undefined : edit} numbers={numbers!} owned={owned} queues={queues!} hours={hours!} reload={() => (load.reload(), owned.reload())} onClose={() => setEdit(null)} />}
     </Page>
   );
 }
 
-function NumberSheet({ row, numbers, queues, hours, reload, onClose }: { row?: EntryPoint; numbers: EntryPoint[]; queues: Queue[]; hours: BusinessHours[]; reload: () => void; onClose: () => void }) {
+function NumberSheet({ row, numbers, owned, queues, hours, reload, onClose }: { row?: EntryPoint; numbers: EntryPoint[]; owned: ReturnType<typeof useAccountNumbers>; queues: Queue[]; hours: BusinessHours[]; reload: () => void; onClose: () => void }) {
   const [timed, setTimed] = useState(!!row?.business_hours_id);
   const shown = shownOf(row);
   const [opens, setOpens] = useState(shown.open);
@@ -216,9 +265,18 @@ function NumberSheet({ row, numbers, queues, hours, reload, onClose }: { row?: E
       warn={(b) => (!row && b.old ? [`${phone(b.number)} is already on the list, and its callers go to ${where(b.old.open_action)}. Move number changes only what you chose here.`, "Move number"] : undefined)}
     >
       {!row && (
-        <Field label="Number" hint="A number on the organization's Plivo account, with the country code, such as +14155550100.">
-          <Input name="number" required autoFocus placeholder="+14155550100" inputMode="tel" pattern="\+\d{6,15}" title="A plus sign, then the country code and number" />
-        </Field>
+        <>
+          <Field label="Number" hint={owned.error ? <NumbersFailed owned={owned} /> : "Pick a number on your Plivo account, or type one with its country code."}>
+            <PhoneInput name="number" required autoFocus list="account-numbers" />
+          </Field>
+          <datalist id="account-numbers">
+            {[...(owned.data ?? [])].sort((a, b) => +a.routed - +b.routed).map((n) => (
+              <option key={n.number} value={n.number}>
+                {n.routed ? "Routed here" : "Not routed yet"}
+              </option>
+            ))}
+          </datalist>
+        </>
       )}
       <Field label="Callers go to">
         <Select name="open" required defaultValue={shown.open} onChange={(e) => setOpens(e.target.value)}>

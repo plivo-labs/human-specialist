@@ -66,7 +66,7 @@ jobs:
       HS_SECRET_KEY: ci-secret-key-ci-secret-key-ci-secret-key
     steps:
       - uses: actions/checkout@v7
-      - run: docker build -f docker/Dockerfile -t hs-ci .
+      - run: docker build -t hs-ci .
       - run: docker build -f examples/plugin/Dockerfile --build-arg HS_IMAGE=hs-ci -t hs-ci-toy examples/plugin
       - run: |
           docker compose -f docker/compose.test.yaml up -d --wait postgres
@@ -75,6 +75,7 @@ jobs:
           docker run -d --name toy --network host -e DATABASE_URL -e REDIS_URL -e PUBLIC_BASE_URL -e HS_OPERATOR_KEY -e HS_SECRET_KEY hs-ci-toy
           curl --retry 30 --retry-delay 1 --retry-connrefused -fsS http://127.0.0.1:6004/status
           curl -fsS http://127.0.0.1:6004/toy/hello
+          curl -fsS http://127.0.0.1:6004/ | grep -q '<div id="root">'
       - if: failure()
         run: docker logs toy
 
@@ -96,9 +97,25 @@ jobs:
       - run: npm test
       - run: npm run build
 
+  # cfn-lint runs as a tool, not a project dependency. Pinned: a new release can change its verdict on the same
+  # template, as its RDS version data did.
+  aws-template:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+      - run: uvx cfn-lint==1.60.1 deploy/aws/template.yaml
+      - name: Each mistake planted in a copy fails the linter
+        run: |
+          for mistake in s/DNSName/DnsName/ 's/Memory: "1024"/Memory: "300"/' s/SUCCESS/SUCEED/; do
+            sed "$mistake" deploy/aws/template.yaml > "$RUNNER_TEMP/planted.yaml"
+            ! uvx cfn-lint==1.60.1 "$RUNNER_TEMP/planted.yaml" > /dev/null || { echo "cfn-lint passed: $mistake"; exit 1; }
+          done
+
   # A reusable workflow, so the image is pushed only after every job passed on this commit, and only for a release tag.
   image:
-    needs: [fast, acceptance, plugin-image, ui]
+    needs: [fast, acceptance, plugin-image, ui, aws-template]
     if: github.ref_type == 'tag'
     permissions:
       contents: read

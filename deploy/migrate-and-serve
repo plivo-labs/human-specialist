@@ -1,0 +1,5 @@
+#!/bin/sh
+# For platforms with no pre-start step.
+set -e
+alembic upgrade head
+exec uvicorn hs.app:app --host 0.0.0.0 --port "${PORT:-6004}"

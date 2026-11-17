@@ -6,6 +6,9 @@ export const visible = <T extends { need?: Need }>(items: T[], h: Held) => items
 export const landing = (h: Held) => (h.session ? "/desk" : "/agents");
 export const renewDue = (ends: number, now: number, tried: number) => now >= ends - 6 * 60e3 && now - tried >= 60e3;
 
+export const asksForKey = (status: number, sentKey: string) => status === 401 && !sentKey;
+export const showsKey = (setup: unknown, refused: boolean) => refused || setup !== true;
+
 export const NO_PASSWORD = "If you have no password yet, ask an administrator to set your email and password under Settings, Users.";
 
 export function signInTrouble(code: string, retryAfter: unknown): string | null {

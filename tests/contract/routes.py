@@ -1,9 +1,9 @@
 """The public route table: (method, path, auth). Every route hs.app serves must be listed here.
 
-Auth codes: `op` operator key; `key:<scope>` tenant key with that scope; `agent` agent token (own
-resources); `sup` supervisor token (accessible agents); `admin` admin token (the tenant's settings); `stream` stream
-token; `sig` signed URL; `plivo` Plivo signature; `none` public. Path parameter names are free: `{id}` matches any
-`{...}`.
+Auth codes: `op` operator key; `setup` no credential while setup lasts; `key:<scope>` tenant key with that scope;
+`agent` agent token (own resources); `sup` supervisor token (accessible agents); `admin` admin token (the tenant's
+settings); `stream` stream token; `sig` signed URL; `plivo` Plivo signature; `none` public. Path parameter names are
+free: `{id}` matches any `{...}`.
 """
 
 import re
@@ -34,7 +34,7 @@ ACCESS = [
 
 # config/
 CONFIG = [
-    ("POST", "/api/v1/tenants", OP),
+    ("POST", "/api/v1/tenants", ("op", "setup")),
     ("GET", "/api/v1/tenants", OP),
     ("GET", "/api/v1/tenants/{id}", OP),
     ("PATCH", "/api/v1/tenants/{id}", OP),
@@ -88,6 +88,7 @@ CONFIG = [
     ("DELETE", "/api/v1/business-hours/{id}", ADMIN),
     ("GET", "/api/v1/business-hours/{id}/status", ADMIN),
     ("GET", "/api/v1/numbers", ADMIN),
+    ("GET", "/api/v1/numbers/available", ADMIN),
     ("GET", "/api/v1/numbers/{number}", ADMIN),
     ("PUT", "/api/v1/numbers/{number}", ADMIN),
     ("DELETE", "/api/v1/numbers/{number}", ADMIN),
@@ -266,7 +267,7 @@ EVENTS = [
     ("POST", "/api/v1/webhooks/{id}/test", EVENTS),
     ("GET", "/api/v1/events", EVENTS),
     ("GET", "/api/v1/events/stream", ("key:events", "agent", "stream")),
-    ("GET", "/api/v1/conversations/{id}/timeline", ("key:calls", "sup")),
+    ("GET", "/api/v1/conversations/{id}/timeline", CALLS_AGENT_SUP),
 ]
 
 ROUTES = (

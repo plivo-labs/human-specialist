@@ -46,6 +46,15 @@ def test_the_agents_disposition_closes_the_conversation(tenant):
     assert (entry["agent_id"], entry["disposition_id"], entry["skipped"]) == (live.agent.id, sale["id"], False)
 
 
+def test_the_conversation_and_its_closed_event_carry_the_wrap_up_note(tenant):
+    live, _ = hung_up(tenant)
+    note = "Sent a new jar; the tracking link goes by email."
+    ok(wrap_up(live.agent, live.id, disposition(tenant, "Sale")["id"], note=note))
+    closed = live.stream.wait_for("conversation.closed", conversation_id=live.id)
+    read = ok(tenant.api.get(f"/api/v1/conversations/{live.id}"))
+    assert [d["note"] for d in read["dispositions"]] == [d["note"] for d in closed["data"]["dispositions"]] == [note]
+
+
 def test_a_tenant_key_wrap_up_names_an_agent_who_is_in_wrap_up(tenant):
     live, _ = hung_up(tenant)
     sale = disposition(tenant, "Sale")["id"]

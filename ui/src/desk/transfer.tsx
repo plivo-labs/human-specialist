@@ -4,7 +4,7 @@ import { useState } from "react";
 import { asAgent } from "../api";
 import { phone } from "../format";
 import type { TransferTargets } from "../types";
-import { Button, Empty, Input, Listed, Tab, TabPanel, Tabs, act, cls, useLoad } from "../ui";
+import { Button, Empty, Listed, PhoneInput, Tab, TabPanel, Tabs, act, cls, useLoad } from "../ui";
 import type { Ctx } from "./desk";
 import type { Line } from "./state";
 
@@ -104,7 +104,7 @@ export function Transfer({ ctx, line, onDone }: { ctx: Ctx; line: Line; onDone: 
       <TabPanel value="contacts" className="mt-4 grid max-h-64 gap-3 overflow-y-auto">
         {s.me.settings.agent_direct_dial ? (
           <div className="flex items-center gap-2">
-            <Input className="min-w-0 flex-1" value={number} onChange={(e) => setNumber(e.target.value.trim())} inputMode="tel" placeholder="+14155550100" aria-label="Phone number" />
+            <PhoneInput className="min-w-0 flex-1" value={number} onChange={(e) => setNumber(e.target.value)} aria-label="Phone number" />
             <Button size="xs" variant="primary" disabled={!valid} onClick={() => send("warm", { type: "number", number }, phone(number))}>
               Warm
             </Button>

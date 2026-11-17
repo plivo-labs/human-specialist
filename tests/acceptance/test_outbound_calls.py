@@ -7,6 +7,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
+import pytest
 
 from tests.acceptance.conftest import (
     app_call,
@@ -26,6 +27,8 @@ from tests.acceptance.conftest import (
     types,
     with_query,
 )
+from tests.acceptance.test_joined_call_controls import CANCELLED, REJECTED
+from tests.harness.sim import FAILURES
 
 C = "/api/v1/calls"
 
@@ -65,6 +68,7 @@ def test_only_the_dialing_agent_reads_its_dial_before_its_leg_answers(world, ten
     assert ok(agent.api().get(url))["id"] == cid
     for reader in (mate.api(), sup.api(), world.new_tenant("Other").api):
         error(reader.get(url), 404, "conversation_not_found")
+        error(reader.post(f"{C}/{cid}/hangup"), 404, "conversation_not_found")
     error(agent.api().patch(url, json={"attributes": {"k": "v"}}), 404, "conversation_not_found")
 
 
@@ -202,29 +206,134 @@ def test_the_ring_timeout_is_set_per_dial(world, tenant):
     assert adds and str(adds[-1].params["ring_timeout"]) == "7"
 
 
-def test_hanging_up_while_the_agent_rings_cancels_the_dial(world, tenant):
+@pytest.mark.parametrize("by", ["agent", "key"])
+def test_hanging_up_while_the_agent_rings_cancels_the_dial(world, tenant, by):
     agent = tenant.agent().login()
     agent.phone.on_ring("ignore")
     stream = tenant.stream(after=0)
     _, cid = dial(tenant, agent)
     leg = agent.phone.wait_ring()
-    ok(tenant.api.post(f"{C}/{cid}/hangup"))
-    leg.wait_state("completed")
+    ok((agent.api() if by == "agent" else tenant.api).post(f"{C}/{cid}/hangup"))
+    assert leg.wait_state("completed").hangup_cause_code == CANCELLED
     assert stream.wait_for("call.failed", conversation_id=cid)["data"]["result"] == "cancelled"
 
 
-def test_a_plivo_outage_on_cancelling_a_ringing_dial_is_a_503_and_a_retry_cancels(world, tenant):
+def test_a_plivo_outage_on_cancelling_a_ringing_dial_ends_the_call_at_once_and_a_retry_of_the_cancel_ends_the_ring(
+    world, tenant
+):
+    settings(tenant, ring_timeout_sec=120)
     agent = tenant.agent().login()
     agent.phone.on_ring("ignore")
     stream = tenant.stream(after=0)
     _, cid = dial(tenant, agent)
     leg = agent.phone.wait_ring()
     world.plivo.reject_next("/Request/", 503, account=tenant.auth_id)
-    err = error(tenant.api.post(f"{C}/{cid}/hangup"), 503, "dependency_unavailable")
-    assert "503" not in err["message"] and leg.state == "ringing"
     ok(tenant.api.post(f"{C}/{cid}/hangup"))
-    leg.wait_state("completed")
     assert stream.wait_for("call.failed", conversation_id=cid)["data"]["result"] == "cancelled"
+    assert leg.wait_state("completed").hangup_cause_code == CANCELLED
+    assert len(world.plivo.requests_to(f"/Account/{tenant.auth_id}/Request/")) == 2
+
+
+@pytest.mark.parametrize(("while_", "then"), [("rings", "rings"), ("placing", "rings"), ("placing", "answers")])
+def test_an_agent_going_away_while_its_dial_rings_ends_the_call_and_cancels_the_ring(world, tenant, while_, then):
+    settings(tenant, ring_timeout_sec=120)
+    agent = tenant.agent().login()
+    agent.phone.on_ring("ignore")
+    stream = tenant.stream(after=0)
+    placing = world.plivo.fault("stall", placed, account=tenant.auth_id, times=1 if while_ == "placing" else 0)
+    with ThreadPoolExecutor(1) as pool:
+        dialing = pool.submit(tenant.api.post, C, json=body(tenant, agent, lead(world)[0]))
+        ring = agent.phone.wait_ring()
+        cid = hs_header(ring, "HsConversation")
+        agent.set_status("Away")
+        assert stream.wait_for("call.failed", conversation_id=cid)["data"]["result"] == "cancelled"
+        assert ok(tenant.api.get(f"/api/v1/conversations/{cid}"))["state"] == "closed"
+        if then == "answers":
+            ring.answer()
+            assert ring.wait_state("completed").hangup_cause_code == REJECTED
+        placing.release()
+        assert dialing.result(15).status_code == 201
+    assert ring.wait_state("completed").hangup_cause_code == (CANCELLED if then == "rings" else REJECTED)
+    world.wait(world.plivo.idle, what="the ended leg's callbacks handled")
+    fence(tenant)
+    told = [len(replayed(tenant, kind, conversation_id=cid)) for kind in ("call.failed", "call.ended", "call.answered")]
+    assert told == [1, 1, 0] and ok(tenant.api.get(f"/api/v1/conversations/{cid}"))["legs"] == []
+
+
+@pytest.mark.parametrize("then", ["rings out", "answers"])
+def test_a_dial_the_call_session_timeout_closes_while_it_rings_tells_its_end_once_when_the_ring_ends(
+    world, tenant, then
+):
+    settings(tenant, call_session_timeout_sec=60, ring_timeout_sec=120)
+    agent = tenant.agent().login()
+    agent.phone.on_ring("ignore")
+    _, cid = dial(tenant, agent)
+    ring = agent.phone.wait_ring()
+    world.advance(61)
+    assert ok(tenant.api.get(f"/api/v1/conversations/{cid}"))["state"] == "closed"
+    if then == "answers":
+        ring.answer()
+    ended = ring.wait_state("completed", timeout=20).hangup_cause_code
+    assert ended == (REJECTED if then == "answers" else FAILURES["timeout"])
+    world.wait(world.plivo.idle, what="the ended leg's callbacks handled")
+    kinds = ("conversation.closed", "call.failed", "call.ended", "call.answered")
+    told = [(kind, e["data"]["result"]) for kind in kinds for e in replayed(tenant, kind, conversation_id=cid)]
+    assert told == [(kind, "abandoned") for kind in kinds[:3]]
+    assert ok(tenant.api.get(f"/api/v1/conversations/{cid}"))["legs"] == []
+
+
+def placed(r) -> bool:
+    return r.method == "POST" and r.path.endswith("/Call/")
+
+
+@pytest.mark.parametrize("then", ["rings", "answers"])
+@pytest.mark.parametrize("by", ["agent", "key"])
+def test_a_hangup_while_plivo_still_places_the_dial_ends_the_call_and_frees_the_agent_at_once(world, tenant, by, then):
+    settings(tenant, ring_timeout_sec=120)
+    agent = tenant.agent().login()
+    number, phone = lead(world)
+    agent.phone.on_ring("ignore")
+    stream, client, key = tenant.stream(after=0), agent.api() if by == "agent" else tenant.api, str(uuid.uuid4())
+    placing = world.plivo.fault("stall", placed, account=tenant.auth_id)
+    with ThreadPoolExecutor(1) as pool:
+        dialing = pool.submit(tenant.api.post, C, json=body(tenant, agent, number))
+        ring = agent.phone.wait_ring()
+        cid = hs_header(ring, "HsConversation")
+        ok(client.post(f"{C}/{cid}/hangup", headers={"Idempotency-Key": key}))
+        assert ok(tenant.api.get(f"/api/v1/conversations/{cid}"))["state"] == "closed"
+        assert stream.wait_for("call.failed", conversation_id=cid)["data"]["result"] == "cancelled"
+        assert stream.wait_for("call.ended", conversation_id=cid)["data"]["ended_by"] == "agent"
+        dial(tenant, agent)
+        second = agent.phone.wait_ring()
+        if then == "answers":
+            ring.answer()
+            assert ring.wait_state("completed").hangup_cause_code == REJECTED
+        placing.release()
+        assert dialing.result(15).status_code == 201
+    assert ring.wait_state("completed").hangup_cause_code == (CANCELLED if then == "rings" else REJECTED)
+    world.wait(world.plivo.idle, what="the ended leg's callbacks handled")
+    fence(tenant)
+    told = [len(replayed(tenant, kind, conversation_id=cid)) for kind in ("call.failed", "call.ended", "call.answered")]
+    assert told == [1, 1, 0] and not phone.legs and second.state == "ringing"
+    assert ok(tenant.api.get(f"/api/v1/conversations/{cid}"))["legs"] == []
+    assert client.post(f"{C}/{cid}/hangup", headers={"Idempotency-Key": key}).status_code == 204
+    assert len(world.plivo.requests_to(f"/Account/{tenant.auth_id}/Request/")) == 1
+
+
+def test_a_dial_plivo_refuses_after_its_hangup_stays_cancelled_and_its_end_is_told_once(world, tenant):
+    agent = tenant.agent().login()
+    stream = tenant.stream(after=0)
+    refusing = world.plivo.fault("refuse", placed, account=tenant.auth_id, status=400)
+    with ThreadPoolExecutor(1) as pool:
+        dialing = pool.submit(tenant.api.post, C, json=body(tenant, agent, lead(world)[0]))
+        cid = stream.wait_for("conversation.started", agent_id=agent.id)["conversation_id"]
+        ok(tenant.api.post(f"{C}/{cid}/hangup"))
+        assert stream.wait_for("call.failed", conversation_id=cid)["data"]["result"] == "cancelled"
+        refusing.release()
+        error(dialing.result(15), 422, "plivo_refused")
+    fence(tenant)
+    told = [len(replayed(tenant, kind, conversation_id=cid)) for kind in ("call.failed", "call.ended")]
+    assert told == [1, 1] and not agent.phone.legs
 
 
 def test_a_carrier_rate_limit_is_429_with_retry_after(world, tenant):

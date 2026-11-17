@@ -161,6 +161,7 @@ class ClosedDisposition(Data):
     sub_disposition: str | None = None
     system: bool
     skipped: bool
+    note: str | None = Field(None, description="What the agent wrote at wrap-up.")
 
 
 class Closed(Data):

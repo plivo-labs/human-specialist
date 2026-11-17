@@ -17,6 +17,7 @@ TIMER = re.compile(r"kind = 'offer_timeout'")
 STINTS = {
     ("access.py", "_VISIBLE"),
     ("events/__init__.py", "FACTS"),
+    ("events/api.py", "timeline"),
     ("export.py", "FACTS"),
     ("export.py", "ITEMS"),
     ("hot.py", "ACCEPTED"),

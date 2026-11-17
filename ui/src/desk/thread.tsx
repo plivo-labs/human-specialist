@@ -1,5 +1,5 @@
 import { Phone } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import { type Page, asAgent, every } from "../api";
 import { CHANNEL } from "../conversations";
 import { cap, phone, when } from "../format";
@@ -7,7 +7,7 @@ import type { Message, Task } from "../types";
 import { Button, Facts, Textarea, Timeline, act, failed, useLoad } from "../ui";
 import { describe } from "../words";
 import { type Ctx, callOut, cantCall } from "./desk";
-import { type Line, replySubject, thread, windowShut } from "./state";
+import { type Line, note, own, replySubject, thread, windowShut } from "./state";
 
 type Name = (id?: string | null, fallback?: string) => string;
 
@@ -17,55 +17,71 @@ export function Thread({ ctx, line, name }: { ctx: Ctx; line: Line; name: Name }
   const feed = s.feed.filter((e) => e.conversation_id === cid).reverse();
   const heard = feed.findLast((e) => e.type.startsWith("message."))?.id;
   const load = useLoad(() => every<Message>((c) => asAgent<Page<Message>>("GET", `/api/v1/conversations/${cid}/messages?limit=200${c}`)), [cid, heard]);
-  const [text, setText] = useState("");
   const end = useRef<HTMLDivElement>(null);
   const msgs = load.data ?? [];
-  const rows = thread(msgs, feed, (e) => describe(e, name, s.me.id));
+  const rows = thread(msgs, feed, (e) => describe(e, name, s.me.id), line.conv.notes);
   useEffect(() => void end.current?.scrollIntoView({ block: "end" }), [rows.length]);
   const shut = !!load.data && windowShut(line.conv.channel, msgs, now);
   const subject = line.conv.channel === "email" ? replySubject(msgs) : null;
-  const send = async () => {
-    const said = text.trim();
-    if (!said) return;
-    setText("");
-    await asAgent("POST", `/api/v1/conversations/${cid}/messages`, { text: said, ...(subject && { email: { subject } }) }).catch((e) => (setText(said), failed("Sending", e)));
-  };
+  const send = (said: string) => asAgent("POST", `/api/v1/conversations/${cid}/messages`, { text: said, ...(subject && { email: { subject } }) }).then(() => true, (e) => (failed("Sending", e), false));
   return (
     <>
       <Timeline start rows={rows} />
       {load.error && <p className="text-s-400 text-destructive">{load.error}</p>}
-      <div className="sticky bottom-0 mt-auto grid gap-2 border-t bg-background pt-3">
-        {shut ? (
-          <p className="text-s-400 text-secondary">WhatsApp takes a free reply only within 24 hours of the customer's last message. After that it needs an approved template, which this desk cannot send.</p>
-        ) : (
-          <Textarea
-            aria-label="Reply"
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && (e.preventDefault(), send())}
-            placeholder={subject ? `Reply by email (${subject})` : `Reply by ${CHANNEL[line.conv.channel]}. Shift+Enter adds a line.`}
-          />
-        )}
-        <div className="flex justify-between gap-2">
-          <Button variant="danger" onClick={async () => (await act("Ending the conversation", () => asAgent("POST", `/api/v1/conversations/${cid}/close`), "Conversation ended. Wrap-up is open.")) && loadLine(cid)}>
-            End conversation
-          </Button>
-          <Button variant="primary" disabled={shut || !text.trim()} onClick={send}>
-            Send
-          </Button>
-        </div>
-      </div>
+      <Composer
+        label="Reply"
+        action="Send"
+        send={send}
+        placeholder={subject ? `Reply by email (${subject})` : `Reply by ${CHANNEL[line.conv.channel]}. Shift+Enter adds a line.`}
+        shut={shut && <p className="text-s-400 text-secondary">WhatsApp takes a free reply only within 24 hours of the customer's last message. After that it needs an approved template, which this desk cannot send.</p>}
+      >
+        <Button variant="danger" onClick={async () => (await act("Ending the conversation", () => asAgent("POST", `/api/v1/conversations/${cid}/close`), "Conversation ended. Wrap-up is open.")) && loadLine(cid)}>
+          End conversation
+        </Button>
+      </Composer>
       <div ref={end} />
+    </>
+  );
+}
+
+function Composer({ label, action, placeholder, send, shut, children }: { label: string; action: string; placeholder: string; send: (text: string) => Promise<boolean>; shut?: ReactNode; children?: ReactNode }) {
+  const [text, setText] = useState("");
+  const go = async () => {
+    const said = text.trim();
+    if (!said) return;
+    setText("");
+    if (!(await send(said))) setText(said);
+  };
+  return (
+    <div className="sticky bottom-0 mt-auto grid gap-2 border-t bg-background pt-3">
+      {shut || <Textarea aria-label={label} value={text} onChange={(e) => setText(e.target.value)} onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && (e.preventDefault(), go())} placeholder={placeholder} />}
+      <div className="flex justify-between gap-2">
+        {children ?? <span />}
+        <Button variant="primary" disabled={!!shut || !text.trim()} onClick={go}>
+          {action}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+export function Call({ ctx, line, name }: { ctx: Ctx; line: Line; name: Name }) {
+  const { s, loadLine } = ctx;
+  const save = (text: string) => note(asAgent, line.cid, text).then(() => (loadLine(line.cid), true), (e) => (failed("Saving the note", e), false));
+  return (
+    <>
+      <Timeline start rows={thread([], s.feed.filter((e) => e.conversation_id === line.cid).reverse(), (e) => describe(e, name, s.me.id), line.conv.notes)} />
+      <Composer label="Note" action="Add note" send={save} placeholder="A note on this call. The caller never sees it. Shift+Enter adds a line." />
     </>
   );
 }
 
 export function Work({ ctx, line, name }: { ctx: Ctx; line: Line; name: Name }) {
   const { s, loadLine } = ctx;
-  const load = useLoad(() => asAgent<Page<Task>>("GET", `/api/v1/tasks?conversation_id=${line.cid}&limit=1`), [line.cid]);
-  const t = load.data?.data[0];
+  const load = useLoad(() => asAgent<Page<Task>>("GET", `/api/v1/tasks?conversation_id=${line.cid}&limit=50`), [line.cid]);
+  const t = load.data && own(load.data.data, line.cid);
   const why = t?.customer ? cantCall(s) : "";
-  const rows = thread([], s.feed.filter((e) => e.conversation_id === line.cid).reverse(), (e) => describe(e, name, s.me.id));
+  const rows = thread([], s.feed.filter((e) => e.conversation_id === line.cid).reverse(), (e) => describe(e, name, s.me.id), line.conv.notes);
   const resolve = () => act("Resolving the task", () => asAgent("PATCH", `/api/v1/tasks/${t!.id}`, { status: "resolved" }), "Task resolved. Wrap-up is open.");
   return (
     <>

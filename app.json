@@ -1,0 +1,40 @@
+{
+  "name": "human-specialist",
+  "description": "Queue, route and ring human agents over Plivo, with the agent desk in the browser. After the deploy, set PUBLIC_BASE_URL to the app's URL.",
+  "success_url": "https://github.com/plivo-labs/human-specialist/blob/main/docs/deploy.md#heroku",
+  "stack": "container",
+  "env": {
+    "HS_SETUP_PLIVO_AUTH_ID": {
+      "description": "The Auth ID of the Plivo account that registers the first organization without the operator key."
+    },
+    "PUBLIC_BASE_URL": {
+      "description": "Leave empty. After the deploy, copy the app's URL from Settings > Domains into this config var.",
+      "required": false
+    },
+    "HS_OPERATOR_KEY": {
+      "description": "Bearer key for the operator routes.",
+      "generator": "secret"
+    },
+    "HS_SECRET_KEY": {
+      "description": "Encrypts Plivo tokens at rest. Keep a copy: without it they cannot be decrypted.",
+      "generator": "secret"
+    },
+    "DB_POOL_SIZE": "12",
+    "DB_MAX_OVERFLOW": "4",
+    "METRICS_PORT": "0"
+  },
+  "formation": {
+    "web": {
+      "quantity": 1,
+      "size": "basic"
+    }
+  },
+  "addons": [
+    {
+      "plan": "heroku-postgresql:essential-0"
+    },
+    {
+      "plan": "heroku-redis:mini"
+    }
+  ]
+}

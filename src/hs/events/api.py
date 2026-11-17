@@ -24,7 +24,7 @@ router = APIRouter()
 webhook_docs = APIRouter()  # app.webhooks: one documented POST per event type
 EVENTS = access.require("key:events")
 STREAM = access.require(*events.GRANTS)
-CALLS_SUP = access.require("key:calls", "sup")
+TIMELINE = access.require("key:calls", "agent", "sup")
 EventType = Literal[tuple(CATALOG)]
 
 
@@ -85,10 +85,11 @@ for _type, _model in CATALOG.items():
         """Signed with X-HS-Signature: v1=<hex HMAC-SHA256(secret, f"{X-HS-Timestamp}.{body}")>."""
 
 
-def _by_seq(rows: list[dict], limit: int) -> dict:
-    """From `limit + 1` rows: a page whose cursor is its last seq, which `after` takes."""
+def _by_seq(rows: list[dict], limit: int, scanned: int | None = None) -> dict:
+    """From `limit + 1` rows: a page whose cursor is its last seq, which `after` takes; or the seq a scoped scan
+    stopped at before it found them."""
     more, rows = len(rows) > limit, rows[:limit]
-    return {"data": rows, "next_cursor": rows[-1]["id"] if more else None}
+    return {"data": rows, "next_cursor": rows[-1]["id"] if more else None if scanned is None else str(scanned)}
 
 
 def _checked(url: str | None) -> None:
@@ -187,12 +188,24 @@ def replay(
 
 @router.get("/conversations/{conversation_id}/timeline", response_model=Page[Envelope[dict]])
 def timeline(
-    conversation_id: UUID, p: Principal = CALLS_SUP, after: int = Query(0, ge=0), limit: int = Query(200, ge=1, le=200)
+    conversation_id: UUID, p: Principal = TIMELINE, after: int = Query(0, ge=0), limit: int = Query(200, ge=1, le=200)
 ):
+    """A key and a supervisor read every event of the conversation. An agent reads it once it took the conversation
+    as primary, or while it is on it, and gets what its stream sends it, by the same rules. A page may hold fewer
+    events than `limit`, or none, and still carry a `next_cursor`: follow it until it is null."""
+    scope, A = None, core.T.assignment
     with core.read() as db:
         access.conversation(db, p, conversation_id)
-    found, _ = events.read(p.tenant_id, after, limit + 1, agent=p.agent_id, conversation_id=str(conversation_id))
-    return _by_seq(found, limit)
+        if p.kind == "agent" and not access.holds_grant(p, "sup"):
+            mine = select(A).where(A.c.conversation_id == conversation_id, A.c.agent_id == UUID(p.agent_id))
+            if not access.reads(p.agent_id, db.execute(mine).all()):
+                raise ApiError(404, "conversation_not_found", "no such conversation")
+            if (s := access.seen(db, p)).agents is not None:
+                scope = events.Scope(s.agents, s.teams)
+    found, scanned = events.read(
+        p.tenant_id, after, limit + 1, scope=scope, agent=p.agent_id, conversation_id=str(conversation_id)
+    )
+    return _by_seq(found, limit, scanned)
 
 
 @router.get("/events/stream", response_class=StreamingResponse)

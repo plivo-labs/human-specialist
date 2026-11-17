@@ -186,7 +186,8 @@ def test_me_returns_profile_role_status_and_desk_settings(tenant):
 
 def test_caller_id_must_be_a_registered_number(tenant):
     agent = tenant.agent()
-    error(tenant.api.patch(f"{A}/{agent.id}", json={"caller_id": "+14155550123"}), 422, "from_not_allowed")
+    refused = error(tenant.api.patch(f"{A}/{agent.id}", json={"caller_id": "+14155550123"}), 422, "from_not_allowed")
+    assert refused["message"] == "the caller ID must be a number this organization routes; add it under Numbers"
     number = registered_number(tenant)
     ok(tenant.api.patch(f"{A}/{agent.id}", json={"caller_id": number}))
     assert ok(tenant.api.get(f"{A}/{agent.id}"))["caller_id"] == number

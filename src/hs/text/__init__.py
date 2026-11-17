@@ -57,15 +57,16 @@ _CAME = text(
     " ON c.id = s.conversation_id WHERE t.conversation_id = :id AND c.id <> :id LIMIT 1"
 )
 # Plivo's reports come late and repeated: a status only moves forward, and to failed or undelivered only from pending,
-# queued or sent.
+# queued or sent. The message's conversation is locked before the message, as a send's check locks them.
 _STATUS = text(
-    "UPDATE entry SET status = :to, provider_id = coalesce(provider_id, :uuid)"
-    " FROM (SELECT ARRAY['pending', 'queued', 'sent', 'delivered', 'read', 'deleted'] AS r) v"
-    " WHERE id = :id AND tenant_id = :tenant AND kind = 'message'"
+    "WITH c AS (SELECT id FROM conversation WHERE id = (SELECT conversation_id FROM entry WHERE id = :id"
+    " AND tenant_id = :tenant) FOR NO KEY UPDATE)"
+    " UPDATE entry SET status = :to, provider_id = coalesce(provider_id, :uuid) FROM c, (SELECT ARRAY['pending', 'queued', 'sent', 'delivered', 'read', 'deleted'] AS r) v"
+    " WHERE entry.id = :id AND conversation_id = c.id AND tenant_id = :tenant AND kind = 'message'"
     " AND (CAST(:uuid AS text) IS NULL OR provider_id IS NULL OR provider_id = :uuid)"
     " AND CASE WHEN :to IN ('failed', 'undelivered') THEN status IN ('pending', 'queued', 'sent')"
     " ELSE array_position(v.r, status) < array_position(v.r, CAST(:to AS text)) END"
-    " RETURNING id, conversation_id, agent_id, provider_id, at"
+    " RETURNING entry.id, conversation_id, agent_id, provider_id, at"
 )
 SKEW = timedelta(minutes=5)
 
@@ -118,6 +119,7 @@ class Inbound(Parties, Content):
 
 class TextEnqueue(Inbound):
     context: dict | None = None
+    transcript: m.Transcript | None = None
     agents: list[UUID] = []
     route: m.EnqueueRoute | None = None
 
@@ -731,9 +733,11 @@ def _join(db: Connection, p: Principal, raw: dict) -> tuple[Row, TextEnqueue]:
     body = config.validate_model(TextEnqueue, raw)
     msg = body.model_dump(by_alias=True)
     if e := seen(db, p.tenant_id, body.to, body.provider_id):
-        return cv.lock(db, e.conversation_id), body
-    conv = find(db, p.tenant_id, msg) or opened(db, p.tenant_id, msg, body.context)
-    received(db, conv, msg)
+        conv = cv.lock(db, e.conversation_id)
+    else:
+        conv = find(db, p.tenant_id, msg) or opened(db, p.tenant_id, msg, body.context)
+        received(db, conv, msg)
+    cv.keep_transcript(db, conv, body.transcript)
     return conv, body
 
 

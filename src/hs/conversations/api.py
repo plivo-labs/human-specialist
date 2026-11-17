@@ -104,6 +104,7 @@ class Conversation(ConversationSummary):
     notes: list[ConversationNote]
     recording_ids: list[str]
     context: dict | None
+    transcript: list[m.Turn] | None = Field(None, description="The bot's turns before the handoff, as sent.")
     attributes: dict
     dispositions: list[ClosedDisposition]
 
@@ -281,7 +282,7 @@ def count_conversations(p: access.Principal = READ, f: Filters = Depends()):
 @router.get("/conversations/{conversation_id}", response_model=Conversation)
 def get_conversation(conversation_id: UUID, p: access.Principal = READ):
     with read() as db:
-        return cv.view(db, access.conversation(db, p, conversation_id, offer=True), p.agent_id)
+        return cv.view(db, access.conversation(db, p, conversation_id, offer=True), p.agent_id, transcript=True)
 
 
 @router.post("/conversations/{conversation_id}/viewed", status_code=204)
@@ -324,7 +325,7 @@ def patch_conversation(conversation_id: UUID, body: ConversationPatch, p: access
                     409, "conversation_open", "this customer already has an open conversation on this line"
                 ) from None
             cv.touched(db, conv)
-        return cv.view(db, conv, p.agent_id)
+        return cv.view(db, conv, p.agent_id, transcript=True)
 
 
 NOTERS: dict[str, Callable[[Connection, access.Principal, UUID], bool]] = {}

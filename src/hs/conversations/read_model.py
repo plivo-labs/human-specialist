@@ -6,7 +6,7 @@ from sqlalchemy import Text, case, func, select
 from sqlalchemy.dialects.postgresql import aggregate_order_by
 from sqlalchemy.engine import Connection, Row
 
-from hs import config
+from hs import access, config
 from hs.conversations import LIVE, TEXT, Offer, _str, inbox
 from hs.conversations.store import rows
 from hs.core import T
@@ -34,9 +34,8 @@ def _dispositions(db: Connection, conv: Row, every: list[Row]) -> list[dict]:
         d, skipped = config.get(db, t, "disposition", a.disposition_id), a.reason == "skipped"
         ids = {"disposition_id": str(a.disposition_id), "sub_disposition_id": _str(a.sub_disposition_id)}
         ids |= {"disposition": d and d["name"], "sub_disposition": name(a.sub_disposition_id)}
-        out.append(
-            {"agent_id": _str(a.agent_id), **ids, "system": skipped or bool(d and d["system"]), "skipped": skipped}
-        )
+        flags = {"system": skipped or bool(d and d["system"]), "skipped": skipped, "note": a.note}
+        out.append({"agent_id": _str(a.agent_id), **ids, **flags})
     if not out and conv.state == "closed" and (system := _mapped(db, conv, conv.result)):
         ids = {"disposition_id": str(system), "sub_disposition_id": None, "disposition": name(system)}
         out.append({"agent_id": None, **ids, "sub_disposition": None, "system": True, "skipped": False})
@@ -108,18 +107,21 @@ def _iso(at) -> str | None:
     return at and at.isoformat()
 
 
-def view(db: Connection, conv: Row, agent_id=None) -> dict:
+def view(db: Connection, conv: Row, agent_id=None, *, transcript: bool = False) -> dict:
     """The one read model of a conversation: GET /conversations/{id} and the search document. An agent reads the
-    handoff context only once it took the conversation as primary, or while it is on it."""
+    handoff context only once it took the conversation as primary, or while it is on it, and the handoff transcript
+    by the same rule; only a caller that asks for `transcript` gets it, and the search document never asks."""
     doc = dict(db.execute(summary(agent_id).where(T.conversation.c.id == conv.id)).one()._mapping)
     inbox.counted(db, conv.tenant_id, [doc])
     every = rows(db, conv.id)
-    mine = [a for a in every if agent_id and _str(a.agent_id) == str(agent_id)]
-    reads = not agent_id or any(a.state == "active" or (a.role == "primary" and a.started_at) for a in mine)
+    reads = access.reads(agent_id, every)
     left = conv.state in ("wrap_up", "closed") and conv.routing.get("left_at")
     legs = [(conv.call_uuid, "customer", conv.opened_at, (left and datetime.fromisoformat(left)) or conv.closed_at)]
     legs += [(a.call_uuid, a.role, a.started_at, a.ended_at) for a in every if not isinstance(a, Offer)]
     entries = _entries(db, conv.id, ("note", "recording", "voicemail"))
+    if transcript:
+        kept = _entries(db, conv.id, ("transcript",))
+        doc["transcript"] = kept[0].body["turns"] if kept and reads else None
     return doc | {
         "legs": [{"call_uuid": u, "role": r, "started_at": _iso(s), "ended_at": _iso(e)} for u, r, s, e in legs if u],
         "notes": [note(n) for n in entries if n.kind == "note"],

@@ -42,7 +42,7 @@ A transfer to a saved destination is told as the number or redirect the destinat
 
 `offer.missed` says why the offer ended unanswered, by `data.reason`: `timeout` when its timer ran out, `ring_unconfirmed` when the timer ran out on a call ring Plivo never confirmed (its ring request met an error or no reply, or was not sent in time), `ring_failed` when Plivo refused the ring, `unsuccessful` when none of the ring's legs joined, or Plivo's hangup cause code when the agent's leg ended unanswered; null when the leg left the room before it joined. On a call, `strike` is the agent's RONA strike count after the miss, and only `timeout` and Plivo's ring timeout (`6010`) add a strike.
 
-`call.participant_added` comes when a participant joins the call, never for one that does not answer. `call.participant_removed` says why a participant is off the call while the caller is still on, by `data.reason`: `no_answer` for a ring that ended unanswered, `left` when its leg hung up, `removed` when the agent or HS took it off the call. A warm transfer's agent target that joined and comes off without taking the conversation, by a cancel or, on a text, a close, is told `call.participant_removed` (`removed`) or `conversation.participant_removed`, its `participant_id` the transfer's id. `call.held` and `call.resumed` come for each member whose hold changes, and `data.participant_id` names the participant, or the transfer for its target, or is null for the caller.
+`call.participant_added` comes when a participant joins the call, never for one that does not answer. `call.participant_removed` says why a participant is off the call, by `data.reason`: `no_answer` for a ring that ended unanswered, `left` when its leg hung up, `removed` when the agent or HS took it off the call. A warm transfer's agent target that joined and comes off without taking the conversation is told, its `participant_id` the transfer's id: `call.participant_removed` when its leg hangs up (`left`), on a cancel or when the caller leaves (`removed`), and `conversation.participant_removed` when a text is closed. `call.held` and `call.resumed` come for each member whose hold changes, and `data.participant_id` names the participant, or the transfer for its target, or is null for the caller.
 
 ## Event types
 
@@ -69,11 +69,11 @@ Every type the service emits, with the keys of its `data`. A key marked `?` can 
 | `conversation.transferred` | a text transfer changes status | `transfer_id`, `mode`, `from_agent_id?`, `target`, `status`, `to_agent_id?` |
 | `call.participant_added`, `conversation.participant_removed` | a participant joins the call, or leaves a conversation | `participant_id`, `participant`, `role` |
 | `call.participant_removed` | a participant is off the call | `participant_id`, `participant`, `role`, `reason` |
-| `supervisor.joined`, `supervisor.mode_changed`, `supervisor.left`, `supervisor.revealed`, `supervisor.assistance_requested`, `supervisor.assistance_rejected`, `supervisor.failed` | a supervisor's monitoring changes; `supervisor.left` fires on every way a supervisor stops monitoring: leaving, moving to another call, being displaced, or a transfer taking over | `supervisor_id`, `mode`, `visible` |
+| `supervisor.joined`, `supervisor.mode_changed`, `supervisor.left`, `supervisor.revealed`, `supervisor.assistance_requested`, `supervisor.assistance_rejected`, `supervisor.failed` | a supervisor's monitoring changes; `supervisor.left` fires on every way a supervisor stops monitoring: leaving, moving to another call, being displaced, a transfer taking over, or the caller hanging up | `supervisor_id`, `mode`, `visible` |
 | `call.ended` | the caller's room ends | `from?`, `to?`, `result`, `queue_id?`, `hangup_cause?`, `hangup_cause_code?`, `duration_sec?`, `talk_sec?`, `ended_by` |
 | `conversation.wrap_up_started` | an agent's wrap-up begins | `mode`, `deadline_at?` |
 | `conversation.wrapped_up` | an agent submits or skips wrap-up | `disposition_id?`, `disposition?`, `sub_disposition?`, `note?`, `system`, `skipped`, `duration_sec` |
-| `conversation.closed` | the conversation closes | `result`, `dispositions`, `recording_ids`, `duration_sec?` |
+| `conversation.closed` | the conversation closes | `result`, `dispositions` (each with its wrap-up `note?`), `recording_ids`, `duration_sec?` |
 | `conversation.csat_recorded` | a customer's CSAT score is recorded | `score` |
 | `recording.ready` | a recording is available | `recording_id`, `duration_sec?` |
 | `transcript.ready` | a recording's transcript is available | `recording_id` |
@@ -89,7 +89,7 @@ Every type the service emits, with the keys of its `data`. A key marked `?` can 
 
 ## Stream
 
-`GET /api/v1/events/stream` is server-sent events. Each frame has `id: <seq>` and a `data:` JSON envelope (`id`, `type`, `created_at`, `tenant_id`, `conversation_id`, `agent_id`, `direction`, `context`, `data`). The handoff `context` reaches an agent's stream, and a supervisor's conversation timeline, only while that agent is on the conversation: active on it, or in wrap-up as its primary. Otherwise it reads null.
+`GET /api/v1/events/stream` is server-sent events. Each frame has `id: <seq>` and a `data:` JSON envelope (`id`, `type`, `created_at`, `tenant_id`, `conversation_id`, `agent_id`, `direction`, `context`, `data`). The handoff `context` reaches the stream and the conversation timeline of an agent or a supervisor only while that person is on the conversation: active on it, or in wrap-up as its primary. Otherwise it reads null.
 
 `GET /conversations/{id}` gives it to an agent that took the conversation as primary or is active on it, a monitoring supervisor included. An agent holding an open offer on the conversation reads it and its messages until the offer ends or its ring timeout passes, with `context` null. A tenant credential, webhooks and plugin hooks always get it. There is no `event:` field, so `EventSource.onmessage` receives every event.
 

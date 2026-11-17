@@ -1,9 +1,9 @@
 import { Plus, UserPen } from "lucide-react";
 import { type ReactNode, useState } from "react";
 import { type Page as Paged, api, every } from "../api";
-import { cap, day, phone, plain, zone } from "../format";
+import { COLORS, cap, day, hue, phone, plain, zone } from "../format";
 import type { BusinessHours, Destination, HolidayGroup, Named, PresenceStatus, Skill, Slot, Task } from "../types";
-import { Badge, Button, cls, Editor, Empty, Facts, Field, Input, ListView, Page, Rows, Select, Sheet, State, TabList, TabPanel, Tab, Tabs, type Tone, useLoad, usePaged } from "../ui";
+import { Badge, Button, cls, Editor, Empty, Facts, Field, Input, ListView, Page, PhoneInput, Rows, Select, Sheet, State, TabList, TabPanel, Tab, Tabs, type Tone, useLoad, usePaged } from "../ui";
 import { allAgents, twin } from "./agents";
 import { StatusRules } from "./settings";
 
@@ -97,19 +97,18 @@ export function Skills() {
               <Input name="max" type="number" required min={0} max={100} defaultValue={row?.max_level ?? 100} className="font-mono" />
             </Field>
           </div>
+          <p className="text-s-400 text-secondary">Give users skills from each user's sheet under Users.</p>
         </Editor>
       )}
     </Page>
   );
 }
 
-const COLORS: Record<string, string> = { "#27AE7D": "Green", "#EB5757": "Red", "#EBA000": "Amber", "#9B9FAA": "Gray" };
-
 export function Statuses() {
   const load = useLoad(() => every<PresenceStatus>((c) => api<Paged<PresenceStatus>>("GET", `/api/v1/agent-statuses?limit=200${c}`)).then((s) => s.sort((a, b) => a.sequence - b.sequence)));
   const e = useEdit<PresenceStatus>();
   const row = e.row;
-  const color = row?.color?.toUpperCase() ?? "#27AE7D";
+  const color = row ? hue(row) : "#27AE7D";
   return (
     <Page title="Availability Status" sub="Manage your organization's status">
       <Tabs defaultValue="status" className="mt-2 flex min-h-0 flex-1 flex-col">
@@ -128,7 +127,7 @@ export function Statuses() {
             empty={<Empty title="No statuses yet." />}
             cols={[
               ["Status", (s) => s.name],
-              ["Color", (s) => <span aria-label={s.color ?? "No color"} className="m-0.5 block size-3 rounded-full ring-1 ring-border ring-offset-2 ring-offset-background" style={{ background: s.color }} />],
+              ["Color", (s) => <span aria-label={COLORS[hue(s)] ?? hue(s)} className="m-0.5 block size-3 rounded-full ring-1 ring-border ring-offset-2 ring-offset-background" style={{ background: hue(s) }} />],
               ["Availability", (s) => (s.availability ? <State tone="live">Available</State> : <State tone="off" dim>Unavailable</State>)],
               ["Default", (s) => s.default && <span className="label inline-block rounded-sm bg-muted px-2 py-[5px] text-secondary">Default</span>],
             ]}
@@ -212,7 +211,7 @@ export function Contacts() {
             </Field>
           ) : (
             <Field label="Phone number">
-              <Input name="number" required autoFocus inputMode="tel" placeholder="+14155550100" pattern="\+\d{6,15}" title="A plus sign, then the country code and number" defaultValue={row?.number ?? ""} className="font-mono" />
+              <PhoneInput name="number" required autoFocus defaultValue={row?.number ?? ""} />
             </Field>
           )}
           <Field label="Alias">
@@ -372,6 +371,18 @@ const PRIORITY: Record<Task["priority"], [Tone | undefined, string?]> = { low: [
 const STATUSES = ["todo", "in_progress", "waiting_on_customer", "resolved", "cancelled"];
 const ENDED = ["resolved", "cancelled"];
 
+export const PriorityField = ({ value = "medium" }: { value?: string }) => (
+  <Field label="Priority">
+    <Select name="priority" defaultValue={value}>
+      {Object.keys(PRIORITY).map((p) => (
+        <option key={p} value={p}>
+          {cap(p)}
+        </option>
+      ))}
+    </Select>
+  </Field>
+);
+
 export function Tasks() {
   const load = usePaged<Task>((c) => api<Paged<Task>>("GET", `/api/v1/tasks?limit=50${c}`));
   const e = useEdit<Task>();
@@ -407,15 +418,7 @@ export function Tasks() {
           <Field label="Task name">
             <Input name="title" required autoFocus defaultValue={row.title} />
           </Field>
-          <Field label="Priority">
-            <Select name="priority" defaultValue={row.priority}>
-              {Object.keys(PRIORITY).map((p) => (
-                <option key={p} value={p}>
-                  {cap(p)}
-                </option>
-              ))}
-            </Select>
-          </Field>
+          <PriorityField value={row.priority} />
           <Field label="Status">
             <Select name="status" defaultValue={row.status}>
               {STATUSES.map((s) => (

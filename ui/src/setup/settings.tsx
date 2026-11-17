@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { type Page as Paged, api, every, renewals } from "../api";
 import { phone } from "../format";
 import type { EntryPoint, PresenceStatus } from "../types";
+import { OTHER_CHANNELS } from "./numbers";
 import { Field, Form, Input, Listed, Page, Select, Submit, Tab, TabList, TabPanel, Tabs, Toggle, act, cls, useLoad } from "../ui";
 
 type Ref = { status_id: string | null } | null;
@@ -21,7 +22,6 @@ type Settings = {
 
 const TEXT = [["chat", "Chat"], ["email", "Email"], ["sms", "SMS"], ["whatsapp", "WhatsApp"]];
 const SESSION = [["sms", "SMS"], ["chat", "Chat"], ["whatsapp", "WhatsApp"], ["email", "Email"]];
-const CAPACITY = [["chat", "Chat"], ["sms", "SMS"], ["whatsapp", "WhatsApp"], ["email", "Email"], ["callback", "Callback"], ["task", "Task"]];
 const num = (f: FormData, name: string) => Number(f.get(name));
 const on = (f: FormData, name: string) => f.get(name) === "on";
 
@@ -58,7 +58,7 @@ const Part = ({ title, sub, end, children }: { title: string; sub?: string; end?
   </section>
 );
 
-const Unit = ({ label, name, value, unit, min, max, disabled }: { label: string; name: string; value: number; unit?: string; min?: number; max?: number; disabled?: boolean }) => (
+export const Unit = ({ label, name, value, unit, min, max, disabled }: { label: string; name: string; value: number; unit?: string; min?: number; max?: number; disabled?: boolean }) => (
   <Field label={label}>
     <span className="relative block">
       <Input name={name} type="number" required min={min} max={max} defaultValue={value} disabled={disabled} className="pr-20 font-mono disabled:bg-muted" />
@@ -98,7 +98,7 @@ export const Workload = () => (
         ring_timeout_sec: num(f, "ring"),
         text: { offer_timeout_sec: Object.fromEntries(TEXT.map(([ch]) => [ch, num(f, `offer_${ch}`)])) },
         acw_blocks_routing: !on(f, "release"),
-        capacity: Object.fromEntries(CAPACITY.map(([ch]) => [ch, num(f, `cap_${ch}`)])),
+        capacity: Object.fromEntries(OTHER_CHANNELS.map(([ch]) => [ch, num(f, `cap_${ch}`)])),
       })}
     >
       {(s) => (
@@ -115,7 +115,7 @@ export const Workload = () => (
             <Toggle name="release" label="Free an agent's slot during wrap-up" defaultChecked={!s.acw_blocks_routing} />
             <div className={pair}>
               <Unit label="Call" name="cap_call" value={1} disabled />
-              {CAPACITY.map(([ch, label]) => (
+              {OTHER_CHANNELS.map(([ch, label]) => (
                 <Unit key={ch} label={label} name={`cap_${ch}`} value={s.capacity[ch] ?? 1} min={0} max={100} />
               ))}
             </div>

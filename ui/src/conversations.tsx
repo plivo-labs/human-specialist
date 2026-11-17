@@ -5,7 +5,7 @@ import { thread } from "./desk/state";
 import { ago, cap, clock, dmy, phone, plain, time, when } from "./format";
 import { allAgents, allQueues, names } from "./setup/agents";
 import type { Conversation as Conv, ConversationSummary, Envelope, Message, Recording, Task } from "./types";
-import { Empty, Facts, ListView, Listed, Page, Section, State, Tile, Timeline, type Tone, useLoad, usePaged } from "./ui";
+import { Empty, Facts, Handoff, ListView, Listed, Page, Section, State, Tile, Timeline, type Tone, useLoad, usePaged } from "./ui";
 import { describe } from "./words";
 
 const STATE: Record<ConversationSummary["state"], [string, Tone]> = { active: ["Live", "live"], transferring: ["Transferring", "hold"], in_wrap_up: ["Wrap-up", "wrap"], closed: ["Closed", "off"] };
@@ -34,7 +34,7 @@ export function Conversations({ id }: { id?: string }) {
             </button>
           </div>
           <div className="grid content-start gap-1 overflow-y-auto pl-4 pr-2">
-            {list.data?.map((c) => <Tile key={c.id} href={`#/conversations/${c.id}`} active={c.id === id} title={contact(c, titles)} when={ago(c.created_at)} icon={kindIcon(c)} line={kindWord(c)} />)}
+            {list.data?.map((c) => <Tile key={c.id} href={`/conversations/${c.id}`} active={c.id === id} title={contact(c, titles)} when={ago(c.created_at)} icon={kindIcon(c)} line={kindWord(c)} />)}
           </div>
         </div>
         <Conversation id={id} titles={titles} />
@@ -62,6 +62,17 @@ export function Conversations({ id }: { id?: string }) {
   );
 }
 
+export const WrapUp = ({ rows, name }: { rows: Conv["dispositions"]; name: (id: string | null, fallback: string) => string }) => (
+  <ul className="grid gap-1 text-s-400">
+    {rows.map((d, i) => (
+      <li key={i}>
+        {name(d.agent_id, "Automatic")}: {d.skipped ? "skipped" : [d.disposition, d.sub_disposition].filter(Boolean).join(", ")}
+        {d.note && <p className="whitespace-pre-wrap break-words text-secondary">{d.note}</p>}
+      </li>
+    ))}
+  </ul>
+);
+
 function Conversation({ id, titles }: { id: string; titles: Record<string, string> }) {
   const load = useLoad(
     () =>
@@ -83,7 +94,8 @@ function Conversation({ id, titles }: { id: string; titles: Record<string, strin
         <>
           <div className="min-w-0 flex-1 overflow-y-auto px-4 pb-6">
             <h2 className="subtitle py-3.5">{contact(c!, titles)}</h2>
-            <Timeline start rows={thread(messages!, timeline!.data, (e) => describe(e, name))} />
+            <Handoff turns={c!.transcript} />
+            <Timeline start rows={thread(messages!, timeline!.data, (e) => describe(e, name), c!.notes)} />
             {recordings!.data.map((r) => (
               <section key={r.id} className="mt-6 grid max-w-[406px] gap-4 rounded-sm border p-4">
                 <h3 className="flex items-center gap-2 text-p-400">
@@ -119,13 +131,7 @@ function Conversation({ id, titles }: { id: string; titles: Record<string, strin
             </Section>
             {c!.dispositions.length > 0 && (
               <Section title="Wrap-up">
-                <ul className="grid gap-1 text-s-400">
-                  {c!.dispositions.map((d, i) => (
-                    <li key={i}>
-                      {name(d.agent_id, "Automatic")}: {d.skipped ? "skipped" : [d.disposition, d.sub_disposition].filter(Boolean).join(", ")}
-                    </li>
-                  ))}
-                </ul>
+                <WrapUp rows={c!.dispositions} name={name} />
               </Section>
             )}
             {c!.context && Object.keys(c!.context).length > 0 && (

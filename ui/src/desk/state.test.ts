@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { autoWrap, frames, init, pending, reduce, replySubject, sdkFree, stage, stalled, thread, voice, windowShut } from "./state.ts";
+import { asks, autoWrap, createTask, endCall, frames, history, init, note, own, pending, recent, recentCalls, reduce, replySubject, sdkFree, stage, stalled, thread, voice, windowShut } from "./state.ts";
 
 const me = { id: "me", name: "Tom", role: "agent", teams: [], status: null, caller_id: null, endpoint_username: null, grants: { monitor: false, barge: false }, settings: { agent_direct_dial: false }, pending_offers: [] } as const;
-const ev = (type: string, data: object, extra: object = {}) => ({ id: type, type, created_at: "", conversation_id: "c1", agent_id: "me", data, ...extra });
+let seq = 0;
+const ev = (type: string, data: object, extra: object = {}) => ({ id: String(++seq), type, created_at: "", conversation_id: "c1", agent_id: "me", data, ...extra });
 const conv = (state: "active" | "wrap_up", role = "primary", channel = "call", extra: object = {}, id = "c1") => ({ id, channel, number: "+14155550142", assignments: [{ agent_id: "me", role, mode: null, state, started_at: "2026-11-09T10:00:00Z", ended_at: null, wrap_up_until: null, ...extra }] }) as any;
 
 test("a call moves from ring to live to wrap-up to idle", () => {
@@ -40,6 +41,30 @@ test("a call moves from ring to live to wrap-up to idle", () => {
   s = reduce(s, { type: "line", cid: "c1", conv: null });
   assert.equal(stage(s).kind, "idle");
   assert.equal(s.feed.length, 5);
+});
+
+test("a line's timeline fills its activity once, in order, around the live events", () => {
+  let s = reduce(init(me as any, [], []), { type: "line", cid: "c1", conv: conv("active") });
+  s = reduce(s, { type: "event", e: ev("call.held", {}, { id: "70" }) });
+  const before = [ev("conversation.started", {}, { id: "30" }), ev("message.received", {}, { id: "50" }), ev("call.held", {}, { id: "70" })];
+  s = reduce(s, { type: "history", events: before as any });
+  s = reduce(s, { type: "event", e: ev("call.held", {}, { id: "70" }) });
+  s = reduce(s, { type: "event", e: ev("call.resumed", {}, { id: "80" }) });
+  assert.deepEqual(s.feed.map((e) => e.id), ["80", "70", "30"], "newest first, each once, messages left to the thread");
+});
+
+test("a line's history follows the cursor to the end, at most ten reads", async () => {
+  const asked: string[] = [];
+  const pages: Record<string, { data: any[]; next_cursor: string | null }> = { "0": { data: [{ id: "1" }], next_cursor: "1" }, "1": { data: [], next_cursor: "9" }, "9": { data: [{ id: "12" }], next_cursor: null } };
+  assert.deepEqual((await history(async (after) => (asked.push(after), pages[after]))).map((e) => e.id), ["1", "12"]);
+  assert.deepEqual(asked, ["0", "1", "9"], "a page with no events still hands on its cursor");
+  asked.length = 0;
+  let held = true;
+  await history(async (after) => (asked.push(after), (held = after === "0"), pages[after]), () => held);
+  assert.deepEqual(asked, ["0", "1"], "it stops once the desk no longer holds the line");
+  let reads = 0;
+  await history(async (after) => (reads++, { data: [], next_cursor: String(Number(after) + 1) }));
+  assert.equal(reads, 10, "a timeline that never ends stops after ten reads");
 });
 
 test("a supervisor's stint shows as monitoring", () => {
@@ -91,7 +116,7 @@ test("a missed offer leaves a notice until it is dismissed", () => {
   s = reduce(s, { type: "event", e: ev("offer.created", { offer_id: "o1", channel: "call", from: "+14155550142", via: "queue" }) });
   s = reduce(s, { type: "event", e: ev("offer.missed", { offer_id: "o1", strike: 2 }) });
   assert.deepEqual(s.notices.map((n) => [n.missed, n.from, n.strike]), [[true, "+14155550142", 2]]);
-  s = reduce(s, { type: "dismiss", id: "offer.missed" });
+  s = reduce(s, { type: "dismiss", id: s.notices[0].id });
   assert.equal(s.notices.length, 0);
 });
 
@@ -164,6 +189,12 @@ test("a thread reads messages and the line's events in time order, with each mes
   assert.deepEqual(rows.map((r) => [r.text, r.side, r.note]), [["hi", "inbound", undefined], ["offer.accepted", undefined, undefined], ["hello", "outbound", "delivered"]], "a message event shows as its message, not twice");
 });
 
+test("a call's notes show in its thread in time order, each once", () => {
+  const feed = [ev("call.answered", {}, { id: "e1", created_at: "2026-11-10T10:00:00Z" }), ev("note.added", { text: "refund" }, { id: "e2", created_at: "2026-11-10T10:01:00Z" })];
+  const notes = [{ id: "n1", text: "refund", agent_id: "me", created_at: "2026-11-10T10:01:00Z" }];
+  assert.deepEqual(thread([], feed as any, (e) => e.type, notes).map((r) => [r.text, r.side]), [["call.answered", undefined], ["refund", "note"]], "a note event shows as its note, not twice");
+});
+
 test("WhatsApp takes a free reply only within 24 hours of the customer's last message", () => {
   const now = Date.parse("2026-11-10T12:00:00Z");
   assert.equal(windowShut("whatsapp", [msg("a", "inbound", "2026-11-09T13:00:00Z")] as any, now), false);
@@ -176,4 +207,66 @@ test("an email reply keeps the customer's subject", () => {
   assert.equal(replySubject([msg("a", "inbound", "2026-11-10T10:00:00Z", { email: { subject: "Order 12" } })] as any), "Re: Order 12");
   assert.equal(replySubject([msg("a", "inbound", "2026-11-10T10:00:00Z", { email: { subject: "RE: Order 12" } })] as any), "RE: Order 12");
   assert.equal(replySubject([]), undefined);
+});
+
+test("the dialer's recent calls are the last five numbers called, newest first, each once, named when a contact has the number", async () => {
+  const calls = ["+1", "+2", "+1", "+3", "+4", "+5", "+6"].map((number, i) => ({ id: `c${i}`, number }));
+  const rows = recent(calls as any, [{ name: "Billing desk", number: "+2" }]);
+  assert.deepEqual(rows.map((c) => [c.number, c.name]), [["+1", undefined], ["+2", "Billing desk"], ["+3", undefined], ["+4", undefined], ["+5", undefined]]);
+  const asked: unknown[][] = [];
+  await recentCalls(async (...a) => (asked.push(a), { data: [] }), "a1");
+  assert.deepEqual(asked, [["GET", "/api/v1/conversations?agent_id=a1&direction=outbound&channel=call&limit=20"]], "only this agent's outbound calls are read");
+});
+
+test("a note on a call is posted to that call's notes", async () => {
+  const asked: unknown[][] = [];
+  const cid = "c1";
+  await note(async (...a) => asked.push(a), cid, "Wants a refund");
+  assert.deepEqual(asked, [["POST", `/api/v1/conversations/${cid}/notes`, { text: "Wants a refund" }]]);
+});
+
+test("the task sheet asks each kind for what the API's validator needs of it, and an optional due date", () => {
+  for (const kind of ["internal", "others", "task"] as const) assert.deepEqual(asks(kind, true), { due_at: false }, `${kind} takes no schedule and no channel`);
+  assert.deepEqual(asks("callback", false), { due_at: false, customer: true }, "a callback about no conversation needs the customer's number");
+  assert.deepEqual(asks("callback", true), { due_at: false, customer: false }, "one raised from a conversation may take that conversation's customer");
+  assert.deepEqual(asks("follow_up", true), { channel: true, scheduled_at: true }, "an agent's follow-up needs its channel and a schedule, and is due then");
+});
+
+test("the task sheet sends one POST /tasks, with only the fields its kind takes", async () => {
+  const sent: unknown[][] = [];
+  const ask = async (...a: unknown[]) => void sent.push(JSON.parse(JSON.stringify(a)));
+  const form = { title: "Refund", description: "", priority: "high", due_at: "2030-01-03T17:00", scheduled_at: "2030-01-02T09:30", customer: "", channel: "sms", target: "agent:a1" };
+  const [due, at] = [new Date("2030-01-03T17:00").toISOString(), new Date("2030-01-02T09:30").toISOString()];
+  await createTask(ask, { ...form, type: "callback" }, "c1");
+  await createTask(ask, { ...form, type: "callback", customer: "+14155550142" });
+  await createTask(ask, { ...form, type: "follow_up", target: "team:t1" }, "c1");
+  await createTask(ask, { ...form, type: "internal", description: "Check the order" });
+  await createTask(ask, { ...form, type: "others", due_at: "" }, "c1");
+  await createTask(ask, { ...form, type: "task", due_at: "2020-01-03T17:00" });
+  const common = { title: "Refund", priority: "high", target: { type: "agent", agent_id: "a1" } };
+  assert.deepEqual(sent, [
+    ["POST", "/api/v1/tasks", { type: "callback", ...common, conversation_id: "c1", due_at: due }],
+    ["POST", "/api/v1/tasks", { type: "callback", ...common, customer: "+14155550142", due_at: due }],
+    ["POST", "/api/v1/tasks", { type: "follow_up", ...common, target: { type: "team", team_id: "t1" }, conversation_id: "c1", channel: "sms", scheduled_at: at, due_at: at }],
+    ["POST", "/api/v1/tasks", { type: "internal", ...common, description: "Check the order", due_at: due }],
+    ["POST", "/api/v1/tasks", { type: "others", ...common, conversation_id: "c1" }],
+    ["POST", "/api/v1/tasks", { type: "task", ...common, due_at: new Date("2020-01-03T17:00").toISOString() }],
+  ]);
+});
+
+test("a task's line shows its own task, not a newer one raised from it", () => {
+  const read = [{ conversation_id: "c9", title: "Raised from it" }, { conversation_id: "c1", title: "Call back" }];
+  assert.equal(own(read, "c1")?.title, "Call back");
+  assert.equal(own(read.slice(0, 1), "c1"), undefined);
+});
+
+test("a hangup the service refuses because the call is over hangs up this browser's leg and clears the call", async () => {
+  const done: string[] = [];
+  const phone = { hangup: () => done.push("leg hung up") };
+  const refused = (code: string) => () => Promise.reject(Object.assign(new Error("the call is not live"), { code }));
+  await endCall(refused("call_not_live"), phone, () => done.push("call cleared"));
+  assert.deepEqual(done, ["leg hung up", "call cleared"]);
+  await assert.rejects(endCall(refused("forbidden"), phone, () => done.push("call cleared")), /not live/, "any other refusal is shown");
+  await endCall(() => Promise.resolve(), phone, () => done.push("call cleared"));
+  assert.equal(done.length, 2, "a hangup the service takes leaves the rest to its events");
 });

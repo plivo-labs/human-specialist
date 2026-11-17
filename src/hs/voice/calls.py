@@ -21,7 +21,7 @@ from hs.access import Principal
 from hs.config import models as m
 from hs.conversations import ON
 from hs.core import ApiError, T, read, tx
-from hs.voice import mpc
+from hs.voice import mpc, outbound
 
 router = APIRouter()
 CALLS = access.require("key:calls", "agent")
@@ -184,17 +184,20 @@ def hangup(cid: UUID, p: Principal = CALLS) -> Response:
     the caller. Otherwise the call is torn down: the primary's leg ends first, so an outage there leaves the call as
     it was, then every other leg, and call.ended reads ended_by agent. A retry, or HS on its own, finishes a teardown
     an outage or a refusal cut short, whoever is on the call by then, and sends again each leg Plivo has not confirmed
-    gone. A call that is over, or that the teardown handed back, is 409 until a queue takes it again. A call joined to
-    a text or task conversation ends as when its agent's phone hangs up, whoever sends it: its agent's leg is hung
-    up, and a dial still ringing its agent, or still being placed, is cancelled now."""
+    gone. A call that is over, or that the teardown handed back, is 409 until a queue takes it again. A dial whose
+    agent's phone has not answered, still ringing or still being placed, ends now when its own agent or a caller
+    who controls the call sends it: the call fails as cancelled and the agent is free. A call joined to a text or
+    task conversation ends as when its agent's phone hangs up: its agent's leg is hung up."""
     with tx() as db:
-        conv, key = access.conversation(db, p, cid, lock=True), None
-        if conv.channel != "call":
-            leaving = mpc.dialed(db, conv := _call(db, p, cid, joins=True))
-            if leaving.state == "active":
-                key = _leg(db, conv, leaving.call_uuid)
-            else:
-                conversations.end_joined(db, leaving, conversations.no_cause("agent", 0), "cancelled")
+        conv, key = access.conversation(db, p, cid, lock=True, dial=True), None
+        leaving = (conv.channel != "call" or conv.state == "open") and mpc.dialed(db, conv)
+        if leaving and leaving.state == "offered":
+            if str(leaving.agent_id) != p.agent_id:
+                access.controlled(conv)
+            outbound.failed(db, conv, leaving, "cancelled", conversations.no_cause("agent", 0))
+        elif conv.channel != "call":
+            _call(db, p, cid, joins=True)
+            key = _leg(db, conv, leaving.call_uuid)
         else:
             key, leaving = _leave(db, p, conv)
     plivo.verdict(key)
@@ -273,21 +276,21 @@ def _legs(db: Connection, conv: Row, primary: Row | None) -> list[str]:
 
 def _rest(db: Connection, conv: Row, primary: Row | None) -> list[str | None]:
     """Every row the leaving primary leaves behind comes off, told of now, since the room may end before its exit
-    reaches HS: a ring is withdrawn and a dial still ringing its agent is cancelled. Every listed leg is hung up, and
-    the caller's last, unless its queue's after-agent action takes it once the room ends around it."""
+    reaches HS: a ring is withdrawn. Every listed leg is hung up, and the caller's last, unless its queue's
+    after-agent action takes it once the room ends around it."""
     queue = conv.queue_id and config.get(db, str(conv.tenant_id), "queue", conv.queue_id)
-    keys, legs = [], _legs(db, conv, primary)
-    for a in conversations.by_agent(conversations.rows(db, conv.id, ON)):
+    legs, kept = _legs(db, conv, primary), getattr(primary, "id", None)
+    for a in conversations.by_agent(a for a in conversations.rows(db, conv.id, ON) if a.id != kept):
+        # A teardown job the previous release wrote can still meet an offered dial during a rolling upgrade.
         if a.via == "outbound" and a.state == "offered":
-            ringing = _payload(conv, request_uuid=str(a.ring))
-            keys.append(a.ring and plivo.command(db, "cancel", str(a.id), ringing, wait=True))
-        elif not primary or a.id != primary.id:
-            if a.role == "monitor" and a.state == "active":
-                mpc.supervisor(db, conv, a, "supervisor.left")
-            elif a.via == "participant":
-                conversations.participant(db, a, "call.participant_removed", reason="removed")
-            conversations.move_out(db, a, "cancelled" if a.state == "offered" else "left")
-    keys += [_leg(db, conv, leg) for leg in legs]
+            outbound.failed(db, conv, a, "cancelled", conversations.no_cause("agent", 0))
+            continue
+        if a.role == "monitor" and a.state == "active":
+            mpc.supervisor(db, conv, a, "supervisor.left")
+        elif a.via == "participant":
+            conversations.participant(db, a, "call.participant_removed", reason="removed")
+        conversations.move_out(db, a, "cancelled" if a.state == "offered" else "left")
+    keys = [_leg(db, conv, leg) for leg in legs]
     if not (queue and queue["after_agent_action"] and conv.state == "live"):
         keys.append(_leg(db, conv, conv.call_uuid))
     return keys

@@ -4,12 +4,15 @@ plugin resolvers, grants, tenant-scoped conversations and body ids, and Idempote
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import re
 import secrets
+import threading
 import uuid
 from collections.abc import Callable, Iterable
+from contextlib import nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -31,7 +34,7 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 SCOPES = ("admin", "sessions", "calls", "reports", "events", "recordings", "messages")
 ROLES = {"sup": ("admin", "supervisor"), "admin": ("admin",)}
-GRANTS = {"op", "agent", "stream", *ROLES, *(f"key:{s}" for s in SCOPES)}
+GRANTS = {"op", "setup", "agent", "stream", *ROLES, *(f"key:{s}" for s in SCOPES)}
 # A response naming one of these fields, or carrying an HS token, is a secret: never stored, never replayed.
 SECRET = re.compile(rb'"(?:agent_token|password|api_key|secret)"\s*:|hs_(?:tk|at|st)_')
 
@@ -106,6 +109,17 @@ def bearer(request: Request) -> str:
     return token.strip() if scheme.lower() == "bearer" else ""
 
 
+def client(request: Request) -> str:
+    """The caller's address a limit counts tries by: an IPv6 one by its /64, which one host can hold whole."""
+    host = request.client.host if request.client else ""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    ip = getattr(ip, "ipv4_mapped", None) or ip
+    return str(ip if ip.version == 4 else ipaddress.ip_network((ip, 64), strict=False))
+
+
 def credential(request: Request, stream: bool) -> str:
     """The token a caller presents: its bearer, else on a stream route a query stream token, since EventSource
     cannot send headers. The stream route reads it here too, so it checks the very credential `require` took."""
@@ -124,14 +138,37 @@ def holds_grant(p: Principal, grant: str) -> bool:
     return p.kind == grant
 
 
+# Set once this process sees a tenant: setup never opens again, so it stops asking.
+CLAIMED = threading.Event()
+
+
+def unclaimed(db: Connection | None = None) -> bool:
+    """Setup lasts while HS_SETUP_PLIVO_AUTH_ID is set and no tenant was ever registered, a deleted one included. `db`
+    is a connection the caller already holds."""
+    if CLAIMED.is_set() or not core.settings.setup_plivo_auth_id:
+        return False
+    with nullcontext(db) if db else read() as db:
+        if db.execute(select(T.tenant.c.id).limit(1)).first():
+            CLAIMED.set()
+    return not CLAIMED.is_set()
+
+
+def claims(p: Principal, auth_id: str) -> None:
+    if p.kind == "setup" and not hmac.compare_digest(auth_id.encode(), core.settings.setup_plivo_auth_id.encode()):
+        raise ApiError(401, "unauthorized", "missing or invalid credential")
+
+
 def require(*grants: str) -> params.Depends:
     """The caller's Principal when it holds one of `grants` (the route table's codes): 401 for a missing or unknown
-    credential, 403 for one this route does not take."""
+    credential, 403 for one this route does not take. `setup` takes a caller with no credential while setup lasts."""
     if not grants or not set(grants) <= GRANTS:
         raise ValueError(f"unknown grants {grants}")
 
     def principal(request: Request) -> Principal:
-        if (p := resolve(credential(request, "stream" in grants), request)) is None:
+        token = credential(request, "stream" in grants)
+        if (p := resolve(token, request)) is None and not token and "setup" in grants and unclaimed():
+            p = Principal(OPERATOR.tenant_id, "setup")
+        if p is None:
             raise ApiError(401, "unauthorized", "missing or invalid credential")
         if not any(holds_grant(p, grant) for grant in grants):
             raise ApiError(403, "forbidden", "this credential cannot use this route")
@@ -188,10 +225,10 @@ _VISIBLE = text(
     " FROM conversation c WHERE c.id = :cid AND c.tenant_id = :tenant AND (:all OR EXISTS ("
     " SELECT 1 FROM assignment a WHERE a.conversation_id = c.id AND a.agent_id = ANY(CAST(:seen AS uuid[]))"
     " AND (a.state = 'active' OR a.started_at IS NOT NULL))"
-    " OR (:offer AND (EXISTS (SELECT 1 FROM jobs j WHERE j.kind = 'offer_timeout'"
+    " OR (:offer AND EXISTS (SELECT 1 FROM jobs j WHERE j.kind = 'offer_timeout'"
     " AND j.payload->>'conversation_id' = c.id::text AND j.payload->>'agent_id' = ANY(CAST(:seen AS text[]))"
-    " AND j.run_at > now() AND j.attempts = 0) OR EXISTS (SELECT 1 FROM assignment a WHERE a.conversation_id = c.id"
-    " AND a.agent_id = CAST(:me AS uuid) AND a.state = 'offered' AND a.via = 'outbound')))"
+    " AND j.run_at > now() AND j.attempts = 0)) OR (:dial AND EXISTS (SELECT 1 FROM assignment a"
+    " WHERE a.conversation_id = c.id AND a.agent_id = CAST(:me AS uuid) AND a.state = 'offered' AND a.via = 'outbound'))"
     " OR (" + ROUTED + " AND NOT EXISTS (SELECT 1 FROM assignment a"
     " WHERE a.conversation_id = c.id AND a.agent_id IS NOT NULL AND a.started_at IS NOT NULL)))"
 )
@@ -242,21 +279,35 @@ def permits(db: Connection, p: Principal, grant: str) -> bool:
 
 
 def conversation(
-    db: Connection, p: Principal, cid: UUID, *, lock: bool = False, control: bool = False, offer: bool = False
+    db: Connection,
+    p: Principal,
+    cid: UUID,
+    *,
+    lock: bool = False,
+    control: bool = False,
+    offer: bool = False,
+    dial: bool = False,
 ) -> Row:
     """The conversation when `p` may see it, else 404, another tenant's included: one an agent of `visible_agents`
     is active on, or for a read without `control`, ever was or no agent took on a route to one of its teams
-    (`ROUTED`). `offer`, which only reads pass, adds one it holds an offer on before its ring timeout, and the
-    caller's own dial before its leg answers. `lock` takes the row lock first, as `conversations.lock` does, so the
-    check holds for the rest of the transaction."""
+    (`ROUTED`). `offer`, which only reads pass, adds one it holds an offer on before its ring timeout; it or `dial`,
+    which a hangup passes, adds the caller's own dial before its leg answers. `lock` takes the row lock first, as
+    `conversations.lock` does, so the check holds for the rest of the transaction."""
     s = seen(db, p)
     args = {"cid": cid, "tenant": p.tenant_id, "all": s.agents is None, "teams": sorted(s.teams), "offer": offer}
-    args |= {"seen": sorted(s.agents or ()), "queues": s.queues, "me": p.agent_id}
+    args |= {"seen": sorted(s.agents or ()), "queues": s.queues, "me": p.agent_id, "dial": offer or dial}
     if lock:
         db.execute(_LOCK, args)
     if (row := db.execute(_VISIBLE, args).first()) is None:
         raise ApiError(404, "conversation_not_found", "no such conversation")
     return controlled(row) if control else row
+
+
+def reads(agent_id, stints) -> bool:
+    """Whether a caller reads a conversation's handoff context, transcript and timeline, given its stints: a key
+    always, an agent once it took the conversation as primary, or while it is on it."""
+    mine = [a for a in stints if str(a.agent_id) == str(agent_id)]
+    return not agent_id or any(a.state == "active" or (a.role == "primary" and a.started_at) for a in mine)
 
 
 def controlled(conv: Row) -> Row:

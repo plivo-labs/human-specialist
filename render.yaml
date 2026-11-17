@@ -1,0 +1,43 @@
+# The Deploy to Render button reads this Blueprint: docs/deploy.md#render.
+services:
+  - type: web
+    name: human-specialist
+    runtime: docker
+    plan: free
+    autoDeployTrigger: "off"
+    healthCheckPath: /status
+    dockerCommand: /app/migrate-and-serve
+    envVars:
+      - key: PORT
+        value: "6004"
+      - key: METRICS_PORT
+        value: "0"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: hs-postgres
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: hs-redis
+          property: connectionString
+      - key: PUBLIC_BASE_URL
+        fromService:
+          type: web
+          name: human-specialist
+          envVarKey: RENDER_EXTERNAL_URL
+      - key: HS_OPERATOR_KEY
+        generateValue: true
+      - key: HS_SECRET_KEY
+        generateValue: true
+      - key: HS_SETUP_PLIVO_AUTH_ID
+        sync: false
+  - type: keyvalue
+    name: hs-redis
+    plan: free
+    maxmemoryPolicy: noeviction
+    ipAllowList: []
+databases:
+  - name: hs-postgres
+    plan: free
+    ipAllowList: []

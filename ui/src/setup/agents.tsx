@@ -1,23 +1,41 @@
 import { Plus } from "lucide-react";
-import { useState } from "react";
-import { ApiError, type Page as Paged, api, asAgent, every, held, reloadToSignIn, store } from "../api";
-import { phone } from "../format";
-import type { Agent, Me, Named, PresenceStatus, Queue } from "../types";
-import { Badge, Button, Confirm, Copy, EditForm, Editor, Empty, Facts, Field, Form, Input, ListView, Page, Section, Select, Sheet, State, Submit, act, useLoad } from "../ui";
+import { useRef, useState } from "react";
+import { type Page as Paged, api, asAgent, every, held, reloadToSignIn, store } from "../api";
+import { hue, phone } from "../format";
+import type { AccountNumber, Agent, Me, Named, PresenceStatus, Queue, Skill } from "../types";
+import { type Route, callersTo, fresh, routeTo, saveUser, sendUser, userBody } from "./numbers";
+import { Badge, Button, Confirm, Copy, EditForm, Editor, Empty, Facts, Field, Form, Input, ListView, Page, PhoneInput, Section, Select, Sheet, State, Submit, act, useLoad } from "../ui";
 
-type Directory = { agents: Agent[]; teams: Named[]; queues: Queue[]; statuses: PresenceStatus[] };
+type Directory = { agents: Agent[]; teams: Named[]; queues: Queue[]; statuses: PresenceStatus[]; skills: Skill[] };
 
 export const allAgents = () => every<Agent>((c) => api<Paged<Agent>>("GET", `/api/v1/agents?limit=200${c}`));
 export const allQueues = () => every<Queue>((c) => api<Paged<Queue>>("GET", `/api/v1/queues?limit=200${c}`));
+export function useAccountNumbers() {
+  const load = useLoad(() => every<AccountNumber>((c) => api<Paged<AccountNumber>>("GET", `/api/v1/numbers/available?limit=200${c}`)));
+  const routed = useRef(new Set<string>()).current;
+  return { ...load, routed, fresh: (n: string | null) => fresh(load.data, routed, n) };
+}
+type Owned = ReturnType<typeof useAccountNumbers>;
+
+export const NumbersFailed = ({ owned }: { owned: Owned }) => (
+  <>
+    Your Plivo numbers did not load. {owned.error}{" "}
+    <button type="button" className="underline" onClick={owned.reload}>
+      Try again
+    </button>
+  </>
+);
+export const put = (number: string, body: Route) => api("PUT", `/api/v1/numbers/${encodeURIComponent(number)}`, body);
 
 const loadDirectory = async (): Promise<Directory> => {
-  const [agents, teams, queues, statuses] = await Promise.all([
+  const [agents, teams, queues, statuses, skills] = await Promise.all([
     allAgents(),
     every<Named>((c) => api<Paged<Named>>("GET", `/api/v1/teams?limit=200${c}`)),
     allQueues(),
     every<PresenceStatus>((c) => api<Paged<PresenceStatus>>("GET", `/api/v1/agent-statuses?limit=200${c}`)),
+    every<Skill>((c) => api<Paged<Skill>>("GET", `/api/v1/skills?limit=200${c}`)),
   ]);
-  return { agents, teams, queues, statuses };
+  return { agents, teams, queues, statuses, skills };
 };
 
 export const ROLES = { agent: "Agent", supervisor: "Supervisor", admin: "Administrator" };
@@ -30,7 +48,7 @@ export const twin = (what: string, rows: Named[], name: unknown, self?: string):
 
 export function SignInLink() {
   const org = store.get<string>("tenant");
-  const url = `${location.origin}${location.pathname}#/signin${org ? `?org=${org}` : ""}`;
+  const url = `${location.origin}/signin${org ? `?org=${org}` : ""}`;
   return (
     <span className="flex items-center gap-2">
       <Input readOnly value={url} aria-label="Sign-in link" onFocus={(e) => e.target.select()} />
@@ -40,15 +58,17 @@ export function SignInLink() {
 }
 
 export function StatusText({ status, statuses }: { status: Agent["status"]; statuses: PresenceStatus[] }) {
-  const s = statuses.find((x) => x.id === status?.id);
-  return <State color={s?.availability ? "var(--available)" : (s?.color ?? "var(--tertiary)")}>{status?.name ?? "Offline"}</State>;
+  return <State color={hue(statuses.find((x) => x.id === status?.id))}>{status?.name ?? "Offline"}</State>;
 }
 
 export function Agents() {
   const dir = useLoad(loadDirectory);
+  const owned = useAccountNumbers();
+  const reload = () => (dir.reload(), owned.reload());
   const [adding, setAdding] = useState(false);
   const [open, setOpen] = useState<string | null>(null);
   const agent = dir.data?.agents.find((a) => a.id === open);
+  const skillsOf = (a: Agent) => names(a.skills.map((s) => s.skill_id), dir.data!.skills);
   return (
     <Page title="Users">
       <div className="mt-4 max-w-xl">
@@ -78,25 +98,21 @@ export function Agents() {
             ),
           ],
           ["Team", (a) => (a.teams.length > 1 ? <Badge>{a.teams.length} teams</Badge> : names(a.teams, dir.data!.teams)), "hidden md:table-cell"],
+          ["Skills", (a) => <span title={skillsOf(a)}>{a.skills.length > 1 ? <Badge>{a.skills.length} skills</Badge> : skillsOf(a)}</span>, "hidden lg:table-cell"],
           ["Status", (a) => <StatusText status={a.status} statuses={dir.data!.statuses} />],
           ["Role", (a) => ROLES[a.role ?? "agent"], "hidden sm:table-cell"],
         ]}
       />
-      {dir.data && adding && <AddAgent dir={dir.data} onClose={() => setAdding(false)} onAdded={dir.reload} />}
-      {agent && <AgentSheet agent={agent} dir={dir.data!} onClose={() => setOpen(null)} reload={dir.reload} />}
+      {dir.data && adding && <AddAgent dir={dir.data} owned={owned} onClose={() => setAdding(false)} onAdded={reload} />}
+      {agent && <AgentSheet agent={agent} dir={dir.data!} owned={owned} onClose={() => setOpen(null)} reload={reload} />}
     </Page>
   );
 }
 
-const agentBody = (f: FormData) => ({
-  name: f.get("name"),
-  role: f.get("role"),
-  email: String(f.get("email")).trim() || null,
-  teams: f.getAll("teams"),
-  caller_id: String(f.get("caller_id")).trim() || null,
-});
-
-function AgentFields({ agent, teams }: { agent?: Agent; teams: Named[] }) {
+function AgentFields({ agent, dir: { teams, queues, skills }, owned }: { agent?: Agent; dir: Directory; owned: Owned }) {
+  const [callerId, setCallerId] = useState(agent?.caller_id ?? "");
+  const [picked, setPicked] = useState(agent?.skills.map((s) => s.skill_id) ?? []);
+  const to = callersTo(queues, agent?.id);
   return (
     <>
       <Field label="Name" hint={agent ? undefined : "Adding a user creates their phone login on your Plivo account."}>
@@ -126,23 +142,62 @@ function AgentFields({ agent, teams }: { agent?: Agent; teams: Named[] }) {
           <p className="text-s-400 text-secondary">No teams yet. Create them under Teams.</p>
         )}
       </fieldset>
-      <Field label="Caller ID" hint="Optional. A number this organization routes, shown when the user calls out.">
-        <Input name="caller_id" placeholder="+14155550100" inputMode="tel" defaultValue={agent?.caller_id ?? ""} />
+      <fieldset className="grid gap-2">
+        <legend className="pb-1.5 text-s-500 text-secondary">Skills</legend>
+        {skills.length ? (
+          skills.map((s) => (
+            <span key={s.id} className="flex items-center gap-2">
+              <label className="flex flex-1 items-center gap-2 text-p-400">
+                <input type="checkbox" name="skills" id={`skill_${s.id}`} value={s.id} checked={picked.includes(s.id)} onChange={(e) => setPicked(e.target.checked ? [...picked, s.id] : picked.filter((id) => id !== s.id))} className="size-4 accent-primary" /> {s.name}
+              </label>
+              {s.is_level_required && (
+                <Input
+                  name={`level_${s.id}`}
+                  type="number"
+                  required
+                  disabled={!picked.includes(s.id)}
+                  min={s.min_level}
+                  max={s.max_level}
+                  placeholder={`Level ${s.min_level} to ${s.max_level}`}
+                  defaultValue={agent?.skills.find((x) => x.skill_id === s.id)?.level ?? ""}
+                  aria-label={`${s.name} level`}
+                  onInvalid={(e) => e.currentTarget.validity.customError || e.currentTarget.setCustomValidity(`${s.name} takes a level from ${s.min_level} to ${s.max_level}.`)}
+                  className="max-w-40 font-mono"
+                />
+              )}
+            </span>
+          ))
+        ) : (
+          <p className="text-s-400 text-secondary">No skills yet. Create them under Skills.</p>
+        )}
+      </fieldset>
+      <Field label="Caller ID" hint={owned.error ? <NumbersFailed owned={owned} /> : owned.fresh(callerId) ? `Saving routes ${phone(callerId)} to this organization, and its callers ${to ? `go to ${to.name}` : "hear a hang-up"}. Change that under Phone Numbers.` : "Optional. The number shown when the user calls out."}>
+        {owned.data ? (
+          <Select name="caller_id" value={callerId} onChange={(e) => setCallerId(e.target.value)}>
+            <option value="">The organization's default</option>
+            {callerId && !owned.data.some((n) => n.number === callerId) && <option value={callerId}>{phone(callerId)}</option>}
+            {[...owned.data].sort((a, b) => +b.routed - +a.routed).map((n) => (
+              <option key={n.number} value={n.number}>
+                {phone(n.number)}
+                {n.routed ? "" : ", not routed yet"}
+              </option>
+            ))}
+          </Select>
+        ) : (
+          <PhoneInput name="caller_id" value={callerId} onChange={(e) => setCallerId(e.target.value)} />
+        )}
       </Field>
     </>
   );
 }
 
-const taken = (agents: Agent[], call: () => Promise<unknown>) =>
-  call().catch((e) => {
-    const who = e instanceof ApiError && e.code === "agent_exists" && agents.find((a) => a.id === e.details?.id);
-    return Promise.reject(who ? new Error(`Another user, ${who.name}, already has this email.`) : e);
-  });
+const saveAgent = ({ agents, queues }: Directory, owned: Owned, callerId: string | null, call: () => Promise<unknown>, self?: string) =>
+  saveUser({ listed: owned.data, routed: owned.routed, users: agents }, callerId, (n) => put(n, routeTo(callersTo(queues, self))).then(owned.reload), call);
 
-function AddAgent({ dir: { agents, teams }, onClose, onAdded }: { dir: Directory; onClose: () => void; onAdded: () => void }) {
+function AddAgent({ dir, owned, onClose, onAdded }: { dir: Directory; owned: Owned; onClose: () => void; onAdded: () => void }) {
   return (
-    <Editor what="user" reload={onAdded} onClose={onClose} body={agentBody} save={(b) => taken(agents, () => api<Agent>("POST", `/api/v1/agents`, b))} warn={(b) => twin("user", agents, b.name)}>
-      <AgentFields teams={teams} />
+    <Editor what="user" reload={onAdded} onClose={onClose} body={userBody} save={(b) => saveAgent(dir, owned, b.caller_id, () => sendUser(api, b))} warn={(b) => twin("user", dir.agents, b.name)}>
+      <AgentFields dir={dir} owned={owned} />
     </Editor>
   );
 }
@@ -157,7 +212,7 @@ const Once = ({ text, value }: { text: string; value: string }) => (
   </div>
 );
 
-function AgentSheet({ agent, dir, onClose, reload }: { agent: Agent; dir: Directory; onClose: () => void; reload: () => void }) {
+function AgentSheet({ agent, dir, owned, onClose, reload }: { agent: Agent; dir: Directory; owned: Owned; onClose: () => void; reload: () => void }) {
   const [made, setMade] = useState<string | null>(null);
   const [sip, setSip] = useState<{ username: string; password: string } | null>(null);
   const queues = dir.queues.filter((q) => q.agents?.includes(agent.id));
@@ -176,12 +231,12 @@ function AgentSheet({ agent, dir, onClose, reload }: { agent: Agent; dir: Direct
           row={agent}
           reload={reload}
           onClose={onClose}
-          body={agentBody}
-          save={(b) => taken(dir.agents, () => api("PATCH", `/api/v1/agents/${agent.id}`, b))}
+          body={userBody}
+          save={(b) => saveAgent(dir, owned, b.caller_id, () => sendUser(api, b, agent), agent.id)}
           remove={() => api("DELETE", `/api/v1/agents/${agent.id}`)}
           warn={(b) => twin("user", dir.agents, b.name, agent.id)}
         >
-          <AgentFields agent={agent} teams={dir.teams} />
+          <AgentFields agent={agent} dir={dir} owned={owned} />
         </EditForm>
       </Section>
       <Section title="Sign-in">

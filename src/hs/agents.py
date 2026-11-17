@@ -5,7 +5,6 @@ desk's beats live in `hot`. A session's second beat applies the sign-in status; 
 Offline. Every status change emits `agent.status_changed` and schedules `route_agent`, which offers an available
 agent queued work and withdraws the offers of one that left."""
 
-import ipaddress
 import secrets
 import time
 from collections import Counter
@@ -37,10 +36,19 @@ _WHO = text(
     "SELECT tenant_id, agent_id FROM credential WHERE sha256 = :sha AND kind = 'agent' AND revoked_at IS NULL"
     " AND (expires_at IS NULL OR expires_at > now())"
 )
-# Desks routing's sweep checks: agents signed in, and agents a live session may be counting beats for.
+# On Break: a status that is not available, not the built-in Offline and not the one the tenant's sign-out sets. The
+# built-in Offline is signed out in every setting, as the Redis rebuild and a sign-in during a loss take it.
+_ON_BREAK = (
+    "NOT (s.body->>'availability')::boolean AND s.key IS DISTINCT FROM 'offline'"
+    " AND s.id::text IS DISTINCT FROM t.settings->'sign_out'->>'status_id'"
+)
+_PRESENCE = " FROM presence p JOIN config s ON s.id = p.status_id JOIN tenant t ON t.id = p.tenant_id"
+_ON_BREAK_NOW = text(f"SELECT {_ON_BREAK} AS on_break{_PRESENCE} WHERE p.agent_id = :agent FOR UPDATE OF p")
+# Desks routing's sweep checks, each signed in or not and on Break or not: agents signed in, and agents a live
+# session may be counting beats for.
 _DESKS = text(
-    "SELECT p.tenant_id, p.agent_id, s.key IS DISTINCT FROM 'offline' FROM presence p JOIN config s"
-    " ON s.id = p.status_id WHERE s.key IS DISTINCT FROM 'offline' OR EXISTS (SELECT 1 FROM credential c"
+    f"SELECT p.tenant_id, p.agent_id, s.key IS DISTINCT FROM 'offline', {_ON_BREAK}{_PRESENCE}"  # noqa: S608
+    " WHERE s.key IS DISTINCT FROM 'offline' OR EXISTS (SELECT 1 FROM credential c"
     "  WHERE c.tenant_id = p.tenant_id AND c.agent_id = p.agent_id AND c.kind = 'agent' AND c.revoked_at IS NULL"
     "  AND (c.expires_at IS NULL OR c.expires_at > now()))"
 )
@@ -251,7 +259,8 @@ def _vet(db: Connection, p: Principal, body: AgentIn | AgentPatch, *, partial: b
     """The body as stored, ids made canonical, once its caller id is a routed number and every id it names is the
     tenant's. A partial body leaves out what it does not change; a null caller_id clears it."""
     if body.caller_id and config.by_key(db, p.tenant_id, "number", body.caller_id) is None:
-        raise ApiError(422, "from_not_allowed", "caller_id must be a number the tenant routes (PUT /numbers)")
+        why = "the caller ID must be a number this organization routes; add it under Numbers"
+        raise ApiError(422, "from_not_allowed", why)
     config.check(db, p, body)
     doc = body.model_dump(mode="json", exclude_unset=partial)
     doc = {k: v for k, v in doc.items() if v is not None or k in ("caller_id", "external_id", "email")}
@@ -276,7 +285,8 @@ def _unique(db: Connection, tenant_id, doc: dict, me=None) -> None:
     same["email"] = func.lower(A.c.body["email"].astext) == func.lower(doc.get("email"))
     for field, match in same.items():
         if doc.get(field) and (taken := db.execute(config.docs(tenant_id, "agent").where(match, A.c.id != me)).first()):
-            raise ApiError(409, "agent_exists", f"an agent has this {field}", {"id": str(taken.id)})
+            why = f"another user of this organization already has this {field}"
+            raise ApiError(409, "agent_exists", why, {"id": str(taken.id)})
 
 
 @router.get("/agents", response_model=Page[Agent])
@@ -388,7 +398,7 @@ def set_status(db: Connection, tenant_id, agent_id, status_id, reason: str, why:
     data["to_status"] = {"id": str(to.id), "name": to.body["name"]}
     data["available"] = to.body["availability"]
     events.emit(db, "agent.status_changed", str(tenant_id), data, agent_id=str(agent_id))
-    jobs.schedule(db, "route_agent", {"tenant_id": str(tenant_id), "agent_id": str(agent_id)}, key=str(agent_id))
+    jobs.schedule_last(db, "route_agent", {"tenant_id": str(tenant_id), "agent_id": str(agent_id)}, key=str(agent_id))
     return True
 
 
@@ -447,7 +457,8 @@ def _session(tenant_id, agent_id, renewable_until=None, still=None) -> dict:
         tokens = access.mint(db, tenant_id, found["id"], renewable_until)
         mine = T.credential.c.sha256 == access.digest(tokens.agent_token)
         db.execute(update(T.credential).where(mine).values(name=f"{username}_{auth_id}"))
-        after_commit(db, lambda: hot.recount(tenant_id, agent_id))
+        if renewable_until is None:  # a renewal continues its session: only a new one signs in at its second beat
+            after_commit(db, lambda: hot.recount(tenant_id, agent_id))
     expires = datetime.fromtimestamp(claims["exp"], UTC)
     return tokens._asdict() | {"plivo": {"endpoint_username": username, "access_token": jwt, "expires_at": expires}}
 
@@ -496,18 +507,8 @@ _UNCHANGED = text(
 )
 
 
-def _client(request: Request) -> str:
-    host = request.client.host if request.client else ""
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        return host
-    ip = getattr(ip, "ipv4_mapped", None) or ip
-    return str(ip if ip.version == 4 else ipaddress.ip_network((ip, 64), strict=False))
-
-
 def _try(request: Request, account: str) -> list[str]:
-    tries = {f"email:{access.digest(account.lower())}": 10, f"ip:{_client(request)}": 100}
+    tries = {f"email:{access.digest(account.lower())}": 10, f"ip:{access.client(request)}": 100}
     if wait := hot.sign_in_tried(tries, 900):
         raise ApiError(429, "too_many_attempts", "too many failed sign-ins; try again later", {"retry_after": wait})
     return list(tries)
@@ -663,8 +664,11 @@ def go_idle(p: Principal = AGENT):
 
 @router.post("/me/heartbeat", status_code=204)
 def heartbeat(request: Request, _: Ping | None = None) -> Response:
-    """Presence: the second beat of a session applies the sign-in status; 40 s without one sets Offline. An HS
-    agent token is checked by the beat itself; a plugin's credential is resolved first."""
+    """Presence: the second beat of a session applies the sign-in status, and 40 s without one applies the sign-out
+    status to an available agent, each unless the tenant's settings switch it off; the second beat after the desk
+    comes back signs in again. An agent on Break keeps it, and the same session coming back within the 2 h HS keeps
+    its count is no sign-in. An HS agent token is checked by the beat itself; a plugin's credential is resolved
+    first."""
     token, P = access.bearer(request), T.presence
     if token.startswith(AGENT_PREFIX):
         query = _WHO.bindparams(sha=access.digest(token))
@@ -744,9 +748,10 @@ def transfer_targets(channel: Channel = "call", p: Principal = AGENT):
 
 @jobs.handler("agent_offline")
 def _offline(job: Row) -> None:
-    """Rechecked under the presence row lock, so a beat since the sweep keeps the agent on."""
-    P, tenant_id, agent_id = T.presence, job.payload["tenant_id"], job.payload["agent_id"]
+    """Rechecked under the presence row lock, so a beat since the sweep keeps the agent on, and so does Break: a desk
+    on Break keeps its beat count, so the same session coming back is no sign-in."""
+    tenant_id, agent_id = job.payload["tenant_id"], job.payload["agent_id"]
     with tx() as db:
-        held = db.execute(select(P.c.agent_id).where(P.c.agent_id == agent_id).with_for_update()).first()
-        if held and hot.silent(tenant_id, agent_id):
+        held = db.execute(_ON_BREAK_NOW, {"agent": agent_id}).first()
+        if held and not held.on_break and hot.silent(tenant_id, agent_id):
             _signed_out(db, tenant_id, agent_id, "heartbeat", DISCONNECTED)

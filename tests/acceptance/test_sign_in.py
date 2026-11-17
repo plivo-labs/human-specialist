@@ -74,6 +74,23 @@ def test_a_renewal_mints_the_next_session_and_the_old_tokens_live_to_their_own_e
     error(world.client(first["stream_token"]).post("/api/v1/me/sessions"), 403)
 
 
+def test_a_renewal_leaves_an_agent_on_break_on_break(tenant):
+    agent = tenant.agent().login()
+    agent.set_status("Break")
+    desk = tenant.world.client(ok(agent.api().post("/api/v1/me/sessions"))["agent_token"])
+    for _ in range(4):  # the sign-in beat is a session's second
+        ok(desk.post("/api/v1/me/heartbeat"))
+    assert agent._status() == "Break"
+
+
+def test_a_desk_that_fell_silent_signs_in_again_at_the_second_beat_after_its_renewal(tenant):
+    agent = tenant.agent().login()
+    agent.stop_pinging()
+    desk = tenant.world.client(ok(agent.api().post("/api/v1/me/sessions"))["agent_token"])
+    seen = [ok(desk.post("/api/v1/me/heartbeat")) or agent._status() for _ in range(2)]
+    assert seen == ["Offline", "Available"]
+
+
 def test_a_renewal_keeps_the_call(tenant):
     live = connect(tenant)
     fresh = ok(live.agent.api().post("/api/v1/me/sessions"))
@@ -135,6 +152,14 @@ def test_an_admin_session_runs_the_settings_and_a_supervisor_or_agent_session_ca
         desk = world.client(sessions[role]["agent_token"])
         error(desk.post("/api/v1/teams", json={"name": "Mine"}), 403)
         error(desk.patch("/api/v1/settings", json={"agent_direct_dial": False}), 403)
+
+
+def test_an_email_another_user_of_the_tenant_has_is_refused_on_update_too(tenant):
+    email = f"pat-{uuid.uuid4().hex[:6]}@example.test"
+    tenant.agent(email=email)
+    other = tenant.agent(email=f"other-{email}")
+    taken = error(tenant.api.patch(f"{A}/{other.id}", json={"email": email.upper()}), 409, "agent_exists")
+    assert taken["message"] == "another user of this organization already has this email"
 
 
 def test_one_email_in_two_tenants_signs_in_to_the_tenant_the_sign_in_names(world, tenant):

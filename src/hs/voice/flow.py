@@ -153,9 +153,10 @@ def _count(db: Connection, conv: Row, type_: str) -> int:
     return db.execute(select(func.count()).select_from(E).where(*mine)).scalar()
 
 
-def _queue(db: Connection, conv: Row, action: dict, fresh: bool) -> list[tuple]:
+def _queue(db: Connection, conv: Row, action: dict, fresh: bool, tried: frozenset = frozenset()) -> list[tuple]:
     """Seat an open call in the queue, or run the queue's overflow when it is full; a seated call (a repeat) gets
-    its room again."""
+    its room again. An overflow back to a queue already `tried` (a stored loop) hangs up, as no overflow does; two
+    calls entering a stored loop at different queues at once can still deadlock, and Postgres aborts one."""
     t = str(conv.tenant_id)
     if conv.state in SEATED:
         return room(db, conv, config.get(db, t, "queue", conv.queue_id))
@@ -164,16 +165,17 @@ def _queue(db: Connection, conv: Row, action: dict, fresh: bool) -> list[tuple]:
     try:
         routing.enqueue(db, conv, UUID(queue["id"]), agents=action.get("agents", []), hold=action.get("hold_position"))
     except routing.Full as e:
-        return run(db, conv, e.action, fresh)
+        back = (e.action or {}).get("queue_id") in (tried := tried | {queue["id"]})
+        return run(db, conv, None if back else e.action, fresh, tried)
     return room(db, conv, queue)
 
 
-def run(db: Connection, conv: Row, action: dict | None, fresh: bool) -> list[tuple]:
+def run(db: Connection, conv: Row, action: dict | None, fresh: bool, tried: frozenset = frozenset()) -> list[tuple]:
     """The XML of an action for this call; none hangs up."""
     a, t, cid = action or HANGUP, str(conv.tenant_id), str(conv.id)
     match a["type"]:
         case "queue":
-            return _queue(db, conv, a, fresh)
+            return _queue(db, conv, a, fresh, tried)
         case "menu":
             menu = config.get(db, t, "menu", a["menu_id"])
             return _menu(conv, menu, 1, _count(db, conv, "conversation.menu_input")) if menu else [END]
@@ -299,12 +301,12 @@ def move(r: int, a: str, tenant: Row = TENANT, form: dict = FORM) -> Response:
 @callbacks.post("/actions/queue-exit")
 def queue_exit(r: int, tenant: Row = TENANT, form: dict = FORM) -> Response:
     """The caller left room `r` on Plivo's side. Plivo retries an exit whose answer it never got, and the exit has
-    moved the caller on by then, so the first answer is kept per call and room and a retry gets it again."""
-    K = T.idempotency
-    kept = {"tenant_id": tenant.id, "principal": "plivo-exit"}
-    kept["key_sha256"] = access.digest(f"{form.get('CallUUID', '')}:{r}")
+    moved the caller on by then, so the first answer is kept per call and room and a retry gets it again. Plivo
+    names the call ParticipantCallUUID here, and sends no CallUUID."""
+    K, leg = T.idempotency, form.get("ParticipantCallUUID", "")
+    kept = {"tenant_id": tenant.id, "principal": "plivo-exit", "key_sha256": access.digest(f"{leg}:{r}")}
     with tx() as db:
-        conv = _found(db, tenant.id, form)
+        conv = conversations.lock(db, tenant=tenant.id, call_uuid=leg)
         if before := db.execute(select(K.c.body).where(*(K.c[k] == v for k, v in kept.items()))).scalar():
             return Response(before["xml"], media_type="text/xml")
         answer = plivo.xml(*_exit(db, conv, form, r))
@@ -315,13 +317,16 @@ def queue_exit(r: int, tenant: Row = TENANT, form: dict = FORM) -> Response:
 def _exit(db: Connection, conv: Row | None, form: dict, r: int) -> list[tuple]:
     """Its wait ran out (the queue's overflow), or the room ended around it once its agents left: it waits for a
     transfer that still rings unless the agent hung up through the API, else the queue's after-agent action runs, or
-    the call ends."""
+    the call ends. Plivo's documented exit request names no cause, so without one the wait ran out only once the
+    stint's timer is due (`routing.waited_out`): a caller whose agent joined and left before HS heard of the join
+    leaves sooner. A cause Plivo does send is taken as is."""
     if conv is None or conv.state in ("wrap_up", "closed"):
         return [END]
     if r != conv.room:
         return _stale(db, conv)
     queue = conv.queue_id and config.get(db, str(conv.tenant_id), "queue", conv.queue_id)
-    if queue and conv.state == "queued" and form.get("ParticipantExitCause") == WAIT_TIMEOUT:
+    cause = form.get("ParticipantExitCause")
+    if queue and conv.state == "queued" and (cause == WAIT_TIMEOUT if cause else routing.waited_out(db, conv)):
         action = queue["overflow_action"]
         routing.overflowed(db, conv, conv.queue_id, "wait_timeout", action)
         return run(db, _leave(db, conv, action or HANGUP), action, True)
@@ -335,12 +340,18 @@ def _exit(db: Connection, conv: Row | None, form: dict, r: int) -> list[tuple]:
 def _ringing(db: Connection, conv: Row) -> list[tuple] | None:
     """The room ended around the caller while its transfer still rang. The caller waits in a new room, where the
     transfer rings again from the same agent's stint, and its queue takes the call if the target never answers. The
-    queue's row and the targets' presence rows are locked first, in lock order."""
+    queue and every queue its overflow leads to are locked before the targets' presence rows; if no target rings
+    again, a savepoint lets those rows go before the queue's round locks others. Two re-rings at different queues of
+    a ring stored before queue writes refused loops lock each other's queue, and Postgres aborts one."""
     if not (rings := [a for a in conversations.rows(db, conv.id, ("offered",)) if a.via == "transfer"]):
         return None
-    config.get(db, str(conv.tenant_id), "queue", conv.queue_id, lock=True)
+    q, walked = str(conv.queue_id), set()
+    while q and q not in walked:
+        walked.add(q)
+        a = (config.get(db, str(conv.tenant_id), "queue", q, lock=True) or {}).get("overflow_action") or {}
+        q = a.get("queue_id") if a.get("type") == "queue" else None
+    moved, targets = _leave(db, conv, HANGUP), db.begin_nested()
     db.execute(routing._LOCK, {"ids": sorted(t.agent_id for t in rings if t.agent_id)})
-    moved = _leave(db, conv, HANGUP)
     # A target whose slot another round took meanwhile is not rung again.
     same = {"via": "transfer", "transfer_id": rings[0].transfer_id, "came": rings[0].from_assignment}
     made = (
@@ -348,6 +359,7 @@ def _ringing(db: Connection, conv: Row) -> list[tuple] | None:
         for t in rings
     )
     again = list(filter(None, made))
+    (targets.commit if again else targets.rollback)()
     routing.CHANNELS["call"].ring(db, moved, again)
     return _queue(db, moved, {"type": "queue", "queue_id": str(moved.queue_id)}, True)
 
@@ -359,6 +371,7 @@ class EnqueueIn(BaseModel):
     agents: list[UUID] = []
     route: m.EnqueueRoute | None = None
     context: dict | None = None
+    transcript: m.Transcript | None = None
     direction: Literal["inbound", "outbound"] = "inbound"
 
 
@@ -473,6 +486,7 @@ def _hand_over(p: Principal, queue_id: UUID, body: EnqueueIn) -> dict:
             raise ApiError(404, "queue_not_found", "no such queue")
         config.check(db, p, body)
         conv, _ = _call(db, p.tenant_id, call, body.context)
+        conversations.keep_transcript(db, conv, body.transcript)
         try:
             if conv.state == "open":
                 routing.enqueue(db, conv, queue_id, agents=body.agents, own=body.route)
