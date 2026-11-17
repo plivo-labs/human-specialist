@@ -10,6 +10,8 @@ human-specialist is an open-source contact-center engine for human agents on Pli
 
 [What you need](#what-you-need) · [Deploy](#deploy) · [Quick start](#quick-start) · [What it does](#what-it-does) · [Build your own desk](#build-your-own-desk) · [Docs](#docs)
 
+https://github.com/user-attachments/assets/c624aa17-7604-4e5d-ba02-0f04b19c409e
+
 ## What you need
 
 - **A Plivo account.** human-specialist runs on [Plivo](https://plivo.com). You register with the account's Auth ID and Auth Token.
