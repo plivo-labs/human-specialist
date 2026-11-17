@@ -327,6 +327,15 @@ def added(r) -> bool:
     return r.method == "POST" and r.path.endswith("/Participant/") and r.params.get("role") == "Customer"
 
 
+def answered(tenant, leg):
+    """The leg's statuses are held, so only its joining the room says it answered, and a join heard before the add's
+    reply is saved names a leg the service does not know. Hence the wait before answering."""
+    find = {"call_uuid": leg.call_uuid}
+    tenant.world.wait(lambda: ok(tenant.api.get("/api/v1/conversations", params=find))["data"], what="the leg bound")
+    leg.answer()
+    return leg
+
+
 def test_a_customer_leg_plivo_tells_of_only_after_its_call_ended_and_a_redial_went_live_is_hung_up(world, tenant):
     agent, task, phone, stream = worked(tenant, "task")
     cid = task["conversation_id"]
@@ -340,10 +349,9 @@ def test_a_customer_leg_plivo_tells_of_only_after_its_call_ended_and_a_redial_we
     stray = phone.wait_ring()
     ok(act(tenant.api, cid, "hangup"))
     stream.wait_for("call.ended", conversation_id=cid)
-    phone.on_ring("answer")
     ok(tenant.api.post("/api/v1/calls", json=placed(tenant, agent, task)))
     agent.phone.wait_ring()
-    customer = phone.wait_ring()
+    customer = answered(tenant, phone.wait_ring())
     assert stream.wait_for("call.answered", conversation_id=cid)["data"]["call_uuid"] == customer.call_uuid
     late.release()
     assert stray.wait_state("completed").hangup_cause_code == CANCELLED
@@ -384,10 +392,9 @@ def test_a_redial_answered_while_plivo_holds_the_ended_calls_customer_add_rings_
     stray = phone.wait_ring()
     ok(act(tenant.api, cid, "hangup"))
     stream.wait_for("call.ended", conversation_id=cid)
-    phone.on_ring("answer")
     ok(tenant.api.post("/api/v1/calls", json=placed(tenant, agent, task)))
     agent.phone.wait_ring()
-    customer = phone.wait_ring()
+    customer = answered(tenant, phone.wait_ring())
     assert stream.wait_for("call.answered", conversation_id=cid)["data"]["call_uuid"] == customer.call_uuid
     adding.release()
     assert stray.wait_state("completed").hangup_cause_code == CANCELLED

@@ -3,7 +3,7 @@ expired session does not touch a call in progress. Liveness holds across a Redis
 
 import contextlib
 
-from tests.acceptance.conftest import activity, connect, error, ok, set_status, settings
+from tests.acceptance.conftest import activity, connect, error, ok, replayed, set_status, settings
 from tests.harness import World
 
 
@@ -27,9 +27,7 @@ def test_a_swept_agent_needs_two_quick_pings_to_come_back(tenant):
 
 
 def changes(tenant, agent) -> list[str]:
-    return [
-        e["data"]["to_status"]["name"] for e in tenant.events(type="agent.status_changed") if e["agent_id"] == agent.id
-    ]
+    return [e["data"]["to_status"]["name"] for e in replayed(tenant, "agent.status_changed", agent_id=agent.id)]
 
 
 def test_an_agent_on_break_keeps_it_when_its_desk_comes_back_after_a_silence(tenant):
