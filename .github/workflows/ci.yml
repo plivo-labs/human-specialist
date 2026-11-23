@@ -21,7 +21,7 @@ jobs:
       HS_REQUIRE_STACK: "1"
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@v10.4.0
         with:
           enable-cache: true
       # The whole tree, not only the changed files the pre-commit hook sees.
@@ -47,7 +47,7 @@ jobs:
       HS_REQUIRE_STACK: "1"
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@v10.4.0
         with:
           enable-cache: true
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends redis-server redis-tools tzdata-legacy
@@ -104,7 +104,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@v10.4.0
       - run: uvx cfn-lint==1.60.1 deploy/aws/template.yaml
       - name: Each mistake planted in a copy fails the linter
         run: |
